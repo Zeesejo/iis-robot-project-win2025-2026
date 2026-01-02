@@ -66,18 +66,18 @@ Integrate all modules into a unified "Sense-Think-Act" loop in `notebooks/cognit
 
 ## 6. A Work Plan
 
-- Week 1 (Modules 1-3): Define the task and "build" the robot in the URDF, mounting sensors, and generate the environment.
-- Week 2 (Modules 4-5): Implement perception of objects and navigation of robot
-- Week 3 (Modules 6-8): Write the motion planner, the PID controller for the wheels/arm and the Prolog logic to represent and access knowledge.
-- Week 4 (Modules 9-10): Integrate the loop, handle failures (e.g., robot hits obstacle), and run "experience trials" to optimize their parameters.
-- Week 6 (Tests): Ensure the system is running as expected and identify limitations.
-- Week 7 (Presentation): Prepare documentation and presentation.
+- `Week 1 (Modules 1-3)`: Define the task and "build" the robot in the URDF, mounting sensors, and generate the environment.
+- `Week 2 (Modules 4-5)`: Implement perception of objects and navigation of robot
+- `Week 3 (Modules 6-8)`: Write the motion planner, the PID controller for the wheels/arm and the Prolog logic to represent and access knowledge.
+- `Week 4 (Modules 9-10)`: Integrate the loop, handle failures (e.g., robot hits obstacle), and run "experience trials" to optimize their parameters.
+- `Week 6 (Tests)`: Ensure the system is running as expected and identify limitations.
+- `Week 7 (Presentation)`: Prepare documentation and presentation.
 
 ---
 
 ## 7. Evaluation Criteria and Weight
 
-- Module Implementation, 50% (5% per module)
-- System Robustness, 20% (Handling noise, changes & pushes)
-- Integration & Logic, 20% (Clean architecture & reasoning)
-- Optimization, 10% (Speed)
+- **Module Implementation**, 50% (5% per module)
+- **System Robustness**, 20% (Handling noise, changes & pushes)
+- **Integration & Logic**, 20% (Clean architecture & reasoning)
+- **Optimization**, 10% (Speed)

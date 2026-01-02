@@ -12,7 +12,7 @@ This project requires you to design, implement, and integrate the full cognitive
 * **Situatedness:** The room is a $10\text{m} \times 10\text{m} \times 10\text{m}$ cube. **Every execution generates a randomized initial scene configuration.** You must perceive the world anew each time.
     * **Floor/Walls/Ceiling:** Floor ([0.2, 0.2, 0.2], $\mu=0.5$), Walls ([0.8, 0.8, 0.8]), Ceiling ([1.0, 1.0, 1.0]).
     * **The Table:** Surface $1.5\text{m} \times 0.8\text{m}$ at $z=0.625\text{m}$. Color: Brown ([0.5, 0.3, 0.1]). Position: Randomized.
-    * **Target Object:** Cylinder ($r=0.03\text{m}, h=0.12\text{m}$). Mass: $0.5\text{kg}$. Color: Red ([1.0, 0.0, 0.0]). Position: Randomized on table surface.
+    * **Target Object:** Cylinder ($r=0.04\text{m}, h=0.12\text{m}$). Mass: $0.5\text{kg}$. Color: Red ([1.0, 0.0, 0.0]). Position: Randomized on table surface.
     * **Obstacles:** Two static cubes ($0.4\text{m}$ side). Color: Blue ([0.0, 0.0, 1.0]). Position: Randomized on floor.
 * **Success Conditions:** Robot reaches the table and lifts the object without colliding with obstacles.
 
@@ -33,7 +33,7 @@ Mount joint encoders, odometry, and RGB-D cameras. Implement denoising (handling
 Detect objects and obstacles based on predefined attributes (color, size). Identify the table plane using **RANSAC**. Use **PCA** (Principal Component Analysis) on the object/obstacle point cloud to find the optimal pose for avoidance and grasping.
 
 ### [M5] State Estimation
-Implement a **Kalman Filter** to fuse noisy sensor data and control inputs into a reliable state estimate $(\hat{x}, \hat{y}, \hat{\theta})$.
+Implement a **Particle Filter** to fuse noisy sensor data and control inputs into a reliable state estimate $(x, y, \theta)$.
 
 ### [M6] Motion Control
 Develop **PID Controllers** for both wheel navigation and arm manipulation. Address steady-state errors and overshoot.

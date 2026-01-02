@@ -9,11 +9,11 @@ This project requires you to design, implement, and integrate the full cognitive
 **Objective:** The robot must navigate a room with obstacles, reach a table, and successfully grasp an object placed on top of it.
 
 * **Embodiedness:** Define and respect the robot’s physical constraints (mass, torque limits, kinematic chain).
-* **Situatedness:** The room is a $10\text{m} \times 10\text{m} \times 10\text{m}$ cube. **Every execution generates a randomized initial scene configuration (i.e., object position).** You must perceive the world anew each time.
+* **Situatedness:** The room is a $10\text{m} \times 10\text{m} \times 10\text{m}$ cube. **Every execution generates a randomized initial scene configuration (i.e., object position).** You must keep this initial configuration as map in your knowledge base for guiding navigation, except the pose of the target object.
     * **Floor/Walls/Ceiling:** Floor ([0.2, 0.2, 0.2], $\mu=0.5$), Walls ([0.8, 0.8, 0.8]), Ceiling ([1.0, 1.0, 1.0]).
-    * **The Table:** Surface $1.5\text{m} \times 0.8\text{m}$ at $z=0.625\text{m}$. Color: Brown ([0.5, 0.3, 0.1]). Position: Randomized on floor.
+    * **The Table:** Surface $1.5\text{m} \times 0.8\text{m}$ at $z=0.625\text{m}$. Mass: $10\text{kg}$. Color: Brown ([0.5, 0.3, 0.1]). Position: Randomized on floor.
     * **Target Object:** Cylinder ($r=0.04\text{m}, h=0.12\text{m}$). Mass: $0.5\text{kg}$. Color: Red ([1.0, 0.0, 0.0]). Position: Randomized on table surface.
-    * **Obstacles:** Two static cubes ($0.4\text{m}$ side). Color: Blue ([0.0, 0.0, 1.0]). Position: Randomized on floor.
+    * **Obstacles:** Five static cubes ($0.4\text{m}$ side). Mass: $10\text{kg}$. Color: Blue ([0.0, 0.0, 1.0]). Position: Randomized on floor.
 * **Success Conditions:** Robot reaches the table and lifts the object without colliding with obstacles.
 
 ---
@@ -24,10 +24,10 @@ This project requires you to design, implement, and integrate the full cognitive
 Document the "Embodiedness" and "Situatedness" of your agent. Define the task constraints and safety boundaries.
 
 ### [M2] Hardware (URDF)
-Create a custom URDF in `src/robot/`. Define the kinematic tree (base + arm), visual/collision shapes, and inertial properties.
+Create a custom URDF in `src/robot/`. Define the kinematic tree (base + arm), visual/collision shapes, and inertial properties. Create also the URDFs of the room, obstacles, table and target object in `src/environment/`. Finally, write the program `world_builder.py` for generating the scene with a random configuration. Any execution of this program generates a new configuration as discussed earlier.
 
 ### [M3] Sensors (Preprocessing)
-Mount joint encoders, odometry, and RGB-D cameras. Implement denoising (handling noise $\mu, \sigma$ via Law of Large Numbers) and data synchronization.
+Mount joint encoders, odometry, and RGB-D cameras. Model noise (e.g., handling noise $\mu, \sigma$ via Law of Large Numbers) and data synchronization.
 
 ### [M4] Perception
 Detect objects and obstacles based on predefined attributes (color, size). Identify the table plane using **RANSAC**. Use **PCA** (Principal Component Analysis) on the object/obstacle point cloud to find the optimal pose for avoidance and grasping.
@@ -64,7 +64,7 @@ Integrate all modules into a unified "Sense-Think-Act" loop in `notebooks/cognit
 - `/notebooks`: Integration and execution (The Cognitive Architecture).
 - `/src/modules`: Individual logic for Perception, Control, Planning, etc.
 - `/src/robot`: URDF files and sensor wrappers.
-- `/src/environment`: World building and physics parameters.
+- `/src/environment`: World building and physics parameters. Ensure scene configuration randomization and provide data for initial scene map.
 
 ---
 

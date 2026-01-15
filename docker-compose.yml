@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  robot_sim:
+    build: 
+      context: .        # Builds from the project root
+      dockerfile: Dockerfile
+    container_name: robotics_lab
+    network_mode: "host"
+    environment:
+      - DISPLAY=${DISPLAY}
+      - QT_X11_NO_MITSHM=1
+      # This ensures Python can find your 'src' and 'modules'
+      - PYTHONPATH=/home/jovyan/work
+    volumes:
+      # X11 Socket: Allows the container to draw on YOUR host screen
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      # Persistent development: Map the whole project root
+      - .:/home/jovyan/work
+    
+    # Start in the executables folder to run your architecture
+    working_dir: /home/jovyan/work/executables
+    
+    # Default command (can be overridden by docker-compose run)
+    command: python3 cognitive_architecture.py

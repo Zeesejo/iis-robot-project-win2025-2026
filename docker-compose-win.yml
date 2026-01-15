@@ -1,0 +1,34 @@
+version: '3.8'
+
+services:
+  robot_sim:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    container_name: robotics_lab
+    # "host" network mode is easiest for X11 forwarding on Linux. 
+    # For Windows, it will fall back to bridge mode, which is fine.
+    network_mode: "host"
+    
+    environment:
+      # WINDOWS USERS: If using VcXsrv, change this to host.docker.internal:0.0
+      # LINUX USERS: Keep as ${DISPLAY}
+      - DISPLAY=host.docker.internal:0.0
+      
+      # Fixes graphical lag/errors with certain X-servers
+      - QT_X11_NO_MITSHM=1
+      
+      # Ensures Python finds your modules in /src
+      - PYTHONPATH=/home/jovyan/work
+      
+    volumes:
+      # Essential for Linux; ignored by Windows but doesn't cause errors
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      
+      # Mounts your project code so changes on your PC reflect in the container
+      - .:/home/jovyan/work
+    
+    working_dir: /home/jovyan/work/executables
+    
+    # This runs your main cognitive architecture script
+    command: python3 cognitive_architecture.py

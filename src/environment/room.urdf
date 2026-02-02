@@ -6,6 +6,9 @@
   <material name="ceiling_color">
     <color rgba="1.0 1.0 1.0 1"/>
   </material>
+  <material name="floor_color">
+    <color rgba="0 0 0 1"/>
+  </material>
 
   <link name="world"/>
 
@@ -69,6 +72,19 @@
       <origin xyz="0 0 10.0"/>
       <material name="ceiling_color"/>
     </visual>
+    <visual>
+      <geometry>
+          <box size="10.0 10.0 0.1"/>
+      </geometry>
+      <origin xyz="0 0 -0.1"/>
+      <material name="floor_color"/>
+    </visual>
+    <collision>
+      <geometry>
+          <box size="10.0 10.0 0.1"/>
+      </geometry>
+      <origin xyz="0 0 -0.1"/>
+    </collision>
   </link>
 
   <joint name="fixed" type="fixed">

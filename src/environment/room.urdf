@@ -72,19 +72,6 @@
       <origin xyz="0 0 10.0"/>
       <material name="ceiling_color"/>
     </visual>
-    <visual>
-      <geometry>
-          <box size="10.0 10.0 0.1"/>
-      </geometry>
-      <origin xyz="0 0 -0.1"/>
-      <material name="floor_color"/>
-    </visual>
-    <collision>
-      <geometry>
-          <box size="10.0 10.0 0.1"/>
-      </geometry>
-      <origin xyz="0 0 -0.1"/>
-    </collision>
   </link>
 
   <joint name="fixed" type="fixed">

@@ -185,31 +185,8 @@ def pid_to_target(robot_id, target_pos):
 
 
 def setup_simulation():
-    p.connect(p.GUI)
-    p.setAdditionalSearchPath(pybullet_data.getDataPath())
-    p.setGravity(0, 0, -9.81)
-
-    # 1. Spawn the Room
-    room_id=p.loadURDF("../src/environment/room.urdf", [0, 0, 0], useFixedBase=True)
-
-    # 2. Spawn the Target Table
-    table_id = p.loadURDF("table/table.urdf", basePosition=[2, 2, 0.0], useFixedBase=True)
-    #Overwrite table mass
-    #p.changeDynamics(table_id, -1, mass=10.0)
-
-    # 3. Spawn Obstacles (Random Blocks)
-    # A heavy crate
-    p.loadURDF("block.urdf", basePosition=[1, 0, 0.1], globalScaling=5.0) 
-    # A simple block obstacle
-    target_id=p.loadURDF("block.urdf", basePosition=[1.8, 1.8, 0.8], globalScaling=2.0)
-
-    # 4. Spawn the Husky Robot
-    robot_id = p.loadURDF("husky/husky.urdf", basePosition=[-3, -3, 0.2])
-    
-    # 5. Spawn the Gripper on the Table
-    arm_id = p.loadURDF("kuka_iiwa/model.urdf", [2, 2, 0.625], useFixedBase=True)
-    
-    return robot_id, table_id, room_id, arm_id, target_id
+    from src.environment.world_builder import build_world
+    return build_world()
 ##########################################################################################################
 
 ############################################ The Main Function ###########################################

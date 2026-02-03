@@ -260,6 +260,21 @@ def main():
        p.stepSimulation()  # DO NOT TOUCH
        time.sleep(1./240.) # DO NOT TOUCH
 ####################################################################################################
+#################################Perception#########################################################
+from src.modules.perception import PerceptionModule, preprocess_sensor_data, extract_target_position
+
+# Initialize
+perception = PerceptionModule()
+
+# In your main loop:
+rgb, depth, mask = get_camera_image(robot_id)
+rgb, depth = preprocess_sensor_data(rgb, depth)
+scene = perception.process_scene(rgb, depth)
+
+# Get target position for navigation
+target_pos = extract_target_position(scene)
+if target_pos:
+    pid_to_target(robot_id, target_pos)
 
 
 ################ The Main Thread ###################################################################

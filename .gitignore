@@ -1,0 +1,4 @@
+﻿executables/frame_*.png
+executables/*.json
+src/**/__pycache__/
+temp_*

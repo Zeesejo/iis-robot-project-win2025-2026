@@ -21,8 +21,8 @@ TABLE_HEIGHT = 0.625
 TARGET_HEIGHT = 0.12
 
 # File Paths (Relative to where python is executed)
-URDF_PATH = "./src/environment/"
-ROBOT_URDF = "./src/robot/robot.urdf"
+URDF_PATH = "../src/environment/"
+ROBOT_URDF = "../src/robot/robot.urdf"
 
 
 def get_random_pos(bounds, min_dist_from_origin=1.0):
@@ -140,7 +140,7 @@ def build_world(gui=True):
 
     print("World Generated. Map saved to initial_map.json")
 
-    return robot_id, table_id, target_id
+    return robot_id, table_id, room_id, target_id
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ import sys
 import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from src.robot.sensor_wrapper import *
+from src.environment.world_builder import build_world
 
 ####################### Function Signature #################################
 
@@ -214,8 +215,7 @@ def setup_simulation():
 
 ############################################ The Main Function ###########################################
 def main():
-    robot_id, table_id, room_id, arm_id, target_id = setup_simulation()
-    print(get_joint_map(arm_id))
+    robot_id, table_id, room_id, target_id = build_world()
     
     print("Room initialized. Husky is at (-3, -3). Table is at (2, 2).")
 
@@ -242,7 +242,7 @@ def main():
            rgb, depth, mask = get_camera_image(robot_id)
            save_camera_data(rgb, depth, filename_prefix=f"frame_{step_counter}")
        step_counter=step_counter+1
-       move_arm_to_coordinate(arm_id, target_id)  
+    #    move_arm_to_coordinate(arm_id, target_id)  
        dist = pid_to_target(robot_id, target)
        print ('Distance: ', dist)
        if dist < 2:

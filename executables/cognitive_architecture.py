@@ -12,6 +12,7 @@ import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from src.robot.sensor_wrapper import *
 from src.environment.world_builder import build_world
+from src.modules.fsm import RobotFSM, RobotState
 
 ####################### Function Signature #################################
 
@@ -191,6 +192,10 @@ def main():
     print(f"Robot starts at origin. Table at {table_pos}")
     print("Target object is on the table.")
     
+    # Initialize FSM
+    fsm = RobotFSM()
+    print(f"\n[FSM] Initialized in state: {fsm.get_state_name()}\n")
+    
     # Target is the table position for navigation
     target = [table_pos[0], table_pos[1], 0]
     
@@ -210,20 +215,53 @@ def main():
     ##################### LOOP STRUCTURE ############################################
     while p.isConnected(): # DO NOT TOUCH
        
-       # Inside your while loop:
+       # 1. SENSE: Gather sensor data
+       robot_pos, robot_orn = p.getBasePositionAndOrientation(robot_id)
+       dist = np.sqrt((target[0] - robot_pos[0])**2 + (target[1] - robot_pos[1])**2)
+       
+       # Prepare sensor data for FSM
+       sensor_data = {
+           'target_visible': True,  # Assume target always visible for now
+           'target_position': target,
+           'distance_to_target': dist,
+           'collision_detected': False,  # To be implemented
+           'gripper_contact': False  # To be implemented
+       }
+       
+       # 2. THINK: Update FSM and get control commands
+       control_commands = fsm.update(sensor_data)
+       
+       # 3. ACT: Execute control commands based on FSM state
+       if control_commands['navigate']:
+           # Navigation mode - move toward target
+           pid_to_target(robot_id, target)
+           move_arm_to_coordinate(arm_id, target_id)
+           
+       elif control_commands['approach']:
+           # Approach mode - fine positioning
+           pid_to_target(robot_id, target)
+           move_arm_to_coordinate(arm_id, target_id)
+           
+       elif control_commands['grasp']:
+           # Grasp mode - arm grasping
+           move_arm_to_coordinate(arm_id, target_id)
+           # Stop base movement
+           for i in [2, 4, 3, 5]:
+               p.setJointMotorControl2(robot_id, i, p.VELOCITY_CONTROL, targetVelocity=0.0, force=1500.)
+               
+       elif control_commands['lift']:
+           # Lift mode - hold lifted position
+           move_arm_to_coordinate(arm_id, target_id)
+       
+       # Save camera data periodically
        if step_counter % 240 == 0:  # Save once per second
            rgb, depth, mask = get_camera_image(robot_id)
            save_camera_data(rgb, depth, filename_prefix=f"frame_{step_counter}")
-       step_counter=step_counter+1
-       move_arm_to_coordinate(arm_id, target_id)  
-       dist = pid_to_target(robot_id, target)
+           
+           # Print FSM status every second
+           print(f'[Main] State: {fsm.get_state_name()} | Distance: {dist:.2f}m | Time in state: {fsm.get_time_in_state():.1f}s')
        
-       # Print status every second instead of every frame
-       if step_counter % 240 == 0:
-           print(f'Distance to target: {dist:.2f}m')
-           if dist < 0.5:
-               print("Target Reached!")
-               
+       step_counter=step_counter+1
        p.stepSimulation()  # DO NOT TOUCH
        time.sleep(1./240.) # DO NOT TOUCH
 ####################################################################################################

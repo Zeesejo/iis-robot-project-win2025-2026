@@ -65,7 +65,7 @@ def build_world(gui=True):
     p.loadURDF(os.path.join(URDF_PATH, "room.urdf"), useFixedBase=True)
 
     # 3. Load Robot (at 0,0,0) - Loaded to ensure we don't spawn obstacles on top of it
-    robot_start_pos = [0, 0, 0]
+    robot_start_pos = [0, 0, 0.2]  # Slightly above ground to prevent falling through
     robot_start_orn = p.getQuaternionFromEuler([0, 0, 0])
     robot_id = p.loadURDF(ROBOT_URDF, robot_start_pos, robot_start_orn)
 

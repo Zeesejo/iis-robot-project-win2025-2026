@@ -64,7 +64,7 @@ def build_world(gui=True):
     p.changeDynamics(room_id, 0, lateralFriction=0.5)
 
     # 3. Load Robot (at 0,0,0) - Loaded to ensure we don't spawn obstacles on top of it
-    robot_start_pos = [0, 0, 0]
+    robot_start_pos = [0, 0, 0.2]
     robot_start_orn = p.getQuaternionFromEuler([0, 0, 0])
     robot_id = p.loadURDF(ROBOT_URDF, robot_start_pos, robot_start_orn)
 

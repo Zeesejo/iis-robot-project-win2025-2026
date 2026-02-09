@@ -84,7 +84,7 @@ def save_camera_data(rgb, depth, filename_prefix="frame"):
 
 def move_arm_to_coordinate(arm_id, target_id):
     # Joint 6 is the last joint (lbr_iiwa_joint_7)
-    end_effector_index = 6 
+    end_effector_index = 15
     
     #0. get target pose
     target_pos, target_orn = p.getBasePositionAndOrientation(target_id)
@@ -93,12 +93,12 @@ def move_arm_to_coordinate(arm_id, target_id):
     # 1. Compute Inverse Kinematics
     joint_poses = p.calculateInverseKinematics(
                   bodyUniqueId=arm_id,
-                  endEffectorLinkIndex=6,
+                  endEffectorLinkIndex=end_effector_index,
                   targetPosition=target_pos
     )
     
     # 2. Command all 7 joints
-    for i in range(7):
+    for i in range(len(joint_poses)):
         p.setJointMotorControl2(
             bodyIndex=arm_id, 
             jointIndex=i, 
@@ -179,6 +179,10 @@ def pid_to_target(robot_id, target_pos):
     for i in [3, 5]: # Righ
         p.setJointMotorControl2(robot_id, i, p.VELOCITY_CONTROL, targetVelocity=1.0, force=1500.)
     dist_error=1.0
+
+    rob_pos = p.getBasePositionAndOrientation(robot_id)[0]
+    dist_error = np.linalg.norm(np.array(target_pos) - np.array(rob_pos))
+
     return dist_error
 #############################################################################################################
 
@@ -210,18 +214,30 @@ def setup_simulation():
     # 5. Spawn the Gripper on the Table
     arm_id = p.loadURDF("kuka_iiwa/model.urdf", [2, 2, 0.625], useFixedBase=True)
     
-    return robot_id, table_id, room_id, arm_id, target_id
+    return robot_id, table_id, room_id, target_id
 ##########################################################################################################
+
+def get_link_in_by_name(body_id, link_name):
+    for i in range(p.getNumJoints(body_id)):
+        info = p.getJointInfo(body_id, i)
+        name = info[12].decode("utf-8")
+        if name == link_name:
+            return i
+    raise ValueError(f"Link {link_name} not found")
 
 ############################################ The Main Function ###########################################
 def main():
     robot_id, table_id, room_id, target_id = build_world()
+    camera_id = get_link_in_by_name(robot_id, "rgbd_camera_link")
     
     print("Room initialized. Husky is at (-3, -3). Table is at (2, 2).")
 
-    target = [2, 2, 0] # The table position
+    target = p.getBasePositionAndOrientation(table_id)[0]
+
+    # for i in range(0, 17):
+    #     print(p.getJointInfo(robot_id, i))
+
     
-    """
     # Run this ONCE before your simulation loop in p.TORQUE_CONTROL
     for i in [2, 3, 4, 5]:
       p.setJointMotorControl2(
@@ -231,7 +247,7 @@ def main():
         targetVelocity=0, 
         force=0  # This "disables" the internal motor
       )
-     """
+     
     
     step_counter=0
     ##################### LOOP STRUCTURE ############################################
@@ -239,26 +255,26 @@ def main():
        
        # Inside your while loop:
        if step_counter % 240 == 0:  # Save once per second
-           rgb, depth, mask = get_camera_image(robot_id)
+           rgb, depth, mask = get_camera_image(robot_id, camera_id)
            save_camera_data(rgb, depth, filename_prefix=f"frame_{step_counter}")
        step_counter=step_counter+1
-    #    move_arm_to_coordinate(arm_id, target_id)  
+       move_arm_to_coordinate(robot_id, target_id)  
        dist = pid_to_target(robot_id, target)
        print ('Distance: ', dist)
-       if dist < 2:
-             print("Target Reached!")
-             # Apply braking torque
-             for i in range(2, 6):
-                 p.setJointMotorControl2(
-                     bodyUniqueId=robot_id, 
-                     jointIndex=i, 
-                     controlMode=p.VELOCITY_CONTROL, 
-                     targetVelocity=0, 
-                     force=1000  # This "disables" the internal motor
-                 )  
+    #    if dist < 2:
+    #          print("Target Reached!")
+    #          # Apply braking torque
+    #          for i in range(2, 6):
+    #              p.setJointMotorControl2(
+    #                  bodyUniqueId=robot_id, 
+    #                  jointIndex=i, 
+    #                  controlMode=p.VELOCITY_CONTROL, 
+    #                  targetVelocity=0, 
+    #                  force=1000  # This "disables" the internal motor
+    #              )  
                  
        p.stepSimulation()  # DO NOT TOUCH
-       time.sleep(1./240.) # DO NOT TOUCH
+    #    time.sleep(1./240.) # DO NOT TOUCH
 ####################################################################################################
 
 

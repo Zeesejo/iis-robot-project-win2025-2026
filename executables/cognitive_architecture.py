@@ -9,6 +9,8 @@ import numpy as np
 import cv2
 import sys
 import os
+from src.modules.state_estimation import state_estimate
+from src.robot import sensor_wrapper
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from src.robot.sensor_wrapper import *
 from src.environment.world_builder import build_world
@@ -235,30 +237,58 @@ def main():
     
     step_counter=0
     ##################### LOOP STRUCTURE ############################################
-    while p.isConnected(): # DO NOT TOUCH
-       
-       # Inside your while loop:
-       if step_counter % 240 == 0:  # Save once per second
-           rgb, depth, mask = get_camera_image(robot_id)
-           save_camera_data(rgb, depth, filename_prefix=f"frame_{step_counter}")
-       step_counter=step_counter+1
-    #    move_arm_to_coordinate(arm_id, target_id)  
-       dist = pid_to_target(robot_id, target)
-       print ('Distance: ', dist)
-       if dist < 2:
-             print("Target Reached!")
-             # Apply braking torque
-             for i in range(2, 6):
-                 p.setJointMotorControl2(
-                     bodyUniqueId=robot_id, 
-                     jointIndex=i, 
-                     controlMode=p.VELOCITY_CONTROL, 
-                     targetVelocity=0, 
-                     force=1000  # This "disables" the internal motor
-                 )  
-                 
-       p.stepSimulation()  # DO NOT TOUCH
-       time.sleep(1./240.) # DO NOT TOUCH
+    while p.isConnected():  # DO NOT TOUCH
+
+    # 1. Get ALL sensors
+        joint_states = sensor_wrapper.get_joint_states(robot_id)
+        rgb, depth, mask = sensor_wrapper.get_camera_image(robot_id, -1)
+        imu_data = sensor_wrapper.get_imu_data(robot_id)
+
+    # 2. REAL wheel velocities (your exact joint names!)
+        wheel_left_vel = joint_states['fl_wheel_joint']['velocity']   # Front left
+        wheel_right_vel = joint_states['fr_wheel_joint']['velocity'] # Front right
+
+    # 3. Print wheels for debugging (remove later)
+        print(f"🔍 WHEELS FL:{wheel_left_vel:.2f} FR:{wheel_right_vel:.2f}")
+
+    # 4. Package for particle filter
+        sensors = {
+            'depth': depth.flatten(),  # 320x240 → 1D array (FIXES error)
+            'imu': np.array(imu_data['gyroscope_data'])
+        }
+        control_inputs = {
+            'wheel_left': wheel_left_vel,
+            'wheel_right': wheel_right_vel
+        }
+
+    # 5. YOUR particle filter
+        robot_pose = state_estimate(sensors, control_inputs)
+        print(f"🧭 LIVE M5 POSE: {robot_pose}") 
+
+        # --- Existing camera logging (M3/M4 support) ---
+        if step_counter % 240 == 0:  # Save once per second
+            rgb, depth, mask = get_camera_image(robot_id)
+            save_camera_data(rgb, depth, filename_prefix=f"frame_{step_counter}")
+        step_counter = step_counter + 1
+
+        # --- Existing navigation / PID to target ---
+        #    move_arm_to_coordinate(arm_id, target_id)  
+        dist = pid_to_target(robot_id, target)
+        print('Distance: ', dist)
+        if dist < 2:
+            print("Target Reached!")
+            # Apply braking torque
+            for i in range(2, 6):
+                p.setJointMotorControl2(
+                    bodyUniqueId=robot_id,
+                    jointIndex=i,
+                    controlMode=p.VELOCITY_CONTROL,
+                    targetVelocity=0,
+                    force=1000  # This "disables" the internal motor
+                )
+
+        p.stepSimulation()  # DO NOT TOUCH
+        time.sleep(1./240.)  # DO NOT TOUCH
 ####################################################################################################
 
 

@@ -12,6 +12,7 @@ import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from src.robot.sensor_wrapper import *
 from src.environment.world_builder import build_world
+from src.modules.sensor_preprocessing import get_sensor_data
 
 ####################### Function Signature #################################
 
@@ -186,37 +187,6 @@ def pid_to_target(robot_id, target_pos):
     return dist_error
 #############################################################################################################
 
-########################################### Setting Up the Environment ######################################
-
-
-def setup_simulation():
-    p.connect(p.GUI)
-    p.setAdditionalSearchPath(pybullet_data.getDataPath())
-    p.setGravity(0, 0, -9.81)
-
-    # 1. Spawn the Room
-    room_id=p.loadURDF("../src/environment/room.urdf", [0, 0, 0], useFixedBase=True)
-
-    # 2. Spawn the Target Table
-    table_id = p.loadURDF("table/table.urdf", basePosition=[2, 2, 0.0], useFixedBase=True)
-    #Overwrite table mass
-    #p.changeDynamics(table_id, -1, mass=10.0)
-
-    # 3. Spawn Obstacles (Random Blocks)
-    # A heavy crate
-    p.loadURDF("block.urdf", basePosition=[1, 0, 0.1], globalScaling=5.0) 
-    # A simple block obstacle
-    target_id=p.loadURDF("block.urdf", basePosition=[1.8, 1.8, 0.8], globalScaling=2.0)
-
-    # 4. Spawn the Husky Robot
-    robot_id = p.loadURDF("husky/husky.urdf", basePosition=[-3, -3, 0.2])
-    
-    # 5. Spawn the Gripper on the Table
-    arm_id = p.loadURDF("kuka_iiwa/model.urdf", [2, 2, 0.625], useFixedBase=True)
-    
-    return robot_id, table_id, room_id, target_id
-##########################################################################################################
-
 def get_link_in_by_name(body_id, link_name):
     for i in range(p.getNumJoints(body_id)):
         info = p.getJointInfo(body_id, i)
@@ -225,18 +195,19 @@ def get_link_in_by_name(body_id, link_name):
             return i
     raise ValueError(f"Link {link_name} not found")
 
-############################################ The Main Function ###########################################
-def main():
+########################################### Setting Up the Environment ######################################
+def setup_simulation():
     robot_id, table_id, room_id, target_id = build_world()
     camera_id = get_link_in_by_name(robot_id, "rgbd_camera_link")
+    lidar_id = get_link_in_by_name(robot_id, "lidar_link")
     
-    print("Room initialized. Husky is at (-3, -3). Table is at (2, 2).")
+    return robot_id, table_id, room_id, target_id, camera_id, lidar_id
+##########################################################################################################
 
+############################################ The Main Function ###########################################
+def main():
+    robot_id, table_id, room_id, target_id, camera_id, lidar_id = setup_simulation()
     target = p.getBasePositionAndOrientation(table_id)[0]
-
-    # for i in range(0, 17):
-    #     print(p.getJointInfo(robot_id, i))
-
     
     # Run this ONCE before your simulation loop in p.TORQUE_CONTROL
     for i in [2, 3, 4, 5]:
@@ -252,29 +223,28 @@ def main():
     step_counter=0
     ##################### LOOP STRUCTURE ############################################
     while p.isConnected(): # DO NOT TOUCH
-       
        # Inside your while loop:
        if step_counter % 240 == 0:  # Save once per second
-           rgb, depth, mask = get_camera_image(robot_id, camera_id)
-           save_camera_data(rgb, depth, filename_prefix=f"frame_{step_counter}")
+           sensor_data = get_sensor_data(robot_id, camera_id, lidar_id)
+           save_camera_data(sensor_data["camera_rgb"], sensor_data["camera_depth"], filename_prefix=f"frame_{step_counter}")
        step_counter=step_counter+1
        move_arm_to_coordinate(robot_id, target_id)  
        dist = pid_to_target(robot_id, target)
        print ('Distance: ', dist)
-    #    if dist < 2:
-    #          print("Target Reached!")
-    #          # Apply braking torque
-    #          for i in range(2, 6):
-    #              p.setJointMotorControl2(
-    #                  bodyUniqueId=robot_id, 
-    #                  jointIndex=i, 
-    #                  controlMode=p.VELOCITY_CONTROL, 
-    #                  targetVelocity=0, 
-    #                  force=1000  # This "disables" the internal motor
-    #              )  
+       if dist < 2:
+             print("Target Reached!")
+             # Apply braking torque
+             for i in range(2, 6):
+                 p.setJointMotorControl2(
+                     bodyUniqueId=robot_id, 
+                     jointIndex=i, 
+                     controlMode=p.VELOCITY_CONTROL, 
+                     targetVelocity=0, 
+                     force=1000  # This "disables" the internal motor
+                 )  
                  
        p.stepSimulation()  # DO NOT TOUCH
-    #    time.sleep(1./240.) # DO NOT TOUCH
+       time.sleep(1./240.) # DO NOT TOUCH
 ####################################################################################################
 
 

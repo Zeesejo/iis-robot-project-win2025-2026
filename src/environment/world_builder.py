@@ -16,7 +16,7 @@ OBSTACLE_COLORS = [
     [1, 1, 0, 1],  # Yellow
     [0, 0, 0, 1]  # Black
 ]
-TABLE_DIM = [1.5, 0.8]  # x, y
+TABLE_DIM = [1.0, 1.0]  # Cylinder: diameter 1.0 (radius 0.5)
 TABLE_HEIGHT = 0.625
 TARGET_HEIGHT = 0.12
 
@@ -83,15 +83,15 @@ def build_world(gui=True):
     # Bounds: -4 to 4 to keep inside 10x10 room
     while True:
         t_pos_xy = get_random_pos([-4, 4, -4, 4])
-        if not is_overlapping(t_pos_xy, 1.0, spawned_objects):  # Table radius approx 1.0
+        if not is_overlapping(t_pos_xy, 0.5, spawned_objects):  # Table radius 0.5
             break
 
     table_pos = [t_pos_xy[0], t_pos_xy[1], 0]
     table_orn = p.getQuaternionFromEuler([0, 0, random.uniform(-3.14, 3.14)])
     table_id = p.loadURDF(os.path.join(URDF_PATH, "table.urdf"), table_pos, table_orn, useFixedBase=True)
 
-    spawned_objects.append({'pos': t_pos_xy, 'radius': 1.0})
-    knowledge_base['table'] = {"position": table_pos, "orientation": list(table_orn), "size": [1.5, 0.8]}
+    spawned_objects.append({'pos': t_pos_xy, 'radius': 0.5})
+    knowledge_base['table'] = {"position": table_pos, "orientation": list(table_orn), "size": [1.0, 0.625]}
 
     # 5. Spawn Target Object (ON the table)
     # We must calculate the position relative to the table center + table rotation

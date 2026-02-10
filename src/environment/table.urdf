@@ -1,116 +1,28 @@
 ﻿<?xml version="1.0"?>
 <robot name="table">
   <material name="brown">
-    <color rgba="0.5 0.3 0.1 1"/>
+    <color rgba="0.6 0.4 0.2 1"/>
   </material>
 
-  <link name="table_base">
-     <inertial>
-       <mass value="0.0"/>
-       <inertia ixx="0" ixy="0" ixz="0" iyy="0" iyz="0" izz="0"/>
-    </inertial>
-  </link>
-
-  <link name="table_top">
+  <link name="table_cylinder">
     <visual>
       <geometry>
-          <box size="1.5 0.8 0.05"/>
+        <cylinder radius="0.5" length="0.625"/>
       </geometry>
+      <origin xyz="0 0 0.3125" rpy="0 0 0"/>
       <material name="brown"/>
     </visual>
     <collision>
       <geometry>
-          <box size="1.5 0.8 0.05"/>
+        <cylinder radius="0.5" length="0.625"/>
       </geometry>
+      <origin xyz="0 0 0.3125" rpy="0 0 0"/>
     </collision>
     <inertial>
-       <mass value="10.0"/>
-       <inertia ixx="1.0" ixy="0" ixz="0" iyy="1.0" iyz="0" izz="1.0"/>
+      <mass value="15.0"/>
+      <origin xyz="0 0 0.3125" rpy="0 0 0"/>
+      <inertia ixx="1.0" ixy="0" ixz="0" iyy="1.0" iyz="0" izz="0.5"/>
     </inertial>
   </link>
-
-  <joint name="base_to_top" type="fixed">
-    <parent link="table_base"/>
-    <child link="table_top"/>
-    <origin xyz="0 0 0.6"/> </joint>
-
-  <link name="leg1">
-      <visual>
-          <geometry>
-              <cylinder radius="0.04" length="0.575"/>
-          </geometry>
-          <material name="brown"/>
-      </visual>
-      <collision>
-          <geometry>
-              <cylinder radius="0.04" length="0.575"/>
-          </geometry>
-      </collision>
-  </link>
-
-  <link name="leg2">
-      <visual>
-          <geometry>
-              <cylinder radius="0.04" length="0.575"/>
-          </geometry>
-          <material name="brown"/>
-      </visual>
-      <collision>
-          <geometry>
-              <cylinder radius="0.04" length="0.575"/>
-          </geometry>
-      </collision>
-  </link>
-
-  <link name="leg3">
-      <visual>
-          <geometry>
-              <cylinder radius="0.04" length="0.575"/>
-          </geometry>
-          <material name="brown"/>
-      </visual>
-      <collision>
-          <geometry>
-              <cylinder radius="0.04" length="0.575"/>
-          </geometry>
-      </collision>
-  </link>
-
-  <link name="leg4">
-      <visual>
-          <geometry>
-              <cylinder radius="0.04" length="0.575"/>
-          </geometry>
-          <material name="brown"/>
-      </visual>
-      <collision>
-          <geometry>
-              <cylinder radius="0.04" length="0.575"/>
-          </geometry>
-      </collision>
-  </link>
-
-  <joint name="j1" type="fixed">
-      <parent link="table_top"/>
-      <child link="leg1"/>
-      <origin xyz="0.65 0.3 -0.3125"/>
-  </joint>
-
-  <joint name="j2" type="fixed">
-      <parent link="table_top"/>
-      <child link="leg2"/>
-      <origin xyz="-0.65 0.3 -0.3125"/>
-  </joint>
-
-  <joint name="j3" type="fixed">
-      <parent link="table_top"/>
-      <child link="leg3"/>
-      <origin xyz="0.65 -0.3 -0.3125"/>
-  </joint>
-
-  <joint name="j4" type="fixed">
-      <parent link="table_top"/>
-      <child link="leg4"/>
-      <origin xyz="-0.65 -0.3 -0.3125"/>
-  </joint>
 </robot>
+

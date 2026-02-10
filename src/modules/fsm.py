@@ -51,6 +51,9 @@ class RobotFSM:
         # Transition history for debugging
         self.state_history = []
         
+        # Flag to prevent repeated printing in terminal states
+        self.terminal_message_printed = False
+        
     def transition_to(self, new_state):
         """
         Transition to a new state with logging.
@@ -63,6 +66,7 @@ class RobotFSM:
             self.state = new_state
             self.state_start_time = time.time()
             self.state_history.append((new_state, time.time()))
+            self.terminal_message_printed = False  # Reset flag on state change
             print(f"[FSM] State transition: {self.previous_state.name} → {new_state.name}")
     
     def get_time_in_state(self):
@@ -165,11 +169,15 @@ class RobotFSM:
                 control['lift'] = True  # Hold lifted position
                 
         elif self.state == RobotState.SUCCESS:
-            print("[FSM] Task completed successfully! 🎉")
+            if not self.terminal_message_printed:
+                print("[FSM] Task completed successfully! 🎉")
+                self.terminal_message_printed = True
             # Stay in success state
             
         elif self.state == RobotState.FAILURE:
-            print("[FSM] Task failed. Recovery needed.")
+            if not self.terminal_message_printed:
+                print("[FSM] Task failed. Recovery needed.")
+                self.terminal_message_printed = True
             # Recovery logic would go here
             
         return control

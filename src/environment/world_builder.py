@@ -1,4 +1,4 @@
-﻿import pybullet as p
+import pybullet as p
 import pybullet_data
 import random
 import time
@@ -16,15 +16,13 @@ OBSTACLE_COLORS = [
     [1, 1, 0, 1],  # Yellow
     [0, 0, 0, 1]  # Black
 ]
-TABLE_DIM = [1.0, 1.0]  # Cylinder: diameter 1.0 (radius 0.5)
+TABLE_DIM = [1.5, 0.8]  # x, y
 TABLE_HEIGHT = 0.625
 TARGET_HEIGHT = 0.12
 
-# File Paths (Relative to project root)
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, '../..'))
-URDF_PATH = os.path.join(PROJECT_ROOT, "src/environment/")
-ROBOT_URDF = os.path.join(PROJECT_ROOT, "src/robot/robot.urdf")
+# File Paths (Relative to where python is executed)
+URDF_PATH = "../src/environment/"
+ROBOT_URDF = "../src/robot/robot.urdf"
 
 
 def get_random_pos(bounds, min_dist_from_origin=1.0):
@@ -56,16 +54,17 @@ def build_world(gui=True):
     p.setAdditionalSearchPath(pybullet_data.getDataPath())
     p.setGravity(0, 0, -9.81)
 
-    # 1. Load Floor (Plane)
-    floor_id = p.loadURDF("plane.urdf")
-    p.changeVisualShape(floor_id, -1, rgbaColor=[0.2, 0.2, 0.2, 1])
-    p.changeDynamics(floor_id, -1, lateralFriction=0.5)
+    # 1. Load Room (Which now includes the floor)
+    room_id = p.loadURDF(os.path.join(URDF_PATH, "room.urdf"), useFixedBase=True)
 
-    # 2. Load Room Walls
-    p.loadURDF(os.path.join(URDF_PATH, "room.urdf"), useFixedBase=True)
+    # 2. Set Floor Friction (Requirement: mu=0.5)
+    # The floor is link index 0 in our new URDF (since it's the first child of world)
+    # We set lateral friction to 0.5
+    p.changeDynamics(room_id, -1, lateralFriction=0.5)
+    p.changeDynamics(room_id, 0, lateralFriction=0.5)
 
     # 3. Load Robot (at 0,0,0) - Loaded to ensure we don't spawn obstacles on top of it
-    robot_start_pos = [0, 0, 0.2]  # Slightly above ground to prevent falling through
+    robot_start_pos = [0, 0, 0]
     robot_start_orn = p.getQuaternionFromEuler([0, 0, 0])
     robot_id = p.loadURDF(ROBOT_URDF, robot_start_pos, robot_start_orn)
 
@@ -83,15 +82,15 @@ def build_world(gui=True):
     # Bounds: -4 to 4 to keep inside 10x10 room
     while True:
         t_pos_xy = get_random_pos([-4, 4, -4, 4])
-        if not is_overlapping(t_pos_xy, 0.5, spawned_objects):  # Table radius 0.5
+        if not is_overlapping(t_pos_xy, 1.0, spawned_objects):  # Table radius approx 1.0
             break
 
     table_pos = [t_pos_xy[0], t_pos_xy[1], 0]
     table_orn = p.getQuaternionFromEuler([0, 0, random.uniform(-3.14, 3.14)])
     table_id = p.loadURDF(os.path.join(URDF_PATH, "table.urdf"), table_pos, table_orn, useFixedBase=True)
 
-    spawned_objects.append({'pos': t_pos_xy, 'radius': 0.5})
-    knowledge_base['table'] = {"position": table_pos, "orientation": list(table_orn), "size": [1.0, 0.625]}
+    spawned_objects.append({'pos': t_pos_xy, 'radius': 1.0})
+    knowledge_base['table'] = {"position": table_pos, "orientation": list(table_orn), "size": [1.5, 0.8]}
 
     # 5. Spawn Target Object (ON the table)
     # We must calculate the position relative to the table center + table rotation
@@ -141,7 +140,7 @@ def build_world(gui=True):
 
     print("World Generated. Map saved to initial_map.json")
 
-    return robot_id, table_id, target_id
+    return robot_id, table_id, room_id, target_id
 
 
 if __name__ == "__main__":

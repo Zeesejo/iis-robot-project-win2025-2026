@@ -2,6 +2,14 @@ import numpy as np
 from src.robot.sensor_wrapper import *
 import cv2
 
+def get_link_in_by_name(body_id, link_name):
+    for i in range(p.getNumJoints(body_id)):
+        info = p.getJointInfo(body_id, i)
+        name = info[12].decode("utf-8")
+        if name == link_name:
+            return i
+    raise ValueError(f"Link {link_name} not found")
+
 def get_sensor_data(robot_id, camera_id, lidar_id):
     rgb, depth, mask = get_camera_image(robot_id, camera_id)
     lidar_data = get_lidar_data(robot_id, lidar_id)
@@ -25,3 +33,9 @@ def get_sensor_data(robot_id, camera_id, lidar_id):
     }
 
     return sensor_data
+
+def get_sensor_id(body_id):
+    camera_id = get_link_in_by_name(body_id, "rgbd_camera_link")
+    lidar_id = get_link_in_by_name(body_id, "lidar_link")
+
+    return camera_id, lidar_id

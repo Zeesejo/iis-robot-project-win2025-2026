@@ -12,7 +12,7 @@ import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from src.robot.sensor_wrapper import *
 from src.environment.world_builder import build_world
-from src.modules.sensor_preprocessing import get_sensor_data
+from src.modules.sensor_preprocessing import get_sensor_data, get_sensor_id
 
 ####################### Function Signature #################################
 
@@ -187,19 +187,10 @@ def pid_to_target(robot_id, target_pos):
     return dist_error
 #############################################################################################################
 
-def get_link_in_by_name(body_id, link_name):
-    for i in range(p.getNumJoints(body_id)):
-        info = p.getJointInfo(body_id, i)
-        name = info[12].decode("utf-8")
-        if name == link_name:
-            return i
-    raise ValueError(f"Link {link_name} not found")
-
 ########################################### Setting Up the Environment ######################################
 def setup_simulation():
     robot_id, table_id, room_id, target_id = build_world()
-    camera_id = get_link_in_by_name(robot_id, "rgbd_camera_link")
-    lidar_id = get_link_in_by_name(robot_id, "lidar_link")
+    camera_id, lidar_id = get_sensor_id(robot_id)
     
     return robot_id, table_id, room_id, target_id, camera_id, lidar_id
 ##########################################################################################################

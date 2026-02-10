@@ -1,4 +1,4 @@
-import pybullet as p
+﻿import pybullet as p
 import pybullet_data
 import random
 import time
@@ -54,17 +54,16 @@ def build_world(gui=True):
     p.setAdditionalSearchPath(pybullet_data.getDataPath())
     p.setGravity(0, 0, -9.81)
 
-    # 1. Load Room (Which now includes the floor)
+    # 1. Load Floor (Plane)
+    floor_id = p.loadURDF("plane.urdf")
+    p.changeVisualShape(floor_id, -1, rgbaColor=[0.2, 0.2, 0.2, 1])
+    p.changeDynamics(floor_id, -1, lateralFriction=0.5)
+
+    # 2. Load Room Walls
     room_id = p.loadURDF(os.path.join(URDF_PATH, "room.urdf"), useFixedBase=True)
 
-    # 2. Set Floor Friction (Requirement: mu=0.5)
-    # The floor is link index 0 in our new URDF (since it's the first child of world)
-    # We set lateral friction to 0.5
-    p.changeDynamics(room_id, -1, lateralFriction=0.5)
-    p.changeDynamics(room_id, 0, lateralFriction=0.5)
-
-    # 3. Load Robot (at 0,0,0) - Loaded to ensure we don't spawn obstacles on top of it
-    robot_start_pos = [0, 0, 0]
+    # 3. Load Robot (at 0,0,0.2) - Slightly above ground to prevent falling through floor
+    robot_start_pos = [0, 0, 0.2]
     robot_start_orn = p.getQuaternionFromEuler([0, 0, 0])
     robot_id = p.loadURDF(ROBOT_URDF, robot_start_pos, robot_start_orn)
 

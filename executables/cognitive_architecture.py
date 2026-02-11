@@ -11,6 +11,9 @@ import sys
 import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from src.robot.sensor_wrapper import *
+from src.environment.world_builder import build_world
+from src.modules.sensor_preprocessing import get_sensor_data, get_sensor_id
+from src.modules.perception import PerceptionModule
 
 ####################### Function Signature #################################
 
@@ -83,7 +86,7 @@ def save_camera_data(rgb, depth, filename_prefix="frame"):
 
 def move_arm_to_coordinate(arm_id, target_id):
     # Joint 6 is the last joint (lbr_iiwa_joint_7)
-    end_effector_index = 6 
+    end_effector_index = 15
     
     #0. get target pose
     target_pos, target_orn = p.getBasePositionAndOrientation(target_id)
@@ -92,12 +95,12 @@ def move_arm_to_coordinate(arm_id, target_id):
     # 1. Compute Inverse Kinematics
     joint_poses = p.calculateInverseKinematics(
                   bodyUniqueId=arm_id,
-                  endEffectorLinkIndex=6,
+                  endEffectorLinkIndex=end_effector_index,
                   targetPosition=target_pos
     )
     
     # 2. Command all 7 joints
-    for i in range(7):
+    for i in range(len(joint_poses)):
         p.setJointMotorControl2(
             bodyIndex=arm_id, 
             jointIndex=i, 
@@ -178,50 +181,29 @@ def pid_to_target(robot_id, target_pos):
     for i in [3, 5]: # Righ
         p.setJointMotorControl2(robot_id, i, p.VELOCITY_CONTROL, targetVelocity=1.0, force=1500.)
     dist_error=1.0
+
+    rob_pos = p.getBasePositionAndOrientation(robot_id)[0]
+    dist_error = np.linalg.norm(np.array(target_pos) - np.array(rob_pos))
+
     return dist_error
 #############################################################################################################
 
 ########################################### Setting Up the Environment ######################################
-
-
 def setup_simulation():
-    p.connect(p.GUI)
-    p.setAdditionalSearchPath(pybullet_data.getDataPath())
-    p.setGravity(0, 0, -9.81)
-
-    # 1. Spawn the Room
-    room_id=p.loadURDF("../src/environment/room.urdf", [0, 0, 0], useFixedBase=True)
-
-    # 2. Spawn the Target Table
-    table_id = p.loadURDF("table/table.urdf", basePosition=[2, 2, 0.0], useFixedBase=True)
-    #Overwrite table mass
-    #p.changeDynamics(table_id, -1, mass=10.0)
-
-    # 3. Spawn Obstacles (Random Blocks)
-    # A heavy crate
-    p.loadURDF("block.urdf", basePosition=[1, 0, 0.1], globalScaling=5.0) 
-    # A simple block obstacle
-    target_id=p.loadURDF("block.urdf", basePosition=[1.8, 1.8, 0.8], globalScaling=2.0)
-
-    # 4. Spawn the Husky Robot
-    robot_id = p.loadURDF("husky/husky.urdf", basePosition=[-3, -3, 0.2])
+    robot_id, table_id, room_id, target_id = build_world()
+    camera_id, lidar_id = get_sensor_id(robot_id)
     
-    # 5. Spawn the Gripper on the Table
-    arm_id = p.loadURDF("kuka_iiwa/model.urdf", [2, 2, 0.625], useFixedBase=True)
-    
-    return robot_id, table_id, room_id, arm_id, target_id
+    return robot_id, table_id, room_id, target_id, camera_id, lidar_id
 ##########################################################################################################
 
 ############################################ The Main Function ###########################################
 def main():
-    robot_id, table_id, room_id, arm_id, target_id = setup_simulation()
-    print(get_joint_map(arm_id))
+    robot_id, table_id, room_id, target_id, camera_id, lidar_id = setup_simulation()
+    target = p.getBasePositionAndOrientation(table_id)[0]
     
-    print("Room initialized. Husky is at (-3, -3). Table is at (2, 2).")
-
-    target = [2, 2, 0] # The table position
+    # Initialize the Perception Module
+    perception = PerceptionModule()
     
-    """
     # Run this ONCE before your simulation loop in p.TORQUE_CONTROL
     for i in [2, 3, 4, 5]:
       p.setJointMotorControl2(
@@ -231,22 +213,49 @@ def main():
         targetVelocity=0, 
         force=0  # This "disables" the internal motor
       )
-     """
+     
     
     step_counter=0
     ##################### LOOP STRUCTURE ############################################
     while p.isConnected(): # DO NOT TOUCH
-       
        # Inside your while loop:
-       if step_counter % 240 == 0:  # Save once per second
-           rgb, depth, mask = get_camera_image(robot_id)
-           save_camera_data(rgb, depth, filename_prefix=f"frame_{step_counter}")
+       if step_counter % 240 == 0:  # Run perception once per second
+           sensor_data = get_sensor_data(robot_id, camera_id, lidar_id)
+           
+           # --- M4 PERCEPTION ---
+           perception_results = perception.process_frame(
+               sensor_data["camera_rgb"],
+               sensor_data["camera_depth"]
+           )
+           
+           # Print detection results
+           print(f"\n--- Perception @ step {step_counter} ---")
+           for det in perception_results['detections']:
+               print(f"  Detected: {det['color']} object, bbox={det['bbox']}, area={det['area']}")
+           if perception_results['table_plane']:
+               model = perception_results['table_plane']['model']
+               print(f"  Table plane (A,B,C,D): ({model[0]:.3f}, {model[1]:.3f}, {model[2]:.3f}, {model[3]:.3f})")
+           if perception_results['target_pose']:
+               print(f"  Target pose center: {[round(v,3) for v in perception_results['target_pose']['center']]}")
+               print(f"  Target OBB dims:    {[round(v,3) for v in perception_results['target_pose']['dimensions']]}")
+           for obs in perception_results['obstacle_poses']:
+               print(f"  Obstacle [{obs['color']}] center: {[round(v,3) for v in obs['center']]}")
+           
+           # Save annotated image only when objects are detected
+           if perception_results['detections']:
+               rgb_arr = np.reshape(sensor_data["camera_rgb"], (240, 320, 4)).astype(np.uint8)
+               annotated = cv2.cvtColor(rgb_arr, cv2.COLOR_RGBA2BGR)
+               for det in perception_results['detections']:
+                   x, y, w, h = det['bbox']
+                   cv2.rectangle(annotated, (x, y), (x+w, y+h), (0, 255, 0), 2)
+                   cv2.putText(annotated, det['color'], (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,255,0), 1)
+               os.makedirs("perception_out", exist_ok=True)
+               cv2.imwrite(f"perception_out/annotated_{step_counter}.png", annotated)
+           
        step_counter=step_counter+1
-       move_arm_to_coordinate(arm_id, target_id)  
+       move_arm_to_coordinate(robot_id, target_id)  
        dist = pid_to_target(robot_id, target)
-       print ('Distance: ', dist)
        if dist < 2:
-             print("Target Reached!")
              # Apply braking torque
              for i in range(2, 6):
                  p.setJointMotorControl2(
@@ -260,21 +269,6 @@ def main():
        p.stepSimulation()  # DO NOT TOUCH
        time.sleep(1./240.) # DO NOT TOUCH
 ####################################################################################################
-#################################Perception#########################################################
-from src.modules.perception import PerceptionModule, preprocess_sensor_data, extract_target_position
-
-# Initialize
-perception = PerceptionModule()
-
-# In your main loop:
-rgb, depth, mask = get_camera_image(robot_id)
-rgb, depth = preprocess_sensor_data(rgb, depth)
-scene = perception.process_scene(rgb, depth)
-
-# Get target position for navigation
-target_pos = extract_target_position(scene)
-if target_pos:
-    pid_to_target(robot_id, target_pos)
 
 
 ################ The Main Thread ###################################################################

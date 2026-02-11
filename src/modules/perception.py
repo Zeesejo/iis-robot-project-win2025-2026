@@ -1,296 +1,340 @@
 import numpy as np
 import cv2
-from sklearn.decomposition import PCA
-from typing import Tuple, List, Dict, Optional
+SCENE_OBJECTS = {
+    'table':      {'rgb': [0.5, 0.3, 0.1], 'type': 'plane',   'dims': [1.5, 0.8, 0.625]},
+    'target':     {'rgb': [1.0, 0.0, 0.0], 'type': 'cylinder', 'dims': [0.04, 0.04, 0.12]},
+    'blue_obs':   {'rgb': [0.0, 0.0, 1.0], 'type': 'cube',    'dims': [0.4, 0.4, 0.4]},
+    'pink_obs':   {'rgb': [1.0, 0.75, 0.8],'type': 'cube',    'dims': [0.4, 0.4, 0.4]},
+    'orange_obs': {'rgb': [1.0, 0.64, 0.0],'type': 'cube',    'dims': [0.4, 0.4, 0.4]},
+    'yellow_obs': {'rgb': [1.0, 1.0, 0.0], 'type': 'cube',    'dims': [0.4, 0.4, 0.4]},
+    'black_obs':  {'rgb': [0.0, 0.0, 0.0], 'type': 'cube',    'dims': [0.4, 0.4, 0.4]},
+}
+COLOR_RANGES_HSV = {
+    'red':    [(np.array([0,  120, 70]),  np.array([10, 255, 255])),
+               (np.array([170, 120, 70]), np.array([180, 255, 255]))],
+    'brown':  [(np.array([10,  80, 30]),  np.array([25, 180, 180]))],
+    'blue':   [(np.array([100, 120, 70]), np.array([130, 255, 255]))],
+    'pink':   [(np.array([140, 40, 100]), np.array([180, 255, 255]))],
+    'orange': [(np.array([5,  180, 180]), np.array([25, 255, 255]))],
+    'yellow': [(np.array([25, 120, 120]), np.array([35, 255, 255]))],
+    'black':  [(np.array([0,   0,   0]),  np.array([180, 80,  50]))],
+}
+class SiftFeatureExtractor:
 
+    def __init__(self):
+        self.sift = cv2.SIFT_create()
+
+    def compute_sift(self, image):
+        if len(image.shape) > 2:
+            gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        else:
+            gray_image = image
+        kp, des = self.sift.detectAndCompute(gray_image, None)
+        return kp, des
+
+    def match_and_classify(self, test_des, knowledge_base, ratio_threshold=0.75):
+        if test_des is None:
+            return "Unknown", 0
+        bf = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
+        best_match_count = -1
+        best_category = "Unknown"
+
+        for category, descriptor_list in knowledge_base.items():
+            total_matches = 0
+            for train_des in descriptor_list:
+                if train_des is None:
+                    continue
+                matches = bf.knnMatch(test_des, train_des, k=2)
+                good = [m for m, n in matches if m.distance < ratio_threshold * n.distance]
+                total_matches += len(good)
+            avg = total_matches / len(descriptor_list) if descriptor_list else 0
+            if avg > best_match_count:
+                best_match_count = avg
+                best_category = category
+
+        return best_category, best_match_count
+    
+def edge_contour_segmentation(rgb_image, min_contour_area=500, ratio_threshold=5.0):
+    if len(rgb_image.shape) > 2:
+        gray = cv2.cvtColor(rgb_image, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = rgb_image
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edge_map = cv2.Canny(blurred, 50, 150)
+
+    contours, _ = cv2.findContours(edge_map.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    mask = np.zeros_like(gray, dtype=np.uint8)
+
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < min_contour_area:
+            continue
+        x, y, w, h = cv2.boundingRect(contour)
+        aspect_ratio = float(w) / h if h > 0 else 0
+        if aspect_ratio > ratio_threshold:
+            continue
+        cv2.drawContours(mask, [contour], -1, 255, thickness=cv2.FILLED)
+
+    return mask, edge_map
+
+def detect_objects_by_color(bgr_image, min_area=200):
+    hsv = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2HSV)
+    detections = []
+
+    for color_name, ranges in COLOR_RANGES_HSV.items():
+        combined_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+        for (lower, upper) in ranges:
+            combined_mask |= cv2.inRange(hsv, lower, upper)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel)
+        combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel)
+
+        contours, _ = cv2.findContours(combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < min_area:
+                continue
+            x, y, w, h = cv2.boundingRect(cnt)
+            detections.append({
+                'color': color_name, 'bbox': (x, y, w, h),
+                'area': area, 'contour': cnt, 'mask': combined_mask,
+            })
+    return detections
+
+class RANSAC_Segmentation:
+    def __init__(self, points, max_iterations=1000, distance_threshold=0.01, min_inliers_ratio=0.3):
+        self.points = points
+        self.distance_threshold = distance_threshold
+        self.max_iterations = max_iterations
+        self.N = len(points)
+        self.min_inliers = int(min_inliers_ratio * self.N)
+
+    def _fit_plane(self, samples):
+        """Calculates plane coefficients (A, B, C, D) from 3 points."""
+        p1, p2, p3 = samples[0], samples[1], samples[2]
+        v1 = p2 - p1
+        v2 = p3 - p1
+        normal = np.cross(v1, v2)
+        norm = np.linalg.norm(normal)
+        if norm == 0:
+            return None
+        A, B, C = normal / norm
+        D = -(A * p1[0] + B * p1[1] + C * p1[2])
+        return A, B, C, D
+
+    def _get_inliers(self, points, plane_model):
+        """Determines inliers by perpendicular distance to the plane."""
+        A, B, C, D = plane_model
+        distances = np.abs(A * points[:, 0] + B * points[:, 1] + C * points[:, 2] + D)
+        inliers_mask = distances < self.distance_threshold
+        return np.sum(inliers_mask), inliers_mask
+
+    def run(self):
+        """Executes RANSAC loop, returns (inlier_mask, plane_model)."""
+        best_count = 0
+        best_mask = np.zeros(self.N, dtype=bool)
+        best_model = None
+        if self.N < 3:
+            return best_mask, None
+        for _ in range(self.max_iterations):
+            idx = np.random.choice(self.N, 3, replace=False)
+            model = self._fit_plane(self.points[idx])
+            if model is None:
+                continue
+            count, mask = self._get_inliers(self.points, model)
+            if count > best_count:
+                best_count = count
+                best_model = model
+                best_mask = mask
+                if best_count >= self.min_inliers:
+                    break
+        return best_mask, best_model
+def compute_pca(points):
+    if len(points) < 3:
+        raise ValueError("Not enough points for PCA.")
+    center = np.mean(points, axis=0)
+    centered = points - center
+    cov = np.cov(centered, rowvar=False)
+    eigenvalues, eigenvectors = np.linalg.eigh(cov)
+    order = np.argsort(eigenvalues)[::-1]
+    eigenvectors = eigenvectors[:, order]
+    projected = np.dot(centered, eigenvectors)
+    mins = np.min(projected, axis=0)
+    maxs = np.max(projected, axis=0)
+    dimensions = maxs - mins
+    obb_offset = (mins + maxs) / 2
+    obb_center = center + np.dot(obb_offset, eigenvectors.T)
+    return obb_center, eigenvectors, dimensions
+
+
+def refine_object_points(points, obb_center, obb_vectors, obb_dims, tolerance=1.1):
+    """Geometric refinement — removes outlier points (same as provided code)."""
+    if len(points) == 0:
+        return points
+    v1 = obb_vectors[:, 0]
+    est_radius = (obb_dims[1] + obb_dims[2]) / 4.0
+    centered = points - obb_center
+    proj_v1 = np.dot(centered, v1)
+    parallel = proj_v1[:, np.newaxis] * v1
+    radial_dist = np.linalg.norm(centered - parallel, axis=1)
+    half_len = obb_dims[0] / 2
+    radial_ok = radial_dist < (est_radius * tolerance)
+    axial_ok = (proj_v1 >= -half_len * tolerance) & (proj_v1 <= half_len * tolerance)
+    return points[radial_ok & axial_ok]
+
+def depth_to_point_cloud(depth_buffer, width=320, height=240, fov=60, near=0.1, far=10.0):
+    """Convert PyBullet depth buffer to 3D point cloud."""
+    depth_linear = far * near / (far - (far - near) * depth_buffer)
+    depth_2d = np.reshape(depth_linear, (height, width))
+
+    aspect = width / height
+    fy = height / (2.0 * np.tan(np.radians(fov / 2.0)))
+    fx = fy * aspect
+    cx, cy = width / 2.0, height / 2.0
+
+    v, u = np.indices((height, width))
+    z = depth_2d
+    x = (u - cx) * z / fx
+    y = (v - cy) * z / fy
+
+    points = np.stack([x, y, z], axis=-1).reshape(-1, 3)
+    valid = (z.flatten() > near) & (z.flatten() < far * 0.99)
+    return points[valid], valid
 
 class PerceptionModule:
-    OBJECT_COLORS = {
-        'table': np.array([0.5, 0.3, 0.1]),      # Brown
-        'target': np.array([1.0, 0.0, 0.0]),     # Red
-        'obstacle_blue': np.array([0.0, 0.0, 1.0]),   # Blue
-        'obstacle_pink': np.array([1.0, 0.75, 0.8]),  # Pink
-        'obstacle_orange': np.array([1.0, 0.5, 0.0]), # Orange
-        'obstacle_yellow': np.array([1.0, 1.0, 0.0]), # Yellow
-        'obstacle_black': np.array([0.0, 0.0, 0.0]),  # Black
-        'floor': np.array([0.2, 0.2, 0.2]),      # Gray
-    }
-    OBJECT_SPECS = {
-        'table': {'height': 0.625, 'width': 1.5, 'depth': 0.8},
-        'target': {'radius': 0.04, 'height': 0.12},  # Cylinder
-        'obstacle': {'size': 0.4}  # Cube side length
-    }
-    
-    def __init__(self, color_tolerance: float = 0.2, ransac_threshold: float = 0.01):
-        self.color_tolerance = color_tolerance
-        self.ransac_threshold = ransac_threshold
-        
-    def detect_objects_by_color(self, rgb_image: np.ndarray, 
-                                depth_image: np.ndarray,
-                                segmentation_mask: np.ndarray = None) -> Dict[str, List[Dict]]:
-        detected_objects = {
-            'table': [],
-            'target': [],
-            'obstacles': []
-        }
-        
-        if rgb_image.max() > 1.0:
-            rgb_image = rgb_image / 255.0
-        for obj_name, color in self.OBJECT_COLORS.items():
-            mask = self._create_color_mask(rgb_image, color)
-            
-            if mask.sum() > 0:
-                points_3d = self._depth_to_pointcloud(depth_image, mask)
-                
-                if len(points_3d) > 10:  
-                    # Compute object properties
-                    centroid = np.mean(points_3d, axis=0)
-                    bbox_min = np.min(points_3d, axis=0)
-                    bbox_max = np.max(points_3d, axis=0)
-                    size = bbox_max - bbox_min
-                    
-                    obj_info = {
-                        'name': obj_name,
-                        'color': color,
-                        'centroid': centroid,
-                        'bbox_min': bbox_min,
-                        'bbox_max': bbox_max,
-                        'size': size,
-                        'points': points_3d,
-                        'pixel_count': mask.sum()
-                    }
-                    
-                    # Categorize detected object
-                    if 'table' in obj_name:
-                        detected_objects['table'].append(obj_info)
-                    elif 'target' in obj_name:
-                        detected_objects['target'].append(obj_info)
-                    elif 'obstacle' in obj_name:
-                        detected_objects['obstacles'].append(obj_info)
-        
-        return detected_objects
-    
-    def _create_color_mask(self, rgb_image: np.ndarray, target_color: np.ndarray) -> np.ndarray:
-        color_diff = np.linalg.norm(rgb_image - target_color, axis=2)
-        mask = color_diff < self.color_tolerance
-        return mask
-    def _depth_to_pointcloud(self, depth_image: np.ndarray, 
-                            mask: np.ndarray = None,
-                            fx: float = 525.0, 
-                            fy: float = 525.0,
-                            cx: float = None, 
-                            cy: float = None) -> np.ndarray:
-        h, w = depth_image.shape
-        
-        if cx is None:
-            cx = w / 2.0
-        if cy is None:
-            cy = h / 2.0
-        
-        u, v = np.meshgrid(np.arange(w), np.arange(h))
+    def __init__(self):
+        self.sift_extractor = SiftFeatureExtractor()
+        self.knowledge_base = {}   # SIFT KB built from observations
 
-        if mask is not None:
-            u = u[mask]
-            v = v[mask]
-            depth = depth_image[mask]
-        else:
-            u = u.flatten()
-            v = v.flatten()
-            depth = depth_image.flatten()
-        
-        valid = (depth > 0) & (depth < 100) 
-        u = u[valid]
-        v = v[valid]
-        depth = depth[valid]
-        x = (u - cx) * depth / fx
-        y = (v - cy) * depth / fy
-        z = depth
-        
-        points_3d = np.stack([x, y, z], axis=1)
-        
-        return points_3d
-    
-    def identify_table_plane_ransac(self, points_3d: np.ndarray,
-                                   max_iterations: int = 1000,
-                                   min_inliers: int = 100) -> Optional[Dict]:
-        if len(points_3d) < 3:
-            return None
-        
-        best_plane = None
-        best_inliers = 0
-        
-        for _ in range(max_iterations):
-            idx = np.random.choice(len(points_3d), 3, replace=False)
-            p1, p2, p3 = points_3d[idx]
-            v1 = p2 - p1
-            v2 = p3 - p1
-            normal = np.cross(v1, v2)
-            norm = np.linalg.norm(normal)
-            if norm < 1e-6: 
-                continue
-            normal = normal / norm
-            d = -np.dot(normal, p1)
-            distances = np.abs(np.dot(points_3d, normal) + d)
-            inliers = distances < self.ransac_threshold
-            num_inliers = np.sum(inliers)
-            if num_inliers > best_inliers:
-                best_inliers = num_inliers
-                best_plane = {
-                    'normal': normal,
-                    'd': d,
-                    'inliers': inliers,
-                    'num_inliers': num_inliers,
-                    'centroid': np.mean(points_3d[inliers], axis=0)
-                }
-        if best_plane and best_plane['num_inliers'] >= min_inliers:
-            return best_plane
-        
-        return None
-    
-    def compute_grasp_pose_pca(self, points_3d: np.ndarray) -> Dict:
-        if len(points_3d) < 3:
-            raise ValueError("Need at least 3 points for PCA")
-        centroid = np.mean(points_3d, axis=0)
-        centered_points = points_3d - centroid
-        pca = PCA(n_components=3)
-        pca.fit(centered_points)
-        principal_axes = pca.components_ 
-        explained_variance = pca.explained_variance_
-        projections = np.dot(centered_points, principal_axes.T)
-        dimensions = np.max(projections, axis=0) - np.min(projections, axis=0)
-        approach_idx = np.argmin(explained_variance)
-        approach_vector = principal_axes[approach_idx]
-        if approach_vector[2] < 0:
-            approach_vector = -approach_vector
-        grasp_width = np.min(dimensions)
-        
-        return {
-            'centroid': centroid,
-            'principal_axes': principal_axes,
-            'dimensions': dimensions,
-            'approach_vector': approach_vector,
-            'grasp_width': grasp_width,
-            'explained_variance': explained_variance
-        }
-    
-    def compute_avoidance_pose_pca(self, points_3d: np.ndarray) -> Dict:
-        if len(points_3d) < 3:
-            raise ValueError("Need at least 3 points for PCA")
-        centroid = np.mean(points_3d, axis=0)
-        centered_points = points_3d - centroid
-        pca = PCA(n_components=3)
-        pca.fit(centered_points)
-        principal_axes = pca.components_
-        projections = np.dot(centered_points, principal_axes.T)
-        dimensions = np.max(projections, axis=0) - np.min(projections, axis=0)
-        bounding_radius = np.max(np.linalg.norm(centered_points, axis=1))
-        longest_axis_idx = np.argmax(dimensions)
-        longest_axis = principal_axes[longest_axis_idx]
-        xy_component = longest_axis[:2]
-        if np.linalg.norm(xy_component) > 1e-6:
-            xy_normalized = xy_component / np.linalg.norm(xy_component)
-            avoidance_directions = [
-                np.array([xy_normalized[1], -xy_normalized[0], 0]),
-                np.array([-xy_normalized[1], xy_normalized[0], 0]) 
-            ]
-        else:
-            avoidance_directions = [
-                np.array([1, 0, 0]),
-                np.array([0, 1, 0]),
-                np.array([-1, 0, 0]),
-                np.array([0, -1, 0])
-            ]
-        
-        return {
-            'centroid': centroid,
-            'principal_axes': principal_axes,
-            'dimensions': dimensions,
-            'avoidance_directions': avoidance_directions,
-            'bounding_radius': bounding_radius
-        }
-    
-    def process_scene(self, rgb_image: np.ndarray, 
-                     depth_image: np.ndarray) -> Dict:
-        scene = {
-            'table': None,
-            'target': None,
-            'obstacles': [],
-            'timestamp': None
-        }
-        detected = self.detect_objects_by_color(rgb_image, depth_image)
-        if detected['table']:
-            table_obj = detected['table'][0]
-            table_points = table_obj['points']
-            
-            plane_info = self.identify_table_plane_ransac(table_points)
-            
-            if plane_info:
-                table_obj['plane'] = plane_info
-                scene['table'] = table_obj
-        if detected['target']:
-            target_obj = detected['target'][0]
-            target_points = target_obj['points']
-            
-            try:
-                grasp_pose = self.compute_grasp_pose_pca(target_points)
-                target_obj['grasp_pose'] = grasp_pose
-                scene['target'] = target_obj
-            except ValueError:
-                scene['target'] = target_obj
-        for obstacle_obj in detected['obstacles']:
-            obstacle_points = obstacle_obj['points']
-            
-            try:
-                avoidance_pose = self.compute_avoidance_pose_pca(obstacle_points)
-                obstacle_obj['avoidance_pose'] = avoidance_pose
-                scene['obstacles'].append(obstacle_obj)
-            except ValueError:
-                scene['obstacles'].append(obstacle_obj)
-        
-        return scene
-    
-    def visualize_detection(self, rgb_image: np.ndarray, 
-                           scene: Dict) -> np.ndarray:
-        vis_image = rgb_image.copy()
-        
-        if vis_image.max() <= 1.0:
-            vis_image = (vis_image * 255).astype(np.uint8)
-        if scene['table']:
-            cv2.putText(vis_image, "TABLE", (10, 30), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 1, (139, 76, 25), 2)
-        if scene['target']:
-            cv2.putText(vis_image, "TARGET", (10, 60), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
-        for i, obs in enumerate(scene['obstacles']):
-            cv2.putText(vis_image, f"OBSTACLE {i+1}", (10, 90 + i*30), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-        
-        return vis_image
+    def build_knowledge_base(self, category_images):
+        for cat, img_list in category_images.items():
+            self.knowledge_base[cat] = []
+            for img in img_list:
+                _, des = self.sift_extractor.compute_sift(img)
+                if des is not None:
+                    self.knowledge_base[cat].append(des)
 
-def preprocess_sensor_data(rgb: np.ndarray, depth: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    if rgb.max() > 1.0:
-        rgb = rgb / 255.0
-    depth_filtered = cv2.medianBlur(depth.astype(np.float32), 5)
-    mask = (depth_filtered == 0)
-    if mask.sum() > 0:
-        depth_filtered = cv2.inpaint(depth_filtered, mask.astype(np.uint8), 3, cv2.INPAINT_TELEA)
-    return rgb, depth_filtered
+    def classify_roi(self, roi_image):
+        """Classify a region-of-interest using the SIFT knowledge base."""
+        _, des = self.sift_extractor.compute_sift(roi_image)
+        return self.sift_extractor.match_and_classify(des, self.knowledge_base)
 
+    def process_frame(self, rgb, depth, width=320, height=240):
+        rgb_array = np.reshape(rgb, (height, width, 4)).astype(np.uint8)
+        bgr = cv2.cvtColor(rgb_array, cv2.COLOR_RGBA2BGR)
 
-def extract_target_position(scene: Dict) -> Optional[np.ndarray]:
-    if scene['target'] and 'grasp_pose' in scene['target']:
-        return scene['target']['grasp_pose']['centroid']
-    elif scene['target']:
-        return scene['target']['centroid']
-    return None
+        detections = detect_objects_by_color(bgr)
 
-def extract_obstacle_positions(scene: Dict) -> List[np.ndarray]:
-    positions = []
-    for obs in scene['obstacles']:
-        if 'avoidance_pose' in obs:
-            positions.append(obs['avoidance_pose']['centroid'])
-        else:
-            positions.append(obs['centroid'])
-    return positions
-if __name__ == "__main__":
-    perception = PerceptionModule(color_tolerance=0.2, ransac_threshold=0.01)
+        seg_mask, _ = edge_contour_segmentation(bgr, min_contour_area=300)
+
+        depth_arr = np.array(depth).reshape(height, width)
+        points_3d, valid_mask = depth_to_point_cloud(depth_arr, width, height)
+
+        results = {'detections': detections, 'table_plane': None,
+                   'target_pose': None, 'obstacle_poses': []}
+
+        if len(points_3d) < 10:
+            return results
+
+        # --- E) RANSAC: Identify the table plane ---
+        ransac = RANSAC_Segmentation(
+            points=points_3d, max_iterations=500,
+            distance_threshold=0.02, min_inliers_ratio=0.2
+        )
+        plane_mask, plane_model = ransac.run()
+
+        if plane_model is not None:
+            results['table_plane'] = {
+                'model': plane_model,
+                'num_inliers': int(np.sum(plane_mask))
+            }
+
+        # --- F) Separate plane (table) from objects ---
+        object_points = points_3d[~plane_mask]
+        if len(object_points) < 10:
+            return results
+
+        # --- G) PCA on all object points for target pose ---
+        try:
+            center, vectors, dims = compute_pca(object_points)
+            refined = refine_object_points(object_points, center, vectors, dims)
+            if len(refined) > 10:
+                center, vectors, dims = compute_pca(refined)
+            results['target_pose'] = {
+                'center': center.tolist(),
+                'axes': vectors.tolist(),
+                'dimensions': dims.tolist()
+            }
+        except ValueError:
+            pass
+
+        for det in detections:
+            if det['color'] in ['blue', 'pink', 'orange', 'yellow', 'black']:
+                x, y, w, h = det['bbox']
+                roi_depth = depth_arr[y:y+h, x:x+w]
+                if roi_depth.size == 0:
+                    continue
+                roi_pts, _ = depth_to_point_cloud(roi_depth.flatten(), w, h)
+                if len(roi_pts) < 10:
+                    continue
+                try:
+                    oc, ov, od = compute_pca(roi_pts)
+                    results['obstacle_poses'].append({
+                        'color': det['color'],
+                        'center': oc.tolist(),
+                        'axes': ov.tolist(),
+                        'dimensions': od.tolist()
+                    })
+                except ValueError:
+                    continue
+
+        return results
+
+if __name__ == '__main__':
+
+    np.random.seed(42)
+    num_plane, num_obj = 5000, 1500
+
+    px = np.random.uniform(-0.75, 0.75, num_plane)
+    py = np.random.uniform(-0.4, 0.4, num_plane)
+    pz = 0.625 + np.random.normal(0, 0.005, num_plane)
+    plane_pts = np.stack([px, py, pz], axis=1)
+
+    theta = np.random.uniform(0, 2 * np.pi, num_obj)
+    r = 0.04 * np.sqrt(np.random.rand(num_obj))
+    cx = r * np.cos(theta) + 0.2
+    cy = r * np.sin(theta) - 0.1
+    cz = np.random.uniform(0.625, 0.625 + 0.12, num_obj)
+    cyl_pts = np.stack([cx, cy, cz], axis=1)
+
+    full_cloud = np.concatenate([plane_pts, cyl_pts], axis=0)
+    np.random.shuffle(full_cloud)
+    print(f"\nSynthetic scene: {len(full_cloud)} pts ({num_plane} plane, {num_obj} cylinder)")
+
+    ransac = RANSAC_Segmentation(full_cloud, max_iterations=500,
+                                  distance_threshold=0.02, min_inliers_ratio=0.3)
+    plane_mask, model = ransac.run()
+    obj_pts = full_cloud[~plane_mask]
+    print(f"RANSAC → Plane: {np.sum(plane_mask)} pts, Objects: {len(obj_pts)} pts")
+    if model:
+        print(f"  Plane (A,B,C,D): ({model[0]:.4f}, {model[1]:.4f}, {model[2]:.4f}, {model[3]:.4f})")
+
+    c1, v1, d1 = compute_pca(obj_pts)
+    print(f"Preliminary PCA → center={c1.round(4)}, dims={d1.round(4)}")
+    refined = refine_object_points(obj_pts, c1, v1, d1, tolerance=1.1)
+    c2, v2, d2 = compute_pca(refined)
+    print(f"Final PCA → center={c2.round(4)}, dims={d2.round(4)}")
+
+    # --- Test color detection ---
+    test_img = np.zeros((240, 320, 3), dtype=np.uint8)
+    cv2.rectangle(test_img, (50, 50), (150, 150), (0, 0, 255), -1)
+    cv2.rectangle(test_img, (200, 100), (280, 180), (255, 0, 0), -1)
+    dets = detect_objects_by_color(test_img, min_area=100)
+    print(f"\nColor detection: {len(dets)} objects found")
+    for d in dets:
+        print(f"  Color={d['color']}, bbox={d['bbox']}, area={d['area']}")
+    sift = SiftFeatureExtractor()
+    kp, des = sift.compute_sift(test_img)
+    print(f"\nSIFT: {len(kp) if kp else 0} keypoints")
+    mask, edges = edge_contour_segmentation(test_img, min_contour_area=100)
+    print(f"Edge segmentation: {np.sum(mask > 0)} mask pixels")

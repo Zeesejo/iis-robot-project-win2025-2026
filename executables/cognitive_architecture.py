@@ -238,7 +238,7 @@ def setup_simulation():
 
 ############################################ The Main Function ###########################################
 def main():
-    robot_id, table_id, room_id, target_id = build_world()
+    robot_id, table_id, room_id, target_id = build_world(gui=False)  # Use DIRECT mode for better performance in Docker
     
     # Debug: Print joint structure
     print(f"\n=== Robot Joint Structure ===")
@@ -271,10 +271,10 @@ def main():
     ##################### LOOP STRUCTURE ############################################
     while p.isConnected(): # DO NOT TOUCH
        
-       # Camera disabled for now to test movement
-       # if step_counter % 240 == 0:  # Save once per second
-       #     rgb, depth, mask = get_camera_image(robot_id)
-       #     save_camera_data(rgb, depth, filename_prefix=f"frame_{step_counter}")
+       # Save camera images every 2 seconds (reduce frequency to avoid lag)
+       if step_counter % 480 == 0:
+           rgb, depth, mask = get_camera_image(robot_id)
+           save_camera_data(rgb, depth, filename_prefix=f"frame_{step_counter}")
        step_counter=step_counter+1
     #    move_arm_to_coordinate(arm_id, target_id)  
        dist = pid_to_target(robot_id, target)

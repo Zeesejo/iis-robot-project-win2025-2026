@@ -1,3 +1,7 @@
+executables/frame_*.png
+executables/*.json
+src/**/__pycache__/
+temp_*
 **/__pycache__/
 
 executables/*.png

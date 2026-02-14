@@ -6,9 +6,6 @@
   <material name="ceiling_color">
     <color rgba="1.0 1.0 1.0 1"/>
   </material>
-  <material name="floor_color">
-    <color rgba="1.0 1.0 1.0 1"/>
-  </material>
 
   <link name="world"/>
 

@@ -11,6 +11,7 @@ import sys
 import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from src.robot.sensor_wrapper import *
+from src.environment.world_builder import build_world
 
 ####################### Function Signature #################################
 
@@ -149,35 +150,58 @@ def detect_collision(robot_id, target_list):
 
 ############################### PID Controller ################################
 # PID Constants (These are the "tuning knobs" for your students)
-Kp_dist = 1.0  # Force to move forward
-Kp_angle = 120.0 # Force to turn
-Kd = 1.0        # Damping to prevent oscillation
-posi=0.3
+Kp_dist = 2.5   # Proportional gain for forward motion
+Kp_angle = 5.0  # Proportional gain for turning
+base_speed = 5.0  # Base forward speed
 
 def pid_to_target(robot_id, target_pos):
+    """
+    Navigate robot to target using differential drive with PID control
+    Returns the distance to target
+    """
+    # 1. SENSE: Get robot's current position and orientation
+    pos, orn = p.getBasePositionAndOrientation(robot_id)
+    robot_x, robot_y, robot_z = pos
     
-    # 4. ACT: Apply raw torque to wheels
-    """
-    # Torque-based Control
-    for i in [2, 4]: # Left
-        p.setJointMotorControl2(robot_id, i, p.TORQUE_CONTROL, force=left_torque)
-    for i in [3, 5]: # Righ
-        p.setJointMotorControl2(robot_id, i, p.TORQUE_CONTROL, force=right_torque)
-    """
-    """
-    # Position-based Control
-    posi=posi+0.1
-    for i in [2, 4]: # Left
-        p.setJointMotorControl2(robot_id, i, p.POSITION_CONTROL, targetPosition=-posi, maxVelocity=20.0, force=1500.)
-    for i in [3, 5]: # Righ
-        p.setJointMotorControl2(robot_id, i, p.POSITION_CONTROL, targetPosition=posi, maxVelocity=20.0, force=1500.)
-    """
-    # Velocity-based Control
-    for i in [2, 4]: # Left
-        p.setJointMotorControl2(robot_id, i, p.VELOCITY_CONTROL, targetVelocity=-1.0, force=1500.)
-    for i in [3, 5]: # Righ
-        p.setJointMotorControl2(robot_id, i, p.VELOCITY_CONTROL, targetVelocity=1.0, force=1500.)
-    dist_error=1.0
+    # Get robot's yaw angle (rotation around z-axis)
+    euler = p.getEulerFromQuaternion(orn)
+    robot_yaw = euler[2]  # Z-axis rotation
+    
+    # 2. THINK: Calculate errors
+    # Distance error
+    dx = target_pos[0] - robot_x
+    dy = target_pos[1] - robot_y
+    dist_error = np.sqrt(dx**2 + dy**2)
+    
+    # Angle to target
+    angle_to_target = np.arctan2(dy, dx)
+    
+    # Heading error (normalized to [-pi, pi])
+    heading_error = angle_to_target - robot_yaw
+    heading_error = np.arctan2(np.sin(heading_error), np.cos(heading_error))
+    
+    # 3. ACT: Compute wheel velocities using differential drive
+    # Forward velocity based on distance
+    forward_vel = Kp_dist * dist_error
+    forward_vel = np.clip(forward_vel, -base_speed, base_speed)
+    
+    # Angular velocity based on heading error
+    angular_vel = Kp_angle * heading_error
+    
+    # Differential drive: convert forward + angular to left/right wheel velocities
+    left_vel = forward_vel - angular_vel
+    right_vel = forward_vel + angular_vel
+    
+    # 4. Execute: Apply velocities to wheels  
+    # Based on robot.urdf: joints 0-3 are the four wheels (fl, fr, bl, br)
+    # Left wheels (fl=0, bl=2), Right wheels (fr=1, br=3)
+    for i in [0, 2]:  # Left wheels
+        p.setJointMotorControl2(robot_id, i, p.VELOCITY_CONTROL, 
+                                targetVelocity=left_vel, force=1500.)
+    for i in [1, 3]:  # Right wheels
+        p.setJointMotorControl2(robot_id, i, p.VELOCITY_CONTROL, 
+                                targetVelocity=right_vel, force=1500.)
+    
     return dist_error
 #############################################################################################################
 
@@ -191,12 +215,22 @@ def setup_simulation():
 
 ############################################ The Main Function ###########################################
 def main():
-    robot_id, table_id, room_id, arm_id, target_id = setup_simulation()
-    print(get_joint_map(arm_id))
+    robot_id, table_id, room_id, target_id = build_world(gui=False)  # Use DIRECT mode for better performance in Docker
     
-    print("Room initialized. Husky is at (-3, -3). Table is at (2, 2).")
-
-    target = [2, 2, 0] # The table position
+    # Debug: Print joint structure
+    print(f"\n=== Robot Joint Structure ===")
+    num_joints = p.getNumJoints(robot_id)
+    for i in range(num_joints):
+        info = p.getJointInfo(robot_id, i)
+        print(f"Joint {i}: {info[1].decode('utf-8')} (Type: {info[2]})")
+    print(f"=============================\n")
+    
+    # Get actual table position (randomized by build_world)
+    table_pos, _ = p.getBasePositionAndOrientation(table_id)
+    target = [table_pos[0], table_pos[1], 0]  # Target the table position
+    
+    robot_pos, _ = p.getBasePositionAndOrientation(robot_id)
+    print(f"Room initialized. Robot at {robot_pos[:2]}, Table at {table_pos[:2]}")
     
     """
     # Run this ONCE before your simulation loop in p.TORQUE_CONTROL
@@ -214,24 +248,28 @@ def main():
     ##################### LOOP STRUCTURE ############################################
     while p.isConnected(): # DO NOT TOUCH
        
-       # Inside your while loop:
-       if step_counter % 240 == 0:  # Save once per second
+       # Save camera images every 2 seconds (reduce frequency to avoid lag)
+       if step_counter % 480 == 0:
            rgb, depth, mask = get_camera_image(robot_id)
            save_camera_data(rgb, depth, filename_prefix=f"frame_{step_counter}")
        step_counter=step_counter+1
-       move_arm_to_coordinate(arm_id, target_id)  
+    #    move_arm_to_coordinate(arm_id, target_id)  
        dist = pid_to_target(robot_id, target)
-       print ('Distance: ', dist)
-       if dist < 2:
-             print("Target Reached!")
-             # Apply braking torque
-             for i in range(2, 6):
+       
+       if step_counter % 60 == 0:  # Print every 60 steps (~0.25 seconds)
+           print(f'Distance to target: {dist:.3f} meters')
+       
+       if dist < 0.5:  # Stop when within 0.5 meters of target
+             if step_counter % 60 == 0:
+                 print("Target Reached!")
+             # Apply braking to all wheels (indices 0-3)
+             for i in range(0, 4):
                  p.setJointMotorControl2(
                      bodyUniqueId=robot_id, 
                      jointIndex=i, 
                      controlMode=p.VELOCITY_CONTROL, 
                      targetVelocity=0, 
-                     force=1000  # This "disables" the internal motor
+                     force=1000
                  )  
                  
        p.stepSimulation()  # DO NOT TOUCH

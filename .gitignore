@@ -5,3 +5,5 @@ temp_*
 **/__pycache__/
 
 executables/*.png
+
+.venv

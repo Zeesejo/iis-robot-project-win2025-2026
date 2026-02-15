@@ -65,50 +65,54 @@ def plan_path(start, goal):
 # --------------------------
 # Motion Control Functions
 # --------------------------
-def move_to_goal(robot_id, goal_pos, wheel_joints=[2, 3, 4, 5], dt=1./240.):
+def move_to_goal(robot_id, goal_pos, current_pose, wheel_joints=[0, 1, 2, 3], dt=1./240.):
     """
     Move robot base using PID controller to goal position (x, y)
+    Uses differential drive: Left wheels [0,2], Right wheels [1,3]
     
     Args:
         robot_id: PyBullet robot body ID
         goal_pos: Target position [x, y]
-        wheel_joints: List of wheel joint indices (default: [2,3,4,5] for 4-wheel robot)
+        current_pose: Current estimated pose [x, y, theta] from state estimation
+        wheel_joints: List of wheel joint indices [FL=0, FR=1, BL=2, BR=3]
         dt: Time step
     
     Returns:
         Current distance to goal
     """
-    # Get current position
-    pos, orn = p.getBasePositionAndOrientation(robot_id)
-    x, y, _ = pos
+    x, y = current_pose[0], current_pose[1]
+    theta = current_pose[2] if len(current_pose) > 2 else 0.0
     
-    distance = math.hypot(goal_pos[0]-x, goal_pos[1]-y)
+    distance = math.hypot(goal_pos[0] - x, goal_pos[1] - y)
     
-    # Simple proportional control for now (can upgrade to full PID)
-    Kp = 1.0
     if distance > 0.05:
-        # Calculate velocity towards goal
-        vx = Kp * (goal_pos[0] - x)
-        vy = Kp * (goal_pos[1] - y)
+        # Calculate heading to target
+        angle_to_target = math.atan2(goal_pos[1] - y, goal_pos[0] - x)
+        heading_error = angle_to_target - theta
+        # Normalize to [-pi, pi]
+        heading_error = math.atan2(math.sin(heading_error), math.cos(heading_error))
         
-        # Convert to wheel velocities (differential drive)
-        # Left wheels: indices 2, 4
-        # Right wheels: indices 3, 5
-        left_wheel_vel = -vx  # Negative for forward
-        right_wheel_vel = vx
+        # PID-style differential drive control
+        Kp_lin = 3.0
+        Kp_ang = 4.0
+        forward_vel = min(Kp_lin * distance, 5.0)
+        angular_vel = Kp_ang * heading_error
         
-        # Apply velocities
-        for i in [2, 4]:  # Left wheels
-            p.setJointMotorControl2(robot_id, i, p.VELOCITY_CONTROL, 
-                                   targetVelocity=left_wheel_vel, force=1500.)
-        for i in [3, 5]:  # Right wheels
+        left_vel = forward_vel - angular_vel
+        right_vel = forward_vel + angular_vel
+        
+        # Apply to left wheels (FL=0, BL=2) and right wheels (FR=1, BR=3)
+        for i in [0, 2]:  # Left wheels
             p.setJointMotorControl2(robot_id, i, p.VELOCITY_CONTROL,
-                                   targetVelocity=right_wheel_vel, force=1500.)
+                                   targetVelocity=left_vel, force=5000.)
+        for i in [1, 3]:  # Right wheels
+            p.setJointMotorControl2(robot_id, i, p.VELOCITY_CONTROL,
+                                   targetVelocity=right_vel, force=5000.)
     else:
         # Stop at goal
         for i in wheel_joints:
             p.setJointMotorControl2(robot_id, i, p.VELOCITY_CONTROL,
-                                   targetVelocity=0.0, force=1500.)
+                                   targetVelocity=0.0, force=5000.)
     
     return distance
 
@@ -195,37 +199,58 @@ def grasp_object(robot_id, target_pos, target_orient, arm_joints=None, close_gri
         print("[Motion Control] IK solution failed")
         return False
     
-    # Apply IK solution to arm joints
-    for i, joint_idx in enumerate(arm_joints):
-        if i < len(ik_solution):
-            p.setJointMotorControl2(
-                robot_id,
-                joint_idx,
-                controlMode=p.POSITION_CONTROL,
-                targetPosition=ik_solution[i],
-                force=500,
-                maxVelocity=1.0
-            )
+    # Build mapping from joint index to IK solution index.
+    # IK returns one value per non-fixed joint, in joint-index order.
+    num_joints_total = p.getNumJoints(robot_id)
+    non_fixed_joints = []
+    for j in range(num_joints_total):
+        if p.getJointInfo(robot_id, j)[2] != p.JOINT_FIXED:
+            non_fixed_joints.append(j)
+    
+    # Apply IK solution to arm joints using correct index mapping
+    for joint_idx in arm_joints:
+        if joint_idx in non_fixed_joints:
+            ik_idx = non_fixed_joints.index(joint_idx)
+            if ik_idx < len(ik_solution):
+                p.setJointMotorControl2(
+                    robot_id,
+                    joint_idx,
+                    controlMode=p.POSITION_CONTROL,
+                    targetPosition=ik_solution[ik_idx],
+                    force=500,
+                    maxVelocity=1.0
+                )
     
     # Control gripper
     if close_gripper and len(finger_joints) > 0:
-        # Close gripper (prismatic joints move inward)
+        # Close gripper: move fingers toward center
         for finger_joint in finger_joints:
+            joint_info = p.getJointInfo(robot_id, finger_joint)
+            joint_name = joint_info[1].decode('utf-8')
+            # Left finger: limits [-0.04, 0], close at -0.04 (moves toward center)
+            # Right finger: limits [0, 0.04], close at 0.04 (moves toward center)
+            if 'left' in joint_name:
+                target = -0.04
+            else:
+                target = 0.04
             p.setJointMotorControl2(
                 robot_id,
                 finger_joint,
                 controlMode=p.POSITION_CONTROL,
-                targetPosition=0.02,  # Close to 2cm
+                targetPosition=target,
                 force=50
             )
     elif len(finger_joints) > 0:
-        # Open gripper
+        # Open gripper: move fingers away from center
         for finger_joint in finger_joints:
+            joint_info = p.getJointInfo(robot_id, finger_joint)
+            joint_name = joint_info[1].decode('utf-8')
+            # Left finger: open at 0, Right finger: open at 0
             p.setJointMotorControl2(
                 robot_id,
                 finger_joint,
                 controlMode=p.POSITION_CONTROL,
-                targetPosition=0.0,  # Fully open
+                targetPosition=0.0,
                 force=50
             )
     
@@ -259,8 +284,12 @@ if __name__ == "__main__":
     goal = [2.0, 2.0]
     print(f"[Motion Control] Moving to goal: {goal}")
     
+    # Note: In real usage, current_pose should come from particle filter
+    # For this test, we'll use a dummy pose that gets updated
+    test_pose = [0.0, 0.0, 0.0]
+    
     for _ in range(2400):  # 10 seconds at 240 Hz
-        dist = move_to_goal(robot_id, goal)
+        dist = move_to_goal(robot_id, goal, test_pose)
         if _ % 240 == 0:  # Print every second
             print(f"[Motion Control] Distance to goal: {dist:.2f}m")
         p.stepSimulation()

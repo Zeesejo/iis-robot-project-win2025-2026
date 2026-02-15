@@ -89,7 +89,7 @@ class ActionPlanner:
             # Check distance to each obstacle
             for obs in self.obstacles:
                 dist = np.hypot(point[0] - obs[0], point[1] - obs[1])
-                if dist < 0.5:  # Obstacle radius + safety margin
+                if dist < 1.0:  # Obstacle radius + safety margin (covers table 1.5x0.8)
                     return False
         
         return True

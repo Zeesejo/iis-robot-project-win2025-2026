@@ -19,6 +19,9 @@ services:
       # Ensures Python finds your modules in /src
       - PYTHONPATH=/home/jovyan/work
       
+      # Disable Python stdout/stderr buffering
+      - PYTHONUNBUFFERED=1
+      
     volumes:
       # Essential for Linux; ignored by Windows but doesn't cause errors
       - /tmp/.X11-unix:/tmp/.X11-unix

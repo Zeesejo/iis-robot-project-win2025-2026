@@ -19,12 +19,19 @@ class KnowledgeBase:
     
     def __init__(self):
         self.prolog = None
+        self.facts = {}  # Always initialize dict fallback
+        
         if PROLOG_AVAILABLE:
-            self.prolog = Prolog()
-            self._initialize_facts()
+            try:
+                self.prolog = Prolog()
+                self._initialize_facts()
+                print("[Knowledge] Prolog KB initialized successfully")
+            except Exception as e:
+                print(f"[Knowledge] Prolog initialization failed: {e}")
+                print("[Knowledge] Falling back to dict-based knowledge store")
+                self.prolog = None
         else:
             print("[Knowledge] Running without Prolog - using dict fallback")
-            self.facts = {}
     
     def _initialize_facts(self):
         """Initialize basic Prolog facts and rules"""

@@ -39,7 +39,7 @@ class RobotFSM:
         self.state = RobotState.IDLE
         self.previous_state = None
         self.state_start_time = time.time()
-        self.max_state_time = 30.0  # Max time in any state before timeout
+        self.max_state_time = 120.0  # Max time in any state before timeout (2 minutes)
         
         # Task data
         self.target_found = False
@@ -81,8 +81,9 @@ class RobotFSM:
     
     def check_timeout(self):
         """Check if current state has exceeded max time"""
-        if self.get_time_in_state() > self.max_state_time:
-            print(f"[FSM] Timeout in state {self.state.name}")
+        time_in_state = self.get_time_in_state()
+        if time_in_state > self.max_state_time:
+            print(f"[FSM] Timeout in state {self.state.name} after {time_in_state:.1f}s (max={self.max_state_time}s)")
             self.failure_reason = f'{self.state.name.lower()}_timeout'
             self.transition_to(RobotState.FAILURE)
             return True
@@ -149,8 +150,8 @@ class RobotFSM:
         elif self.state == RobotState.APPROACH:
             self.distance_to_target = sensor_data.get('distance_to_target', float('inf'))
             
-            if self.distance_to_target < 0.5:  # Within grasp range
-                print("[FSM] Target within grasp range")
+            if self.distance_to_target < 0.2:  # Within grasp range (2D horizontal distance)
+                print(f"[FSM] Target within grasp range (horiz_dist={self.distance_to_target:.2f}m)")
                 self.transition_to(RobotState.GRASP)
             elif sensor_data.get('collision_detected', False):
                 print("[FSM] Collision during approach!")
@@ -164,7 +165,7 @@ class RobotFSM:
                 self.object_grasped = True
                 print("[FSM] Object grasped successfully!")
                 self.transition_to(RobotState.LIFT)
-            elif self.get_time_in_state() > 5.0:  # Grasp timeout
+            elif self.get_time_in_state() > 8.0:  # Grasp timeout (multi-phase needs more time)
                 print("[FSM] Grasp attempt failed (timeout)")
                 self.failure_reason = 'grasp_failed'
                 self.transition_to(RobotState.FAILURE)
@@ -199,56 +200,52 @@ class RobotFSM:
             if not self.recovery_started:
                 self.failure_count += 1
                 self.recovery_started = True
-                recovery_time = time.time()
-                
-                if self.failure_reason == 'collision':
-                    # Strategy: Back up and try different path
-                    print(f"[FSM] Recovery {self.failure_count}/{self.max_failures}: Backing up from collision...")
-                    control['navigate'] = True  # Will be handled with negative velocity
-                    # After backing up, go back to SEARCH for new path
-                    if self.get_time_in_state() > 2.0:  # Back up for 2 seconds
-                        print("[FSM] Restarting search from new position")
+                print(f"[FSM] Recovery {self.failure_count}/{self.max_failures}: Starting recovery for {self.failure_reason}...")
+            
+            # Recovery actions (checked every update)
+            if self.failure_reason == 'collision':
+                # Strategy: Back up and try different path
+                control['navigate'] = True  # Will be handled with negative velocity
+                if self.get_time_in_state() > 2.0:  # Back up for 2 seconds
+                    print("[FSM] Restarting search from new position")
+                    self.recovery_started = False
+                    self.failure_reason = None
+                    self.transition_to(RobotState.SEARCH)
+            
+            elif self.failure_reason == 'grasp_failed':
+                # Strategy: Try approaching from different angle
+                if self.get_time_in_state() > 1.5:
+                    print("[FSM] Retrying approach phase")
+                    self.recovery_started = False
+                    self.failure_reason = None
+                    self.grasp_attempted = False
+                    self.transition_to(RobotState.APPROACH)
+            
+            elif 'timeout' in self.failure_reason:
+                # Strategy: Reset to earlier state
+                if 'navigate' in self.failure_reason or 'search' in self.failure_reason:
+                    # Navigation/search timeout - restart from search immediately
+                    if self.get_time_in_state() > 0.5:
+                        print("[FSM] Restarting search due to timeout")
                         self.recovery_started = False
                         self.failure_reason = None
+                        self.target_found = False
                         self.transition_to(RobotState.SEARCH)
-                
-                elif self.failure_reason == 'grasp_failed':
-                    # Strategy: Try approaching from different angle
-                    print(f"[FSM] Recovery {self.failure_count}/{self.max_failures}: Repositioning for grasp...")
-                    # Back up slightly and retry approach
-                    if self.get_time_in_state() > 1.5:
-                        print("[FSM] Retrying approach phase")
-                        self.recovery_started = False
-                        self.failure_reason = None
-                        self.grasp_attempted = False
-                        self.transition_to(RobotState.APPROACH)
-                
-                elif 'timeout' in self.failure_reason:
-                    # Strategy: Reset to earlier state
-                    print(f"[FSM] Recovery {self.failure_count}/{self.max_failures}: Timeout recovery...")
-                    if 'navigate' in self.failure_reason or 'search' in self.failure_reason:
-                        # Navigation/search timeout - restart from search
-                        if self.get_time_in_state() > 1.0:
-                            print("[FSM] Restarting search due to timeout")
-                            self.recovery_started = False
-                            self.failure_reason = None
-                            self.target_found = False
-                            self.transition_to(RobotState.SEARCH)
-                    else:
-                        # Other timeouts - try backing up and searching again
-                        if self.get_time_in_state() > 2.0:
-                            print("[FSM] Restarting from search after timeout")
-                            self.recovery_started = False
-                            self.failure_reason = None
-                            self.transition_to(RobotState.SEARCH)
-                
                 else:
-                    # Unknown failure - restart from search
-                    print(f"[FSM] Recovery {self.failure_count}/{self.max_failures}: Unknown failure, restarting search...")
-                    if self.get_time_in_state() > 1.0:
+                    # Other timeouts - try backing up and searching again
+                    if self.get_time_in_state() > 2.0:
+                        print("[FSM] Restarting from search after timeout")
                         self.recovery_started = False
                         self.failure_reason = None
                         self.transition_to(RobotState.SEARCH)
+            
+            else:
+                # Unknown failure - restart from search
+                if self.get_time_in_state() > 0.5:
+                    print(f"[FSM] Unknown failure, restarting search...")
+                    self.recovery_started = False
+                    self.failure_reason = None
+                    self.transition_to(RobotState.SEARCH)
             
         return control
     

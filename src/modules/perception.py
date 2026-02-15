@@ -10,8 +10,8 @@ SCENE_OBJECTS = {
     'black_obs':  {'rgb': [0.0, 0.0, 0.0], 'type': 'cube',    'dims': [0.4, 0.4, 0.4]},
 }
 COLOR_RANGES_HSV = {
-    'red':    [(np.array([0,  120, 70]),  np.array([10, 255, 255])),
-               (np.array([170, 120, 70]), np.array([180, 255, 255]))],
+    'red':    [(np.array([0,  30, 30]),  np.array([20, 255, 255])),
+               (np.array([160, 30, 30]), np.array([180, 255, 255]))],
     'brown':  [(np.array([10,  80, 30]),  np.array([25, 180, 180]))],
     'blue':   [(np.array([100, 120, 70]), np.array([130, 255, 255]))],
     'pink':   [(np.array([140, 40, 100]), np.array([180, 255, 255]))],
@@ -85,7 +85,9 @@ def detect_objects_by_color(bgr_image, min_area=200):
         combined_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
         for (lower, upper) in ranges:
             combined_mask |= cv2.inRange(hsv, lower, upper)
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        # Use smaller kernel for red to preserve small objects
+        kernel_size = (3, 3) if color_name == 'red' else (5, 5)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, kernel_size)
         combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel)
         combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel)
 

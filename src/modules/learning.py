@@ -3,26 +3,36 @@ from collections import deque
 import csv
 import os
 import matplotlib.pyplot as plt
+import sys
 
-# Define robot parameters for learning
+# Add project root to sys.path so Python can find 'executables'
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
+
+# from executables.cognitive_architecture import CognitiveArchitecture, build_world
+
+
+# =========================
+# Default Parameters
+# =========================
 DEFAULT_PARAMETERS = {
-    # Navigation PID gains
-    "nav_kp": 1.0,
-    "nav_ki": 0.05,
-    "nav_kd": 0.01,
-    
-    # Arm/Gripper PID gains
+    "nav_kp": 2.5,      # strong enough to move
+    "nav_ki": 0,
+    "nav_kd": 0.5,     # small derivative
+
+    "angle_kp": 3.0,    # moderate turn
+    "angle_ki": 0.0,
+    "angle_kd": 0.01,
+
     "arm_kp": 1.2,
     "arm_ki": 0.0,
     "arm_kd": 0.05,
     
-    # Vision thresholds
     "vision_threshold": 0.5,
-    
-    # Robot speed limits
     "max_linear_speed": 0.5,
     "max_angular_speed": 1.0
 }
+
+
 
 # =========================
 # Replay Buffer
@@ -32,7 +42,7 @@ class ReplayBuffer:
         self.buffer = deque(maxlen=capacity)
 
     def add(self, parameters, score):
-        self.buffer.append((parameters, score))
+        self.buffer.append((parameters.copy(), float(score)))
 
     def get_all(self):
         return list(self.buffer)
@@ -40,180 +50,192 @@ class ReplayBuffer:
     def size(self):
         return len(self.buffer)
 
+
 # =========================
 # Evaluator
 # =========================
 class Evaluator:
+
     def evaluate(self, simulation_result):
-        """
-        Replace with actual performance metrics later
-        """
-        # Example: pretend that higher nav_kp and arm_kp slightly improve the score
-        score = 0.5  # base score
-        score += 0.1 * min(simulation_result.get("nav_kp", 1.0), 2.0)
-        score += 0.1 * min(simulation_result.get("arm_kp", 1.0), 2.0)
-        score += random.uniform(-0.05, 0.05)  # simulate noise
+        score = 0
+        if simulation_result["success"]:
+            score += 1000
+        score -= simulation_result["steps"] * 0.1
+        return score
 
-        # result = robot_module.run_with_parameters(parameters)
 
-        # Return result for evaluator (can be more complex later)
-        return {"score": score}
+
 
 # =========================
 # Optimizer
 # =========================
 class Optimizer:
+
+    def random_parameters(self):
+        return {
+            key: value + random.uniform(-0.3, 0.3)
+            for key, value in DEFAULT_PARAMETERS.items()
+        }
+
+    def mutate(self, params, scale=0.05):
+        return {k: v + random.uniform(-scale, scale) for k,v in params.items()}
+
+
     def get_best(self, memory):
         experiences = memory.get_all()
+
         if not experiences:
             return self.random_parameters()
 
         best = max(experiences, key=lambda x: x[1])
-        best_params = best[0]
+        return self.mutate(best[0])
 
-        return self.mutate(best_params)
-
-    def mutate(self, params):
-        new_params = {}
-        for key, value in params.items():
-            new_params[key] = value + random.uniform(-0.05, 0.05)
-        return new_params
-
-    def random_parameters(self):
-        return {"kp": random.uniform(0.5,2.0),
-                "ki": random.uniform(0.0,1.0),
-                "kd": random.uniform(0.0,1.0)}
 
 # =========================
 # Learner
 # =========================
 class Learner:
-    def __init__(self, csv_file="data/experiences.csv"):
+
+    def __init__(self, robot, csv_file="data/experiences.csv"):
+        self.robot = robot     # <-- THIS LINE (connection to architecture)
+
         self.memory = ReplayBuffer()
         self.evaluator = Evaluator()
         self.optimizer = Optimizer()
         self.csv_file = csv_file
         self.load_experience()
 
-    # -------- Load / Save CSV Experience --------
+
+
+    # -------- CSV Handling --------
     def load_experience(self):
+
         if not os.path.exists(self.csv_file):
+
             os.makedirs(os.path.dirname(self.csv_file), exist_ok=True)
-            with open(self.csv_file,"w",newline="") as f:
+
+            with open(self.csv_file, "w", newline="") as f:
                 writer = csv.writer(f)
-                header = list(DEFAULT_PARAMETERS.keys()) + ["score"]
-                writer.writerow(header)
+                writer.writerow(list(DEFAULT_PARAMETERS.keys()) + ["score"])
             return
 
-        with open(self.csv_file,"r",newline="") as f:
+        with open(self.csv_file, "r") as f:
             reader = csv.DictReader(f)
+
             for row in reader:
-                # Convert all numeric values except 'score'
-                params = {k: float(v) for k,v in row.items() if k != "score"}
+                params = {k: float(v) for k, v in row.items() if k != "score"}
                 score = float(row["score"])
                 self.memory.add(params, score)
 
 
     def save_experience(self):
-        with open(self.csv_file,"w",newline="") as f:
+
+        experiences = self.memory.get_all()
+
+        with open(self.csv_file, "w", newline="") as f:
             writer = csv.writer(f)
-            # header
-            if self.memory.size() > 0:
-                first_params = self.memory.get_all()[0][0]
-                header = list(first_params.keys()) + ["score"]
-            else:
-                header = list(DEFAULT_PARAMETERS.keys()) + ["score"]
-            writer.writerow(header)
-            # write rows
-            for params, score in self.memory.get_all():
-                row = [params[key] for key in first_params.keys()] + [score]
+
+            writer.writerow(list(DEFAULT_PARAMETERS.keys()) + ["score"])
+
+            for params, score in experiences:
+                row = [params[k] for k in DEFAULT_PARAMETERS.keys()] + [score]
                 writer.writerow(row)
 
 
-    # -------- Run Trial (Interface with Robot Module) --------
+    # -------- Trial Execution --------
     def run_trial(self, parameters):
         """
-        Replace with actual robot module
+        Later connect to robot module here
         """
+        
+        return self.robot.run_episode(parameters)
 
-        # Call the robot module’s function that actually runs a trial
-        # result = robot_module.run_with_parameters(parameters)
-        # return result
-        result = parameters 
-        return result
+
 
     def run_and_store(self, parameters):
+
         result = self.run_trial(parameters)
-        score = self.evaluator.evaluate(result)  # evaluate once
+        score = self.evaluator.evaluate(result)
+
         self.memory.add(parameters, score)
         self.save_experience()
+
         return score
+
+
+    # -------- Baseline --------
+    def baseline(self, episodes=30):
+
+        scores = []
+
+        for _ in range(episodes):
+            params = self.optimizer.random_parameters()
+            scores.append(self.run_and_store(params))
+
+        return scores
+
 
     # -------- Online Learning --------
     def online_learning(self, episodes=30, initial_parameters=None):
-        if initial_parameters:
-            params = initial_parameters
-        else:
-            params = self.optimizer.random_parameters()
+
+        params = initial_parameters or self.optimizer.random_parameters()
         scores = []
 
-        for ep in range(episodes):
+        for _ in range(episodes):
             score = self.run_and_store(params)
             scores.append(score)
             params = self.optimizer.get_best(self.memory)
+
         return scores
 
-    # -------- Offline Learning (Replay) --------
+
+    # -------- Offline Learning --------
     def offline_learning(self):
-        """
-        Use stored experiences to find best parameters without new trials
-        """
+
         experiences = self.memory.get_all()
+
         if not experiences:
-            print("No experiences available for offline learning")
-            return []
-        # Pick best-so-far parameters repeatedly
-        best_exp = max(experiences, key=lambda x: x[1])  # (parameters, score)
-        best_params = best_exp[0]                        # get parameters dict
+            print("No stored experience")
+            return [], None
+
+        best = max(experiences, key=lambda x: x[1])
         scores = [exp[1] for exp in experiences]
-        return scores, best_params
 
-    # -------- Baseline (No Learning) --------
-    def baseline(self, episodes=30):
-        scores = []
-        for _ in range(episodes):
-            params = self.optimizer.random_parameters()
-            score = self.run_and_store(params)
-            scores.append(score)
-        return scores
+        return scores, best[0]
 
-    # -------- Plot Results --------
+
+    # -------- Plot --------
     def plot_results(self, baseline_scores, online_scores, offline_scores):
+
         plt.figure(figsize=(10,6))
-        plt.plot(range(len(baseline_scores)), baseline_scores, label="Baseline (No Learning)")
-        plt.plot(range(len(online_scores)), online_scores, label="Online Learning")
+
+        plt.plot(baseline_scores, label="Baseline")
+        plt.plot(online_scores, label="Online Learning")
+
         if offline_scores:
-            plt.plot(range(len(offline_scores)), offline_scores, label="Offline Learning")
+            plt.plot(offline_scores, label="Offline Replay")
+
         plt.xlabel("Episode")
         plt.ylabel("Score")
-        plt.title("Learning Module Performance Comparison")
         plt.legend()
         plt.show()
 
+
 # =========================
-# Main Test
+# MAIN TEST
 # =========================
-if __name__ == "__main__":
-    learner = Learner()
+# if __name__ == "__main__":
 
-    # Baseline
-    baseline_scores = learner.baseline(episodes=30)
+#     robot_id, table_id, room_id, target_id = build_world(gui=False)
+#     cog_arch = CognitiveArchitecture(robot_id, table_id, room_id, target_id)
 
-    # Online Learning
-    online_scores = learner.online_learning(episodes=30, initial_parameters=DEFAULT_PARAMETERS)
+#     learner = Learner(robot=cog_arch)
 
-    # Offline Learning (from stored experiences)
-    offline_scores = learner.offline_learning()
+#     baseline_scores = learner.baseline(2)
+#     online_scores = learner.online_learning(2, DEFAULT_PARAMETERS)
+#     offline_scores, best_params = learner.offline_learning()
 
-    # Plot comparison
-    learner.plot_results(baseline_scores, online_scores, offline_scores)
+#     print("\nBest offline parameters:", best_params)
+
+#     learner.plot_results(baseline_scores, online_scores, offline_scores)
+

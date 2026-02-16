@@ -59,6 +59,9 @@ from src.modules.knowledge_reasoning import get_knowledge_base
 
 # M9: Learning
 from src.modules.learning import Learner
+from src.modules.learning import DEFAULT_PARAMETERS
+
+
 
 # Robot physical constants (must match URDF and state_estimation)
 WHEEL_RADIUS = 0.1
@@ -73,13 +76,15 @@ class CognitiveArchitecture:
     Main cognitive architecture implementing the Sense-Think-Act loop.
     """
     
-    def __init__(self, robot_id, table_id, room_id, target_id):
+    def __init__(self, robot_id, table_id, room_id, target_id, parameters=None):
         # Robot IDs from PyBullet
         self.robot_id = robot_id
         self.table_id = table_id
         self.room_id = room_id
         self.target_id = target_id
-        
+
+        self.prev_time = time.time()
+
         # M5: State Estimator (Particle Filter)
         self.state_estimator = ParticleFilter(num_particles=500)
         
@@ -94,17 +99,25 @@ class CognitiveArchitecture:
         self.kb = get_knowledge_base()
         
         # M9: Learner (for parameter optimization)
-        self.learner = Learner()
-        
-        # M6: PID Controllers
-        self.nav_pid = PIDController(Kp=2.5, Ki=0.0, Kd=0.1)
+        parameters = parameters or {}
+        self.learner = Learner(self)
+
+        # Load best parameters from experience
+        _, best_params = self.learner.offline_learning()
+
+        if best_params:
+            print("[Learning] Loaded best learned parameters")
+            self.apply_parameters(best_params)
+        else:
+            self.apply_parameters(DEFAULT_PARAMETERS)
+            print("[Learning] No learned parameters found, using defaults")
         
         # Robot configuration - wheel joints [FL, FR, BL, BR]
         self.wheel_joints = [0, 1, 2, 3]
         self.wheel_names = ['fl_wheel_joint', 'fr_wheel_joint',
                             'bl_wheel_joint', 'br_wheel_joint']
         
-        # Auto-detect special joint indices from URDF
+        # Auto-detect special joint indices fromclea URDF
         self.arm_joints = []
         self.gripper_joints = []
         self.lift_joint_idx = None
@@ -123,6 +136,8 @@ class CognitiveArchitecture:
         # Timing
         self.step_counter = 0
         self.dt = 1.0 / 240.0
+        # self.dt = p.getPhysicsEngineParameters()['fixedTimeStep']
+
         
         # Initialize robot knowledge
         self._initialize_world_knowledge()
@@ -549,16 +564,29 @@ class CognitiveArchitecture:
         # M8: Query knowledge base for decision making
         # M8: Query knowledge base
         target_pos = self.kb.query_position('target')
-        
         # Override with sensor data if available
         if sensor_data['target_detected']:
             target_pos = sensor_data['target_position']
         
+
+        if target_pos:
+            print(f"[DEBUG] Target position from KB: ({target_pos[0]:.2f}, {target_pos[1]:.2f}, {target_pos[2]:.2f})")
+        else:
+            print("[DEBUG] Target position unknown in KB")
+
+        # --- Table detection ---
+        if self.table_position:
+            print(f"[DEBUG] Table detected at: ({self.table_position[0]:.2f}, {self.table_position[1]:.2f})")
+        else:
+            print("[DEBUG] Table not yet detected")
+
+
         # Calculate 2D horizontal distance to target
         if target_pos:
             dx = target_pos[0] - pose[0]
             dy = target_pos[1] - pose[1]
             distance_2d = np.sqrt(dx**2 + dy**2)
+            print(f"[DEBUG] Distance to target: {distance_2d:.2f}m")
             
             # Compute standoff as soon as we know the target
             if self.approach_standoff is None:
@@ -569,8 +597,7 @@ class CognitiveArchitecture:
                       f"({self.approach_standoff[0]:.2f}, {self.approach_standoff[1]:.2f})")
             
             # In NAVIGATE/APPROACH states, FSM distance = dist to standoff
-            if self.approach_standoff is not None and self.fsm.state in (
-                    RobotState.NAVIGATE, RobotState.APPROACH):
+            if self.approach_standoff is not None and self.fsm.state == RobotState.NAVIGATE:
                 sdx = self.approach_standoff[0] - pose[0]
                 sdy = self.approach_standoff[1] - pose[1]
                 distance_for_fsm = np.sqrt(sdx**2 + sdy**2)
@@ -592,6 +619,7 @@ class CognitiveArchitecture:
         }
         
         self.fsm.update(fsm_sensor_data)
+        print(f"[DEBUG] FSM state: {self.fsm.state}")
         
         # M7: Action planning based on FSM state
         control_commands = {
@@ -606,6 +634,7 @@ class CognitiveArchitecture:
                 table_dx = self.table_position[0] - pose[0]
                 table_dy = self.table_position[1] - pose[1]
                 table_dist = np.hypot(table_dx, table_dy)
+                print(f"[DEBUG] Distance to table: {table_dist:.2f}m")
                 
                 if table_dist < 2.0:
                     # Close to table: orbit around it to scan all sides
@@ -616,6 +645,7 @@ class CognitiveArchitecture:
                         'orbit_radius': 2.0,
                         'lidar': sensor_data['lidar']
                     }
+                    print("[DEBUG] Orbiting table to search")
                 else:
                     control_commands = {
                         'mode': 'search_approach',
@@ -624,11 +654,13 @@ class CognitiveArchitecture:
                         'angular_vel': 2.0,
                         'lidar': sensor_data['lidar']
                     }
+                    print("[DEBUG] Approaching table to search")
             else:
                 control_commands = {
                     'mode': 'search_rotate',
                     'angular_vel': 3.0
                 }
+                print("[DEBUG] Rotating to find table")
             
         elif self.fsm.state == RobotState.NAVIGATE:
             # Navigate to standoff point (not directly at the cylinder)
@@ -640,6 +672,7 @@ class CognitiveArchitecture:
                     pose[:2], nav_goal, self.obstacles
                 )
                 self.current_waypoint = self.action_planner.get_next_waypoint()
+                print(f"[DEBUG] Created navigation plan to: ({nav_goal[0]:.2f}, {nav_goal[1]:.2f})")
                 
             if self.current_waypoint:
                 control_commands = {
@@ -652,15 +685,19 @@ class CognitiveArchitecture:
                 # Check if waypoint reached
                 dist = np.hypot(self.current_waypoint[0] - pose[0],
                                self.current_waypoint[1] - pose[1])
+                print(f"[DEBUG] Distance to waypoint: {dist:.2f}m")
+                
                 if dist < 0.3:
+                    print("[DEBUG] Waypoint reached, advancing to next")
                     self.action_planner.advance_waypoint()
                     self.current_waypoint = self.action_planner.get_next_waypoint()
+                
                     
         elif self.fsm.state == RobotState.APPROACH:
             if target_pos:
                 control_commands = {
                     'mode': 'approach',
-                    'target': self.approach_standoff if self.approach_standoff else target_pos[:2],
+                    'target': target_pos[:2],
                     'pose': pose,
                     'lidar': sensor_data['lidar'],
                     'relaxed_avoidance': True
@@ -709,6 +746,10 @@ class CognitiveArchitecture:
                 'gripper': 'open',
                 'lidar': sensor_data['lidar']
             }
+
+        print(f"[DEBUG] Control command: {control_commands}")
+        print(f"[DEBUG] approach_standoff: {self.approach_standoff}, current_waypoint: {self.current_waypoint}")
+
         
         return control_commands
     
@@ -721,7 +762,11 @@ class CognitiveArchitecture:
         
         if mode == 'search_rotate':
             # Rotate in place to search for target
-            angular_vel = control_commands.get('angular_vel', 3.0)
+            angular_vel = np.clip(
+                control_commands.get('angular_vel', 3.0),
+                -self.max_angular_speed,
+                self.max_angular_speed
+            )
             if self.step_counter % 240 == 0:
                 print(f"[Act] SEARCH: rotating at {angular_vel:.1f} rad/s")
             
@@ -747,16 +792,29 @@ class CognitiveArchitecture:
             heading_error = angle_to_target - pose[2]
             heading_error = np.arctan2(np.sin(heading_error), np.cos(heading_error))
             
-            forward_vel = min(3.0, 2.0 * dist)
-            angular_vel = 4.0 * heading_error
+            forward_vel = np.clip(2.0 * dist, -self.max_linear_speed, self.max_linear_speed)
+            angular_vel = np.clip(4.0 * heading_error, -self.max_angular_speed, self.max_angular_speed)
+
             
             # M4: Lidar obstacle avoidance
             forward_vel, avoidance_turn = self._get_lidar_obstacle_avoidance(
                 lidar, forward_vel, robot_pose=pose)
             angular_vel += avoidance_turn
+
+            max_turn = abs(forward_vel) + 0.1
+            angular_vel = np.clip(angular_vel, -max_turn, max_turn)
+
+
+            forward_vel = np.clip(forward_vel, -self.max_linear_speed, self.max_linear_speed)
+            angular_vel = np.clip(angular_vel, -self.max_angular_speed, self.max_angular_speed)
             
-            left_vel = forward_vel - angular_vel
-            right_vel = forward_vel + angular_vel
+            wheel_limit = self.max_linear_speed + self.max_angular_speed
+            left_vel = np.clip(forward_vel - angular_vel, -wheel_limit, wheel_limit)
+            right_vel = np.clip(forward_vel + angular_vel, -wheel_limit, wheel_limit)
+
+
+            print(f"Look Here -------------- {forward_vel} {angular_vel} {left_vel} {right_vel}")
+
             
             if self.step_counter % 240 == 0:
                 print(f"[Act] SEARCH_APPROACH: dist={dist:.2f}m, heading={np.degrees(heading_error):.0f} deg")
@@ -792,16 +850,20 @@ class CognitiveArchitecture:
             heading_error = desired_angle - pose[2]
             heading_error = np.arctan2(np.sin(heading_error), np.cos(heading_error))
             
-            forward_vel = 2.0
+            forward_vel = self.max_linear_speed
             angular_vel = 4.0 * heading_error
             
             # M4: Lidar obstacle avoidance
             forward_vel, avoidance_turn = self._get_lidar_obstacle_avoidance(
                 lidar, forward_vel, robot_pose=pose)
             angular_vel += avoidance_turn
+
+            forward_vel = np.clip(forward_vel, -self.max_linear_speed, self.max_linear_speed)
+            angular_vel = np.clip(angular_vel, -self.max_angular_speed, self.max_angular_speed)
             
-            left_vel = forward_vel - angular_vel
-            right_vel = forward_vel + angular_vel
+            wheel_limit = self.max_linear_speed + self.max_angular_speed
+            left_vel = np.clip(forward_vel - angular_vel, -wheel_limit, wheel_limit)
+            right_vel = np.clip(forward_vel + angular_vel, -wheel_limit, wheel_limit)
             
             if self.step_counter % 240 == 0:
                 print(f"[Act] SEARCH_ORBIT: r={current_dist:.2f}m (target={orbit_radius:.1f}m)")
@@ -826,29 +888,40 @@ class CognitiveArchitecture:
             angle_to_target = np.arctan2(dy, dx)
             heading_error = angle_to_target - pose[2]
             heading_error = np.arctan2(np.sin(heading_error), np.cos(heading_error))
-            
-            # Speed control
-            if mode == 'approach':
-                max_speed = 2.0
-                kp_dist = 3.0
-                kp_angle = 5.0
-            else:
-                max_speed = 5.0
-                kp_dist = 4.0
-                kp_angle = 5.0
-            
-            forward_vel = np.clip(kp_dist * dist, 0, max_speed)
-            angular_vel = kp_angle * heading_error
+
+
+            forward_vel = self.nav_pid_dist.compute(dist, self.dt)
+            angular_vel = self.nav_pid_angle.compute(heading_error, self.dt)
+        
             
             # M4: Lidar obstacle avoidance (relaxed near table during approach)
             relaxed = control_commands.get('relaxed_avoidance', False)
             forward_vel, avoidance_turn = self._get_lidar_obstacle_avoidance(
                 lidar, forward_vel, relaxed=relaxed, robot_pose=pose)
             angular_vel += avoidance_turn
+
+            forward_vel = np.clip(
+                forward_vel,
+                -self.max_linear_speed,
+                self.max_linear_speed
+            )
+
+            angular_vel = np.clip(
+                angular_vel,
+                -self.max_angular_speed,
+                self.max_angular_speed
+            )
             
             left_vel = forward_vel - angular_vel
             right_vel = forward_vel + angular_vel
-            
+
+            wheel_limit = self.max_linear_speed + self.max_angular_speed
+            left_vel = np.clip(forward_vel - angular_vel, -wheel_limit, wheel_limit)
+            right_vel = np.clip(forward_vel + angular_vel, -wheel_limit, wheel_limit)
+
+            print(f"[DEBUG ACT] Mode={mode}, left_vel={left_vel:.2f}, right_vel={right_vel:.2f}")
+
+
             if self.step_counter % 240 == 0:
                 print(f"[Act] {mode.upper()}: dist={dist:.2f}m, heading={np.degrees(heading_error):.0f} deg, "
                       f"fwd={forward_vel:.1f}, turn={angular_vel:.1f}")
@@ -939,7 +1012,7 @@ class CognitiveArchitecture:
                 
                 # Use lidar rear avoidance to prevent reversing into obstacles
                 lidar = control_commands.get('lidar')
-                reverse_vel = -3.0
+                reverse_vel = -self.max_linear_speed
                 if lidar is not None:
                     reverse_vel, avoidance_turn = self._get_lidar_obstacle_avoidance(
                         lidar, reverse_vel, relaxed=False, robot_pose=None)
@@ -978,6 +1051,72 @@ class CognitiveArchitecture:
                     p.setJointMotorControl2(self.robot_id, i, p.VELOCITY_CONTROL,
                                            targetVelocity=0, force=1500)
 
+    def apply_parameters(self, parameters):
+
+        self.parameters = parameters.copy()
+
+        def get_param(name, default=0.0):
+            return parameters.get(name, default)
+
+        self.nav_pid_dist = PIDController(
+            np.clip(get_param("nav_kp"), 0.1, 3.0),
+            get_param("nav_ki", 0),
+            get_param("nav_kd", 0.05),
+            setpoint=0.0
+        )
+
+
+        self.nav_pid_angle = PIDController(
+            np.clip(get_param("angle_kp"), 0.5, 5.0),
+            get_param("angle_ki", 0.0),
+            get_param("angle_kd", 0.01)
+        )
+
+        self.arm_pid = PIDController(
+            get_param("arm_kp", 1.2),
+            get_param("arm_ki", 0.0),
+            get_param("arm_kd", 0.05)
+        )
+
+        self.vision_threshold = get_param("vision_threshold", 0.5)
+        self.max_linear_speed = np.clip(get_param("max_linear_speed", 0.5), 0.1, 1.0)
+        self.max_angular_speed = np.clip(get_param("max_angular_speed", 1.0), 0.2, 2.0)
+
+        print("[Learning] Parameters applied successfully")
+
+    def reset(self):
+
+        if p.isConnected():
+            p.resetSimulation()
+        else:
+            p.connect(p.DIRECT)
+
+        # rebuild world again
+        robot_id, table_id, room_id, target_id = build_world(gui=False)
+
+        self.robot_id = robot_id
+        self.table_id = table_id
+        self.room_id = room_id
+        self.target_id = target_id
+
+        self.target_position = None
+        self.current_waypoint = None
+        self.obstacles = []
+        self.step_counter = 0
+
+        self._initialize_world_knowledge()
+
+        self.state_estimator = ParticleFilter(num_particles=500)
+        self.action_planner.reset()
+        self.fsm.reset()
+
+        # ⭐ VERY IMPORTANT – reset learned controllers
+        if hasattr(self, "nav_pid_dist"):
+            self.nav_pid_dist.reset()
+
+        if hasattr(self, "nav_pid_angle"):
+            self.nav_pid_angle.reset()
+
 
 def main():
     """Main execution loop with Sense-Think-Act cycle"""
@@ -991,7 +1130,7 @@ def main():
     robot_id, table_id, room_id, target_id = build_world(gui=True)
     
     # M10: Create cognitive architecture
-    cog_arch = CognitiveArchitecture(robot_id, table_id, room_id, target_id)
+    cog_arch = CognitiveArchitecture(robot_id, table_id, room_id, target_id, parameters=DEFAULT_PARAMETERS)
     
     # Report initial state
     print("\n[Init] Robot at: (0.00, 0.00) - starting position")

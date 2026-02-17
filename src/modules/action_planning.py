@@ -89,7 +89,7 @@ class ActionPlanner:
             # Check distance to each obstacle
             for obs in self.obstacles:
                 dist = np.hypot(point[0] - obs[0], point[1] - obs[1])
-                if dist < 1.0:  # Obstacle radius + safety margin (covers table 1.5x0.8)
+                if dist < 1.5:  # Obstacle radius + safety margin (covers table 1.5x0.8 + robot 0.5m)
                     return False
         
         return True
@@ -125,7 +125,7 @@ class ActionPlanner:
                 perp_y /= length
             
             # Waypoint offset from obstacle
-            offset = 1.0
+            offset = 1.5
             waypoint = [
                 closest_obs[0] + perp_x * offset,
                 closest_obs[1] + perp_y * offset

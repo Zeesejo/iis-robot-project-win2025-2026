@@ -50,7 +50,7 @@ class RobotFSM:
         
         # Failure recovery data
         self.failure_count = 0
-        self.max_failures = 3
+        self.max_failures = 5
         self.failure_reason = None
         self.recovery_started = False
         
@@ -73,6 +73,13 @@ class RobotFSM:
             self.state_start_time = time.time()
             self.state_history.append((new_state, time.time()))
             self.terminal_message_printed = False  # Reset flag on state change
+            # Reset failure count on forward progress (higher-order states)
+            state_order = {RobotState.SEARCH: 0, RobotState.NAVIGATE: 1,
+                          RobotState.APPROACH: 2, RobotState.GRASP: 3,
+                          RobotState.LIFT: 4, RobotState.SUCCESS: 5}
+            if (new_state in state_order and self.previous_state in state_order
+                    and state_order[new_state] > state_order.get(self.previous_state, -1)):
+                self.failure_count = 0
             print(f"[FSM] State transition: {self.previous_state.name} → {new_state.name}")
     
     def get_time_in_state(self):
@@ -137,7 +144,7 @@ class RobotFSM:
         elif self.state == RobotState.NAVIGATE:
             self.distance_to_target = sensor_data.get('distance_to_target', float('inf'))
             
-            if self.distance_to_target < 1.5:  # Close enough to approach
+            if self.distance_to_target < 2.0:  # Close enough to switch to visual servoing approach
                 print(f"[FSM] Reached navigation waypoint (dist={self.distance_to_target:.2f}m)")
                 self.transition_to(RobotState.APPROACH)
             elif sensor_data.get('collision_detected', False):
@@ -150,8 +157,8 @@ class RobotFSM:
         elif self.state == RobotState.APPROACH:
             self.distance_to_target = sensor_data.get('distance_to_target', float('inf'))
             
-            if self.distance_to_target < 0.2:  # Within grasp range (2D horizontal distance)
-                print(f"[FSM] Target within grasp range (horiz_dist={self.distance_to_target:.2f}m)")
+            if self.distance_to_target < 0.55:  # Within grasp range (camera depth to target on table)
+                print(f"[FSM] Target within grasp range (dist={self.distance_to_target:.2f}m)")
                 self.transition_to(RobotState.GRASP)
             elif sensor_data.get('collision_detected', False):
                 print("[FSM] Collision during approach!")
@@ -165,7 +172,7 @@ class RobotFSM:
                 self.object_grasped = True
                 print("[FSM] Object grasped successfully!")
                 self.transition_to(RobotState.LIFT)
-            elif self.get_time_in_state() > 8.0:  # Grasp timeout (multi-phase needs more time)
+            elif self.get_time_in_state() > 20.0:  # Grasp timeout (multi-phase needs more time)
                 print("[FSM] Grasp attempt failed (timeout)")
                 self.failure_reason = 'grasp_failed'
                 self.transition_to(RobotState.FAILURE)
@@ -192,8 +199,16 @@ class RobotFSM:
             
             # Check if we've exceeded max failures
             if self.failure_count >= self.max_failures:
-                print(f"[FSM] Max failures ({self.max_failures}) reached. Giving up.")
-                # Stay in FAILURE state - task cannot be completed
+                if not getattr(self, '_max_fail_printed', False):
+                    print(f"[FSM] Max failures ({self.max_failures}) reached. Resetting and retrying...")
+                    self._max_fail_printed = True
+                # Reset and retry from scratch instead of giving up
+                self.failure_count = 0
+                self._max_fail_printed = False
+                self.recovery_started = False
+                self.failure_reason = None
+                self.target_found = False
+                self.transition_to(RobotState.SEARCH)
                 return control
             
             # Implement recovery strategy based on failure reason

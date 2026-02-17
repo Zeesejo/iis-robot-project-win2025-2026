@@ -217,7 +217,7 @@
     <child link="arm_base"/>
     <origin xyz="0 0 0.05"/>
     <axis xyz="0 0 1"/>
-    <limit effort="10.0" lower="-3.14" upper="3.14" velocity="1.0"/>
+    <limit effort="10.0" lower="0" upper="3.14" velocity="1.0"/>
   </joint>
 
   <link name="shoulder_link">
@@ -246,7 +246,7 @@
     <child link="shoulder_link"/>
     <origin xyz="0 0 0.025"/>
     <axis xyz="0 1 0"/>
-    <limit effort="10.0" lower="-1.0" upper="1.57" velocity="1.0"/>
+    <limit effort="10.0" lower="0.0" upper="1.57" velocity="1.0"/>
   </joint>
 
   <link name="elbow_link">
@@ -299,7 +299,7 @@
     <child link="elbow_link"/>
     <origin xyz="0 0 0.4"/>
     <axis xyz="0 1 0"/>
-    <limit effort="10.0" lower="-0.5" upper="2.0" velocity="1.0"/>
+    <limit effort="10.0" lower="0.0" upper="2.0" velocity="1.0"/>
   </joint>
   <link name="wrist_link_start">
     <visual>

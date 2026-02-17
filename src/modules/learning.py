@@ -1,3 +1,10 @@
+"""
+Module 9: Learning
+Parameter optimization via replay buffer, evaluation, and mutation.
+Supports online learning (trial-based), offline learning (replay),
+and baseline comparison.
+"""
+
 import random
 from collections import deque
 import csv
@@ -47,6 +54,7 @@ class ReplayBuffer:
         return len(self.buffer)
 
 
+
 # =========================
 # Evaluator
 # =========================
@@ -60,6 +68,7 @@ class Evaluator:
             score += 1000
         score -= simulation_result["steps"] * 0.1
         return score
+
 
 # =========================
 # Optimizer
@@ -85,10 +94,13 @@ class Optimizer:
         return new
 
     def get_best(self, memory):
+        """Get the best parameters from memory and mutate them"""
         experiences = memory.get_all()
         if not experiences:
             return self.random_parameters()
         best = max(experiences, key=lambda x: x[1])
+        return self.mutate(best[0])
+
         return self.mutate(best[0])
 
 
@@ -105,7 +117,9 @@ class Learner:
         self.load_experience()
 
     # -------- CSV Handling --------
+    # -------- CSV Handling --------
     def load_experience(self):
+        """Load past experiences from CSV file"""
         if not os.path.exists(self.csv_file):
             os.makedirs(os.path.dirname(self.csv_file), exist_ok=True)
             with open(self.csv_file, "w", newline="") as f:
@@ -129,12 +143,14 @@ class Learner:
                 writer.writerow(row)
 
     # -------- Trial Execution --------
+    # -------- Trial Execution --------
     def run_trial(self, parameters):
         #  self.robot is CognitiveArcitecture 
         #  run_episode returns { "success": bool, "steps": int }
         return self.robot.run_episode(parameters)
 
     def run_and_store(self, parameters):
+        """Run a trial, evaluate, store experience, and return score"""
         result = self.run_trial(parameters)
         score = self.evaluator.evaluate(result)
         self.memory.add(parameters, score)
@@ -153,6 +169,7 @@ class Learner:
     def online_learning(self, episodes=30, initial_parameters=None):
         params = initial_parameters or self.optimizer.random_parameters()
         scores = []
+        for _ in range(episodes):
         for _ in range(episodes):
             score = self.run_and_store(params)
             scores.append(score)
@@ -178,10 +195,12 @@ class Learner:
         plt.plot(online_scores, label="Online Learning")
         if offline_scores:
             plt.plot(offline_scores, label="Offline Replay")
+            plt.plot(offline_scores, label="Offline Replay")
         plt.xlabel("Episode")
         plt.ylabel("Score")
         plt.legend()
         plt.show()
+
 
 
 # =========================

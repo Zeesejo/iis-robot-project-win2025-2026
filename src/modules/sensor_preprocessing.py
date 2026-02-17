@@ -54,10 +54,15 @@ def get_sensor_data(robot_id, camera_id, lidar_id):
     imu_data = get_imu_data(robot_id)
 
     # Preprocess depth data
-    depth = np.clip(depth, 0.0, 10.0)  # Clip to sensor range
-    depth = cv2.GaussianBlur(depth, (5, 5), 0)  # Smooth out noise
+    depth = np.array(depth)
+    if depth.ndim == 1:
+        depth = depth.reshape((240, 320))  # Reshape flat depth buffer to image
+    depth = np.clip(depth, 0.0, 1.0)  # Clip normalized depth buffer to valid [0,1] range
+    # NOTE: No GaussianBlur here — depth is in normalized [0,1] space and the
+    # nonlinear buffer-to-meters conversion would be corrupted by linear averaging
 
     # Preprocess lidar data
+    lidar_data = np.array(lidar_data)
     lidar_data = np.clip(lidar_data, 0.0, 10.0)  # Clip to sensor range
     lidar_data = np.convolve(lidar_data, np.ones(3)/3, mode='same')  # Simple moving average filter
 

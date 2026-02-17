@@ -5,7 +5,7 @@ Integrates all 10 modules for autonomous navigate-to-grasp mission.
 This is the main executive controller that combines:
 - M1: Task specification (defined in README)
 - M2: URDF robot hardware
-- M3: Sensor preprocessing (sensor_wrapper.py)
+- M3: Sensor preprocessing (sensor_preprocessing.py wrapping sensor_wrapper.py)
 - M4: Perception (object detection, RANSAC)
 - M5: State estimation (Particle Filter)  
 - M6: Motion control (PID, IK)
@@ -36,16 +36,15 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 # M2: Hardware (URDF) & Environment
 from src.environment.world_builder import build_world
 
-# M3: Sensors
-from src.robot.sensor_wrapper import (
-    get_camera_image, get_lidar_data, get_imu_data, get_joint_states
-)
+# M3: Sensor Preprocessing (wraps sensor_wrapper with noise filtering)
+from src.modules.sensor_preprocessing import get_sensor_data, get_sensor_id
+# Note: sensor_wrapper is accessed via sensor_preprocessing module
 
 # M4: Perception
 from src.modules.perception import detect_objects_by_color, RANSAC_Segmentation
 
 # M5: State Estimation
-from src.modules.state_estimation import ParticleFilter
+from src.modules.state_estimation import state_estimate, initialize_state_estimator
 
 # M6: Motion Control
 from src.modules.motion_control import PIDController, move_to_goal, grasp_object
@@ -58,15 +57,13 @@ from src.modules.action_planning import get_action_planner, get_grasp_planner
 from src.modules.knowledge_reasoning import get_knowledge_base
 
 # M9: Learning
-from src.modules.learning import Learner
-from src.modules.learning import DEFAULT_PARAMETERS
-
-
+from src.modules.learning import Learner, DEFAULT_PARAMETERS as LEARNING_DEFAULTS
 
 # Robot physical constants (must match URDF and state_estimation)
 WHEEL_RADIUS = 0.1
 WHEEL_BASELINE = 0.45
-CAMERA_HEIGHT = 0.25    # Base spawn height (0.1) + camera Z offset (0.15)
+CAMERA_HEIGHT = 0.55    # Base spawn (0.1) + torso origin (0.3) + camera Z (0.15)
+CAMERA_FORWARD = 0.25   # Camera is 0.25m forward of robot center on torso
 DEPTH_NEAR = 0.1
 DEPTH_FAR = 10.0
 
@@ -82,11 +79,12 @@ class CognitiveArchitecture:
         self.table_id = table_id
         self.room_id = room_id
         self.target_id = target_id
-
-        self.prev_time = time.time()
-
-        # M5: State Estimator (Particle Filter)
-        self.state_estimator = ParticleFilter(num_particles=500)
+        
+        # M5: State Estimator (via state_estimate function)
+        initialize_state_estimator()
+        
+        # M3: Get sensor link IDs from URDF
+        self.sensor_camera_id, self.sensor_lidar_id = get_sensor_id(self.robot_id)
         
         # M7: FSM for high-level control
         self.fsm = RobotFSM()
@@ -95,23 +93,21 @@ class CognitiveArchitecture:
         self.action_planner = get_action_planner()
         self.grasp_planner = get_grasp_planner()
         
-        # M8: Knowledge Base
+        # M8: Knowledge Base (backed by Dynamic_KB.pl via PySwip)
         self.kb = get_knowledge_base()
         
         # M9: Learner (for parameter optimization)
-        parameters = parameters or {}
-        self.learner = Learner(self)
-
-        # Load best parameters from experience
-        _, best_params = self.learner.offline_learning()
-
-        if best_params:
-            print("[Learning] Loaded best learned parameters")
-            self.apply_parameters(best_params)
-        else:
-            self.apply_parameters(DEFAULT_PARAMETERS)
-            print("[Learning] No learned parameters found, using defaults")
-        # self.apply_parameters(DEFAULT_PARAMETERS)
+        # Pass self as robot so learner can call run_episode if needed
+        self.learner = Learner(robot=None)  # No live robot connection during main loop
+        
+        # M9: Use learned or default PID parameters
+        best_params = self.learner.get_best_parameters()
+        nav_kp = best_params.get('nav_kp', LEARNING_DEFAULTS['nav_kp'])
+        nav_ki = best_params.get('nav_ki', LEARNING_DEFAULTS['nav_ki'])
+        nav_kd = best_params.get('nav_kd', LEARNING_DEFAULTS['nav_kd'])
+        
+        # M6: PID Controllers (initialized from M9 learning parameters)
+        self.nav_pid = PIDController(Kp=nav_kp, Ki=nav_ki, Kd=nav_kd)
         
         # Robot configuration - wheel joints [FL, FR, BL, BR]
         self.wheel_joints = [0, 1, 2, 3]
@@ -127,6 +123,10 @@ class CognitiveArchitecture:
         
         # Task state
         self.target_position = None
+        self.target_position_smoothed = None  # EMA-filtered target position
+        self.target_detection_count = 0
+        self.target_camera_bearing = 0.0  # Camera-relative bearing to target (rad)
+        self.target_camera_depth = float('inf')  # Camera depth to target (m)
         self.table_position = None
         self.table_orientation = None
         self.table_size = None
@@ -169,25 +169,32 @@ class CognitiveArchitecture:
             if 'left_finger_joint' in joint_name or 'right_finger_joint' in joint_name:
                 self.gripper_joints.append(i)
             
-            # Lift joint (prismatic on torso)
+            # Lift joint (only if movable - prismatic/revolute)
             if joint_name == 'lift_joint':
-                self.lift_joint_idx = i
+                joint_type = joint_info[2]
+                if joint_type != p.JOINT_FIXED:
+                    self.lift_joint_idx = i
+                else:
+                    self.lift_joint_idx = None  # Fixed in new URDF, can't actuate
             
             # Camera link
             if 'rgbd_camera' in link_name or 'camera' in link_name:
                 self.camera_link_idx = i
             
-            # Arm joints (revolute joints in the arm chain)
+            # Arm joints (revolute joints in the arm chain, skip fixed cosmetic joints)
             if joint_name in ['arm_base_joint', 'shoulder_joint', 'elbow_joint',
                               'wrist_pitch_joint', 'wrist_roll_joint']:
-                self.arm_joints.append(i)
+                joint_type = joint_info[2]
+                if joint_type != p.JOINT_FIXED:
+                    self.arm_joints.append(i)
         
         print(f"[CogArch] Detected: {len(self.gripper_joints)} gripper joints, "
               f"{len(self.arm_joints)} arm joints, "
               f"lift_joint={self.lift_joint_idx}, camera_link={self.camera_link_idx}")
         
     def _initialize_world_knowledge(self):
-        """Initialize knowledge base with world state from initial map"""
+        """Initialize knowledge base with world state from initial map.
+        Updates Dynamic_KB.pl positions via Prolog update_position/4."""
         map_file = "initial_map.json"
         if os.path.exists(map_file):
             with open(map_file, 'r') as f:
@@ -212,12 +219,21 @@ class CognitiveArchitecture:
                 for i, obs in enumerate(world_map['obstacles']):
                     pos = obs['position']
                     color = self._rgba_to_color_name(obs['color_rgba'])
-                    obj_id = f'obstacle{i+1}'
+                    obj_id = f'obstacle{i}'
                     self.kb.add_position(obj_id, pos[0], pos[1], pos[2])
                     self.kb.add_detected_object(obj_id, 'static', color, pos)
                     self.obstacles.append(pos[:2])
                     
             print(f"[CogArch] Loaded {len(self.obstacles)} obstacles from initial map")
+            
+            # M8: Log KB state
+            try:
+                known_objects = self.kb.objects()
+                pickable = self.kb.pickable_objects()
+                print(f"[CogArch] KB objects: {known_objects}")
+                print(f"[CogArch] KB pickable: {pickable}")
+            except Exception as e:
+                print(f"[CogArch] KB query info: {e}")
     
     def _rgba_to_color_name(self, rgba):
         """Convert RGBA to color name"""
@@ -240,35 +256,15 @@ class CognitiveArchitecture:
     
     def _check_gripper_contact(self):
         """
-        M3: Check if gripper fingers are in contact with target object.
-        Uses joint state feedback (torque + position) to detect grasp.
-        Fingers that are stopped partway with resistance torque indicate contact.
+        M3: Check if gripper/arm is in contact with target object.
+        Uses PyBullet contact points API (simulates touch sensor on gripper).
         """
-        if not self.gripper_joints:
-            return False
-        
-        # Use sensor wrapper to read joint states (legal API)
-        joint_states = get_joint_states(self.robot_id)
-        
-        contact_count = 0
-        for finger_idx in self.gripper_joints:
-            # Find the joint name for this index
-            for name, data in joint_states.items():
-                if data['index'] == finger_idx:
-                    torque = abs(data['applied_torque'])
-                    position = abs(data['position'])
-                    # If the finger has significant resistance torque and has moved
-                    # from its open position, something is between the fingers
-                    if torque > 0.5 and position > 0.005:
-                        contact_count += 1
-                    break
-        
-        # Need contact on at least one finger
-        if contact_count > 0:
+        # Use contact points between robot and target (simulates touch sensor)
+        contacts = p.getContactPoints(bodyA=self.robot_id, bodyB=self.target_id)
+        if contacts and len(contacts) > 0:
             if self.step_counter % 60 == 0:
-                print("[Sense] Gripper contact detected via joint torque feedback")
+                print("[Sense] Gripper contact detected via touch sensor")
             return True
-        
         return False
     
     def _convert_depth_buffer(self, depth_buffer_value):
@@ -287,7 +283,7 @@ class CognitiveArchitecture:
         Approaches from the long side (1.5m) of the table so the arm
         only needs to reach across the short dimension (0.4m from edge to center).
         """
-        standoff_dist = 1.30  # meters from target center (table half-width 0.4 + robot 0.3 + margin 0.4)
+        standoff_dist = 0.65  # meters from target center (table half-width 0.4 + robot 0.2 + margin 0.05)
         
         if self.table_orientation is not None:
             # Get table yaw from orientation quaternion
@@ -397,12 +393,12 @@ class CognitiveArchitecture:
         front_dists = [lidar[i] for i in front_indices]
         min_front = min(front_dists)
         
-        # Check left side (rays 3-8)
-        left_dists = [lidar[i] for i in range(3, 9)]
+        # Check left side (rays 5-12, ~50-120 degrees centered on left)
+        left_dists = [lidar[i] for i in range(5, 13)]
         avg_left = np.mean(left_dists)
         
-        # Check right side (rays 28-33)
-        right_dists = [lidar[i] for i in range(num_rays - 8, num_rays - 2)]
+        # Check right side (rays 24-31, ~240-310 degrees centered on right)
+        right_dists = [lidar[i] for i in range(num_rays - 12, num_rays - 4)]
         avg_right = np.mean(right_dists)
         
         # Check rear cone (about +/- 30 degrees behind)
@@ -442,12 +438,13 @@ class CognitiveArchitecture:
         SENSE phase: Acquire sensor data and update state estimate.
         Returns sensor_data dict for use in THINK phase.
         """
-        # M3: Get raw sensor data using sensor wrapper (legal API)
-        camera_link = self.camera_link_idx if self.camera_link_idx is not None else -1
-        rgb, depth, _ = get_camera_image(self.robot_id, sensor_link_id=camera_link)
-        lidar = get_lidar_data(self.robot_id, num_rays=36)
-        imu = get_imu_data(self.robot_id)
-        joint_states = get_joint_states(self.robot_id)
+        # M3: Get preprocessed sensor data via sensor_preprocessing module
+        preprocessed = get_sensor_data(self.robot_id, self.sensor_camera_id, self.sensor_lidar_id)
+        rgb = preprocessed['camera_rgb']
+        depth = preprocessed['camera_depth']
+        lidar = preprocessed['lidar']
+        imu = preprocessed['imu']
+        joint_states = preprocessed['joint_states']
         
         # M5: Get wheel velocities from joint states using correct URDF joint names
         wheel_vels = []
@@ -457,37 +454,41 @@ class CognitiveArchitecture:
             else:
                 wheel_vels.append(0.0)
         
-        # M5: Update state estimate with sensor fusion
-        sensor_data_for_pf = {
+        # M5: State estimation via state_estimate() function
+        sensors_for_pf = {
             'imu': imu,
             'lidar': lidar,
             'joint_states': joint_states
         }
+        control_inputs = {
+            'wheel_left': (wheel_vels[0] + wheel_vels[2]) / 2.0,   # avg of FL + BL
+            'wheel_right': (wheel_vels[1] + wheel_vels[3]) / 2.0,  # avg of FR + BR
+        }
+        estimated_pose = state_estimate(sensors_for_pf, control_inputs)
         
-        self.state_estimator.predict(wheel_vels, self.dt)
-        self.state_estimator.measurement_update(sensor_data_for_pf)
-        
-        # Resample periodically to prevent particle degeneracy
-        if self.step_counter % 10 == 0:
-            self.state_estimator.resample()
-        
-        estimated_pose = self.state_estimator.estimate_pose()
+        # M8: Update robot position in Knowledge Base (Prolog)
+        if self.step_counter % 50 == 0:
+            self.kb.add_position('robot', 
+                                float(estimated_pose[0]), 
+                                float(estimated_pose[1]), 0.0)
         
         # M4: Perception - Detect objects every 10 steps
         if rgb is not None and self.step_counter % 10 == 0:
             rgb_array = np.reshape(rgb, (240, 320, 4)).astype(np.uint8)
             bgr = cv2.cvtColor(rgb_array, cv2.COLOR_RGBA2BGR)
             
-            detections = detect_objects_by_color(bgr, min_area=10)
+            detections = detect_objects_by_color(bgr, min_area=50)
             
             # Log detections periodically
             if self.step_counter % 240 == 0 and len(detections) > 0:
                 colors_found = [d['color'] for d in detections]
                 print(f"[Perception] Detected {len(detections)} objects: {colors_found}")
             
-            # Look for red target
-            for det in detections:
-                if det['color'] == 'red':
+            # Look for red target - pick the CLOSEST (largest bounding box) red detection
+            red_detections = [d for d in detections if d['color'] == 'red']
+            # Sort by bbox area (larger = closer), take biggest
+            red_detections.sort(key=lambda d: d['bbox'][2] * d['bbox'][3], reverse=True)
+            for det in red_detections[:1]:  # Only process the single closest red detection
                     bbox = det['bbox']
                     center_x = int(bbox[0] + bbox[2] / 2)
                     center_y = int(bbox[1] + bbox[3] / 2)
@@ -507,7 +508,10 @@ class CognitiveArchitecture:
                             continue
                         
                         # Camera intrinsics (FOV=60 deg, width=320, height=240)
-                        fx = fy = (320 / 2.0) / np.tan(np.deg2rad(60 / 2.0))
+                        # Projection uses aspect=1.0 so both H and V FOV are 60 deg
+                        # But image is 4:3, so fx ≠ fy (non-square pixels)
+                        fx = (320 / 2.0) / np.tan(np.deg2rad(60 / 2.0))   # horizontal
+                        fy = (240 / 2.0) / np.tan(np.deg2rad(60 / 2.0))   # vertical
                         cx, cy_cam = 160.0, 120.0
                         
                         # Convert pixel + depth to camera coordinates
@@ -520,10 +524,10 @@ class CognitiveArchitecture:
                         cos_t = math.cos(robot_theta)
                         sin_t = math.sin(robot_theta)
                         
-                        # Camera frame to robot body frame:
-                        #   robot_forward(+X) = cam_z (depth)
+                        # Camera frame to robot body frame (no tilt, camera level on torso):
+                        #   robot_forward(+X) = cam_z (depth) + camera forward offset
                         #   robot_left(+Y)    = -cam_x (camera right is robot -Y)
-                        robot_body_x = cam_z
+                        robot_body_x = cam_z + CAMERA_FORWARD  # camera is 0.25m ahead of robot center
                         robot_body_y = -cam_x
                         
                         world_x = robot_x + robot_body_x * cos_t - robot_body_y * sin_t
@@ -531,12 +535,37 @@ class CognitiveArchitecture:
                         # Height: camera is at CAMERA_HEIGHT, cam_y positive = object lower
                         world_z = CAMERA_HEIGHT - cam_y
                         
-                        self.target_position = [world_x, world_y, world_z]
+                        new_target = [world_x, world_y, world_z]
                         
-                        # Add to knowledge base
-                        self.kb.add_position('target', *self.target_position)
-                        print(f"[CogArch] TARGET DETECTED at ({world_x:.2f}, {world_y:.2f}, {world_z:.2f}), "
-                              f"depth={true_depth:.2f}m")
+                        # Filter: reject detections that jump > 2m from smoothed estimate
+                        accept = True
+                        if self.target_position_smoothed is not None:
+                            jump = np.hypot(new_target[0] - self.target_position_smoothed[0],
+                                            new_target[1] - self.target_position_smoothed[1])
+                            if jump > 2.0 and self.target_detection_count > 5:
+                                accept = False  # Likely false positive
+                        
+                        if accept:
+                            self.target_detection_count += 1
+                            # Store camera-relative bearing and depth for reactive steering
+                            self.target_camera_bearing = math.atan2(-(center_x - cx), fx)
+                            self.target_camera_depth = true_depth
+                            # Exponential moving average for stability
+                            alpha = 0.4 if self.target_detection_count > 3 else 0.8
+                            if self.target_position_smoothed is None:
+                                self.target_position_smoothed = list(new_target)
+                            else:
+                                for k in range(3):
+                                    self.target_position_smoothed[k] = (
+                                        alpha * new_target[k]
+                                        + (1 - alpha) * self.target_position_smoothed[k]
+                                    )
+                            self.target_position = list(self.target_position_smoothed)
+                            
+                            # Add to knowledge base
+                            self.kb.add_position('target', *self.target_position)
+                            print(f"[CogArch] TARGET DETECTED at ({world_x:.2f}, {world_y:.2f}, {world_z:.2f}), "
+                                  f"depth={true_depth:.2f}m")
                         break
         
         # M3: Check gripper contact using joint state feedback (legal)
@@ -551,6 +580,8 @@ class CognitiveArchitecture:
             'joint_states': joint_states,
             'target_detected': self.target_position is not None,
             'target_position': self.target_position,
+            'target_camera_bearing': self.target_camera_bearing,
+            'target_camera_depth': self.target_camera_depth,
             'gripper_contact': gripper_contact
         }
     
@@ -558,30 +589,27 @@ class CognitiveArchitecture:
     def think(self, sensor_data):
         """
         THINK phase: Process sensor data, update knowledge, plan actions.
+        Uses M8 Knowledge Base for reasoning and M7 FSM for state management.
         Returns control commands for ACT phase.
         """
         pose = sensor_data['pose']
         
-        # M8: Query knowledge base for decision making
-        # M8: Query knowledge base
+        # M8: Query knowledge base for target position
         target_pos = self.kb.query_position('target')
-        # Override with sensor data if available
+        
+        # Override with sensor data if available (more recent)
         if sensor_data['target_detected']:
             target_pos = sensor_data['target_position']
         
-
-        if target_pos:
-            print(f"[DEBUG] Target position from KB: ({target_pos[0]:.2f}, {target_pos[1]:.2f}, {target_pos[2]:.2f})")
-        else:
-            print("[DEBUG] Target position unknown in KB")
-
-        # --- Table detection ---
-        if self.table_position:
-            print(f"[DEBUG] Table detected at: ({self.table_position[0]:.2f}, {self.table_position[1]:.2f})")
-        else:
-            print("[DEBUG] Table not yet detected")
-
-
+        # M8: Check if target is the goal object (Prolog reasoning)
+        if target_pos and self.step_counter % 240 == 0:
+            is_goal = self.kb.is_goal_object('target')
+            can_grasp = self.kb.check_can_grasp()
+            if is_goal:
+                print(f"[M8-KB] Target confirmed as goal object (red)")
+            if can_grasp:
+                print(f"[M8-KB] Prolog confirms: robot can grasp target")
+        
         # Calculate 2D horizontal distance to target
         if target_pos:
             dx = target_pos[0] - pose[0]
@@ -597,8 +625,12 @@ class CognitiveArchitecture:
                 print(f"[CogArch] Computed approach standoff: "
                       f"({self.approach_standoff[0]:.2f}, {self.approach_standoff[1]:.2f})")
             
-            # In NAVIGATE/APPROACH states, FSM distance = dist to standoff
-            if self.approach_standoff is not None and self.fsm.state == RobotState.NAVIGATE:
+            # Use camera depth for FSM distance during NAVIGATE and APPROACH
+            # Camera depth is a direct measurement - no state estimation drift
+            cam_depth = sensor_data.get('target_camera_depth', float('inf'))
+            if cam_depth < 10.0 and self.fsm.state in (RobotState.NAVIGATE, RobotState.APPROACH):
+                distance_for_fsm = cam_depth
+            elif self.approach_standoff is not None and self.fsm.state == RobotState.NAVIGATE:
                 sdx = self.approach_standoff[0] - pose[0]
                 sdy = self.approach_standoff[1] - pose[1]
                 distance_for_fsm = np.sqrt(sdx**2 + sdy**2)
@@ -664,7 +696,13 @@ class CognitiveArchitecture:
                 print("[DEBUG] Rotating to find table")
             
         elif self.fsm.state == RobotState.NAVIGATE:
-            # Navigate to standoff point (not directly at the cylinder)
+            cam_depth = sensor_data.get('target_camera_depth', float('inf'))
+            # Use relaxed avoidance when target is visible nearby (near the table)
+            # This reduces table keepout from 0.6m to 0.2m so we can approach
+            use_relaxed = cam_depth < 2.5 and sensor_data['target_detected']
+            self._in_approach = False  # reset approach depth smoother flag
+            
+            # Waypoint navigation toward standoff position
             nav_goal = self.approach_standoff if self.approach_standoff else (
                 target_pos[:2] if target_pos else None
             )
@@ -680,7 +718,8 @@ class CognitiveArchitecture:
                     'mode': 'navigate',
                     'target': self.current_waypoint,
                     'pose': pose,
-                    'lidar': sensor_data['lidar']
+                    'lidar': sensor_data['lidar'],
+                    'relaxed_avoidance': use_relaxed
                 }
                 
                 # Check if waypoint reached
@@ -695,13 +734,20 @@ class CognitiveArchitecture:
                 
                     
         elif self.fsm.state == RobotState.APPROACH:
+            # Reset depth smoother on first approach tick
+            if not hasattr(self, '_in_approach') or not self._in_approach:
+                self._approach_depth_smooth = float('inf')
+                self._in_approach = True
             if target_pos:
+                # During approach, use camera-relative visual servoing for reactive control
                 control_commands = {
-                    'mode': 'approach',
+                    'mode': 'approach_visual',
                     'target': target_pos[:2],
                     'pose': pose,
                     'lidar': sensor_data['lidar'],
-                    'relaxed_avoidance': True
+                    'relaxed_avoidance': True,
+                    'camera_bearing': sensor_data.get('target_camera_bearing', 0.0),
+                    'camera_depth': sensor_data.get('target_camera_depth', float('inf'))
                 }
                 
         elif self.fsm.state == RobotState.GRASP:
@@ -709,7 +755,7 @@ class CognitiveArchitecture:
                 grasp_plan = self.grasp_planner.plan_grasp(target_pos)
                 grasp_time = self.fsm.get_time_in_state()
                 
-                # Multi-phase grasp sequence (8s total timeout)
+                # Multi-phase grasp sequence (20s total timeout)
                 if grasp_time < 2.5:
                     phase = 'reach_above'   # Open gripper, raise lift, IK above target
                 elif grasp_time < 5.5:
@@ -739,9 +785,11 @@ class CognitiveArchitecture:
             }
             
         elif self.fsm.state == RobotState.FAILURE:
-            # Reset standoff and waypoint so new ones are computed on retry
+            # Reset standoff, waypoint, and target smoothing so new ones are computed on retry
             self.approach_standoff = None
             self.current_waypoint = None
+            self.target_position_smoothed = None
+            self.target_detection_count = 0
             control_commands = {
                 'mode': 'failure',
                 'gripper': 'open',
@@ -751,11 +799,23 @@ class CognitiveArchitecture:
         return control_commands
     
     # ==================== ACT ====================
+    def _stow_arm(self):
+        """Hold arm joints at stowed (zero) positions to prevent flailing during driving."""
+        for joint_idx in self.arm_joints:
+            p.setJointMotorControl2(self.robot_id, joint_idx,
+                                   p.POSITION_CONTROL,
+                                   targetPosition=0.0, force=500,
+                                   maxVelocity=2.0)
+    
     def act(self, control_commands):
         """
         ACT phase: Execute motion commands on the robot.
         """
         mode = control_commands.get('mode', 'idle')
+        
+        # Stow arm during all non-grasp/lift modes to prevent spinning
+        if mode not in ('grasp', 'lift', 'success'):
+            self._stow_arm()
         
         if mode == 'search_rotate':
             # Rotate in place to search for target
@@ -895,20 +955,20 @@ class CognitiveArchitecture:
             angle_to_target = np.arctan2(dy, dx)
             heading_error = angle_to_target - pose[2]
             heading_error = np.arctan2(np.sin(heading_error), np.cos(heading_error))
-
-            # Use either fixed gains or your learned PIDs
-            # forward_vel = self.nav_pid_dist.compute(dist, self.dt)
-            # angular_vel = self.nav_pid_angle.compute(heading_error, self.dt)
-
-            Kp_dist = 2.5
-            Kp_angle = 1.0
-            forward_vel = np.clip(Kp_dist * dist,
-                                -self.max_linear_speed,
-                                self.max_linear_speed)
-            angular_vel = np.clip(Kp_angle * heading_error,
-                                -self.max_angular_speed,
-                                self.max_angular_speed)
-
+            
+            # Speed control
+            if mode == 'approach':
+                max_speed = 5.0
+                kp_dist = 3.0
+                kp_angle = 5.0
+            else:
+                max_speed = 5.0
+                kp_dist = 4.0
+                kp_angle = 5.0
+            
+            forward_vel = np.clip(kp_dist * dist, 0, max_speed)
+            angular_vel = kp_angle * heading_error
+            
             # M4: Lidar obstacle avoidance (relaxed near table during approach)
             relaxed = control_commands.get('relaxed_avoidance', False)
             forward_vel, avoidance_turn = self._get_lidar_obstacle_avoidance(
@@ -938,10 +998,68 @@ class CognitiveArchitecture:
             print(f"[DEBUG ACT] Mode={mode}, left_vel={left_vel:.2f}, right_vel={right_vel:.2f}")
 
             if self.step_counter % 240 == 0:
-                print(f"[Act] {mode.upper()}: dist={dist:.2f}m, "
-                    f"heading={np.degrees(heading_error):.0f} deg, "
-                    f"fwd={forward_vel:.1f}, turn={angular_vel:.1f}")
-
+                print(f"[Act] {mode.upper()}: dist={dist:.2f}m, heading={np.degrees(heading_error):.0f} deg, "
+                      f"fwd={forward_vel:.1f}, turn={angular_vel:.1f}")
+            
+            for i in [0, 2]:
+                p.setJointMotorControl2(self.robot_id, i, p.VELOCITY_CONTROL,
+                                       targetVelocity=left_vel, force=5000)
+            for i in [1, 3]:
+                p.setJointMotorControl2(self.robot_id, i, p.VELOCITY_CONTROL,
+                                       targetVelocity=right_vel, force=5000)
+        
+        elif mode == 'approach_visual':
+            # M6: Reactive visual servoing - steer using camera pixel offset
+            # Bypasses state estimation heading drift for approach accuracy
+            camera_bearing = control_commands.get('camera_bearing', 0.0)
+            camera_depth = control_commands.get('camera_depth', float('inf'))
+            lidar = control_commands.get('lidar')
+            pose = control_commands.get('pose')
+            
+            # Smooth depth to avoid jumps (e.g. detection flicker to far pixel)
+            if not hasattr(self, '_approach_depth_smooth'):
+                self._approach_depth_smooth = camera_depth
+            # Only allow depth to INCREASE slowly (prevents overshoot on flicker)
+            if camera_depth < self._approach_depth_smooth:
+                self._approach_depth_smooth = camera_depth  # trust closer readings immediately
+            else:
+                self._approach_depth_smooth = 0.7 * self._approach_depth_smooth + 0.3 * camera_depth
+            smooth_depth = self._approach_depth_smooth
+            
+            # Use camera bearing directly for steering (no state estimation needed)
+            kp_bearing = 8.0
+            max_speed = 4.0   # gentler max speed during approach
+            kp_dist = 3.0
+            
+            forward_vel = np.clip(kp_dist * smooth_depth, 0.5, max_speed)
+            angular_vel = kp_bearing * camera_bearing
+            
+            # Slow down progressively when close
+            if smooth_depth < 1.0:
+                forward_vel = np.clip(2.0 * smooth_depth, 0.3, 2.0)
+            
+            # M4: Lidar obstacle avoidance - only use when far from target
+            # When close to target, lidar seeing the table pushes robot sideways
+            if smooth_depth > 1.5:
+                forward_vel, avoidance_turn = self._get_lidar_obstacle_avoidance(
+                    lidar, forward_vel, relaxed=True, robot_pose=pose)
+                angular_vel += avoidance_turn
+            else:
+                # Emergency braking only: hard-stop if obstacle very close ahead
+                if lidar is not None and len(lidar) > 0:
+                    num_rays_l = len(lidar)
+                    front_idx = [i % num_rays_l for i in range(-2, 3)]
+                    min_front_dist = min(lidar[i] for i in front_idx)
+                    if min_front_dist < 0.15:
+                        forward_vel = 0.0  # Emergency stop
+            
+            left_vel = forward_vel - angular_vel
+            right_vel = forward_vel + angular_vel
+            
+            if self.step_counter % 240 == 0:
+                print(f"[Act] APPROACH_VISUAL: depth={camera_depth:.2f}m, bearing={np.degrees(camera_bearing):.0f} deg, "
+                      f"fwd={forward_vel:.1f}, turn={angular_vel:.1f}")
+            
             for i in [0, 2]:
                 p.setJointMotorControl2(self.robot_id, i, p.VELOCITY_CONTROL,
                                     targetVelocity=left_vel, force=5000)
@@ -1167,6 +1285,17 @@ def main():
     print("  IIS Cognitive Architecture - Navigate-to-Grasp Mission")
     print("  Integrating all 10 modules in Sense-Think-Act loop")
     print("="*60)
+    print("  M1:  Task Specification (README)")
+    print("  M2:  URDF Robot Hardware & Environment")
+    print("  M3:  Sensor Preprocessing (sensor_preprocessing.py)")
+    print("  M4:  Perception (HSV color, SIFT, RANSAC)")
+    print("  M5:  State Estimation (Particle Filter)")
+    print("  M6:  Motion Control (PID, IK, Differential Drive)")
+    print("  M7:  Action Planning (FSM + Waypoint Planner)")
+    print("  M8:  Knowledge Representation (Prolog Dynamic_KB.pl)")
+    print("  M9:  Learning (Parameter Optimization)")
+    print("  M10: Cognitive Architecture (Sense-Think-Act)")
+    print("="*60)
     
     # M2: Build world (hardware initialization)
     robot_id, table_id, room_id, target_id = build_world(gui=True)
@@ -1180,6 +1309,21 @@ def main():
         print(f"[Init] Table at: ({cog_arch.table_position[0]:.2f}, {cog_arch.table_position[1]:.2f})")
     else:
         print("[Init] Table position unknown - will search")
+    
+    # M8: Report KB state
+    try:
+        sensors = cog_arch.kb.sensors()
+        caps = cog_arch.kb.robot_capabilities()
+        print(f"[Init] M8 KB sensors: {sensors}")
+        print(f"[Init] M8 KB robot capabilities: {caps}")
+    except Exception:
+        pass
+    
+    # M9: Report learning state
+    best_params = cog_arch.learner.get_best_parameters()
+    print(f"[Init] M9 Learning params: nav_kp={best_params.get('nav_kp', '?'):.2f}, "
+          f"angle_kp={best_params.get('angle_kp', '?'):.2f}")
+    
     print("[Init] Mission: Navigate to table and grasp red cylinder\n")
 
     # learner = cog_arch.learner
@@ -1200,9 +1344,14 @@ def main():
         
         # ========== ACT ==========
         cog_arch.act(control_commands)
-
         
-
+        # Check for task completion — terminate after SUCCESS holds for 3 seconds
+        if cog_arch.fsm.state == RobotState.SUCCESS:
+            if cog_arch.fsm.get_time_in_state() > 3.0:
+                print("\n" + "="*60)
+                print("  MISSION COMPLETE - Target grasped and lifted!")
+                print("="*60)
+                break
         
         # Status output every ~1 second
         if cog_arch.step_counter % 240 == 0:

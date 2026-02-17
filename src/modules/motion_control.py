@@ -162,17 +162,20 @@ def grasp_object(robot_id, target_pos, target_orient, arm_joints=None, close_gri
         for i in range(num_joints):
             joint_info = p.getJointInfo(robot_id, i)
             joint_name = joint_info[1].decode('utf-8')
+            joint_type = joint_info[2]
             
-            # Collect arm joints in order
-            if 'arm_base_joint' in joint_name:
+            # Collect arm joints in order (only movable joints, skip fixed cosmetic joints)
+            if joint_type == p.JOINT_FIXED:
+                pass  # Skip fixed joints like elbow_joint_start, wrist_joint_start, etc.
+            elif joint_name == 'arm_base_joint':
                 arm_joints.append(i)
-            elif 'shoulder_joint' in joint_name:
+            elif joint_name == 'shoulder_joint':
                 arm_joints.append(i)
-            elif 'elbow_joint' in joint_name:
+            elif joint_name == 'elbow_joint':
                 arm_joints.append(i)
-            elif 'wrist_pitch_joint' in joint_name:
+            elif joint_name == 'wrist_pitch_joint':
                 arm_joints.append(i)
-            elif 'wrist_roll_joint' in joint_name:
+            elif joint_name == 'wrist_roll_joint':
                 arm_joints.append(i)
             
             # Find gripper base link (end effector for IK)

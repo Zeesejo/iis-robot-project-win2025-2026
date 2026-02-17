@@ -8,7 +8,7 @@ import math
 
 # --- Configuration ---
 ROOM_DIM = 10.0
-OBSTACLE_COUNT = 5
+OBSTACLE_COUNT = 10
 OBSTACLE_COLORS = [
     [0, 0, 1, 1],  # Blue
     [1, 0.75, 0.8, 1],  # Pink
@@ -65,18 +65,15 @@ def build_world(gui=True):
 
     p.setAdditionalSearchPath(pybullet_data.getDataPath())
     p.setGravity(0, 0, -9.81)
-    
-    # Tune physics engine for better wheel-ground contact
-    p.setPhysicsEngineParameter(
-        numSolverIterations=150,  # Increase from default 50 for better contact
-        erp=0.8,                   # Error reduction parameter
-        contactERP=0.8,            # Contact-specific ERP
-        frictionERP=0.8,           # Friction constraint ERP
-        enableConeFriction=1       # Better anisotropic friction
-    )
 
     # 1. Load Room (Which now includes the floor)
     room_id = p.loadURDF(os.path.join(URDF_PATH, "room.urdf"), useFixedBase=True)
+
+    # 2. Set Floor Friction (Requirement: mu=0.5)
+    # The floor is link index 0 in our new URDF (since it's the first child of world)
+    # We set lateral friction to 0.5
+    p.changeDynamics(room_id, -1, lateralFriction=0.5)
+    p.changeDynamics(room_id, 0, lateralFriction=0.5)
 
     # 2. Set Floor Friction (Requirement: mu=0.5)
     # The floor is link index 0 in our new URDF (since it's the first child of world)
@@ -159,10 +156,10 @@ def build_world(gui=True):
 
         obs_pos = [o_pos_xy[0], o_pos_xy[1], 0.2]  # Half height of 0.4 box
         obs_orn = p.getQuaternionFromEuler([0, 0, random.uniform(0, 3.14)])
-        obs_id = p.loadURDF(os.path.join(URDF_PATH, "obstacle.urdf"), obs_pos, obs_orn, useFixedBase=False)
+        obs_id = p.loadURDF(os.path.join(URDF_PATH, "obstacle.urdf"), obs_pos, obs_orn, useFixedBase=True)
 
         # Apply Color
-        color = OBSTACLE_COLORS[i]
+        color = OBSTACLE_COLORS[i % len(OBSTACLE_COLORS)]
         p.changeVisualShape(obs_id, -1, rgbaColor=color)
         p.changeDynamics(obs_id, -1, mass=10.0)
 

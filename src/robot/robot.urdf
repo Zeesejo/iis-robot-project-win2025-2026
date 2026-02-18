@@ -27,7 +27,7 @@
       </geometry>
     </collision>
     <inertial>
-      <mass value="5.0"/>
+      <mass value="12.0"/>
       <inertia ixx="0.05" ixy="0" ixz="0" iyy="0.05" iyz="0" izz="0.05"/>
     </inertial>
   </link>
@@ -132,12 +132,12 @@
     <axis xyz="0 0 1"/>
   </joint>
 
-  <link name="rgbd_camera_link"/>
+  <!-- <link name="rgbd_camera_link"/>
   <joint name="camera_joint" type="fixed">
     <parent link="gripper_base"/>
     <child link="rgbd_camera_link"/>
     <origin xyz="0.0 0.0 0.06" rpy="0 0.2 0"/>
-  </joint>
+  </joint> -->
 
   <link name="torso_link">
     <visual>
@@ -167,7 +167,7 @@
   <joint name="camera_joint" type="fixed">
     <parent link="torso_link"/>
     <child link="rgbd_camera_link"/>
-    <origin xyz="0.25 0 0.15" rpy="0 0 0"/>
+   <origin xyz="0.25 0 0.45" rpy="0 0 0"/>
   </joint>
 
   <link name="lidar_link"/>
@@ -252,7 +252,7 @@
     <parent link="arm_base"/>
     <child link="shoulder_link"/>
     <origin xyz="0 0 0.025"/>
-    <axis xyz="0 1 0"/>
+   <axis xyz="1 0 0"/>
     <limit effort="10.0" lower="-1.0" upper="1.57" velocity="1.0"/>
   </joint>
 
@@ -277,47 +277,23 @@
       <inertia ixx="0.01" iyy="0.01" izz="0.01"/>
     </inertial>
   </link>
-  <link name="elbow_link_start">
-    <visual>
-      <origin xyz="0 0 0.4" rpy="1.5708 0 0"/>
-      <geometry>
-        <cylinder length="0.06" radius="0.025"/>
-      </geometry>
-      <material name="black"/>
-    </visual>
-    <collision>
-      <origin xyz="0 0 0.4" rpy="1.5708 0 0"/>
-      <geometry>
-        <cylinder length="0.05" radius="0.025"/>
-      </geometry>
-    </collision>
-    <inertial>
-      <origin xyz="0 0 0.15"/>
-      <mass value="0.8"/>
-      <inertia ixx="0.01" iyy="0.01" izz="0.01"/>
-    </inertial>
-  </link>
-    <joint name="elbow_joint_start" type="fixed">
-    <parent link="shoulder_link"/>
-    <child link="elbow_link_start"/>
-  </joint>
   <joint name="elbow_joint" type="revolute">
     <parent link="shoulder_link"/>
     <child link="elbow_link"/>
     <origin xyz="0 0 0.4"/>
-    <axis xyz="0 1 0"/>
+    <axis xyz="1 0 0"/>
     <limit effort="10.0" lower="-0.5" upper="2.0" velocity="1.0"/>
   </joint>
   <link name="wrist_link_start">
     <visual>
-      <origin xyz="0 0 0" rpy="1.5708 0 0"/>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry>
         <cylinder length="0.05" radius="0.02"/>
       </geometry>
       <material name="black"/>
     </visual>
     <collision>
-      <origin xyz="0 0 0" rpy="1.5708 0 0"/>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry>
         <cylinder length="0.05" radius="0.02"/>
       </geometry>
@@ -346,19 +322,31 @@
       <inertia ixx="0.001" iyy="0.001" izz="0.001"/>
     </inertial>
   </link>
-
-    <joint name="wrist_joint_start" type="fixed">
-    <parent link="wrist_pitch_link"/>
-    <child link="wrist_link_start"/>
-  </joint>
-
+    <!-- Wrist pitch: elbow -> wrist_pitch_link -->
   <joint name="wrist_pitch_joint" type="revolute">
     <parent link="elbow_link"/>
     <child link="wrist_pitch_link"/>
     <origin xyz="0 0 0.29"/>
-    <axis xyz="0 1 0"/>
+    <axis xyz="1 0 0"/>
     <limit effort="5.0" lower="-1.57" upper="1.57" velocity="1.0"/>
   </joint>
+
+  <!-- Fixed link at the end of wrist pitch -->
+  <joint name="wrist_joint_start" type="fixed">
+    <parent link="wrist_pitch_link"/>
+    <child link="wrist_link_start"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+
+  <!-- Wrist roll now attached to wrist_link_start (not directly to wrist_pitch_link) -->
+  <joint name="wrist_roll_joint" type="revolute">
+    <parent link="wrist_link_start"/>
+    <child link="wrist_roll_link"/>
+    <origin xyz="0 0 0.056"/>
+    <axis xyz="0 0 1"/>
+    <limit effort="5.0" lower="-3.14" upper="3.14" velocity="1.0"/>
+  </joint>
+
 
   <link name="wrist_roll_link">
     <visual>
@@ -395,20 +383,11 @@
       <inertia ixx="0.001" iyy="0.001" izz="0.001"/>
     </inertial>
   </link>
-    <joint name="wrist_roll_joint_cup" type="fixed">
-    <parent link="wrist_pitch_link"/>
+  <joint name="wrist_roll_joint_cup" type="fixed">
+    <parent link="wrist_roll_link"/>
     <child link="wrist_roll_link_cup"/>
-    <origin xyz="0 0 0.03"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
   </joint>
-
-  <joint name="wrist_roll_joint" type="revolute">
-    <parent link="wrist_pitch_link"/>
-    <child link="wrist_roll_link"/>
-    <origin xyz="0 0 0.056"/>
-    <axis xyz="0 0 1"/>
-    <limit effort="5.0" lower="-3.14" upper="3.14" velocity="1.0"/>
-  </joint>
-
   <link name="gripper_base">
     <visual>
       <geometry>

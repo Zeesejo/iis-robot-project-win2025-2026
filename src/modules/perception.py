@@ -10,8 +10,10 @@ SCENE_OBJECTS = {
     'black_obs':  {'rgb': [0.0, 0.0, 0.0], 'type': 'cube',    'dims': [0.4, 0.4, 0.4]},
 }
 COLOR_RANGES_HSV = {
-    'red':    [(np.array([0,  30, 30]),  np.array([20, 255, 255])),
-               (np.array([160, 30, 30]), np.array([180, 255, 255]))],
+    'red': [
+        (np.array([0, 120, 70]), np.array([8, 255, 255])),
+        (np.array([170, 120, 70]), np.array([180, 255, 255]))
+    ],
     'brown':  [(np.array([10,  80, 30]),  np.array([25, 180, 180]))],
     'blue':   [(np.array([100, 120, 70]), np.array([130, 255, 255]))],
     'pink':   [(np.array([140, 40, 100]), np.array([180, 255, 255]))],
@@ -151,6 +153,7 @@ class RANSAC_Segmentation:
                 if best_count >= self.min_inliers:
                     break
         return best_mask, best_model
+
 def compute_pca(points):
     if len(points) < 3:
         raise ValueError("Not enough points for PCA.")
@@ -167,7 +170,6 @@ def compute_pca(points):
     obb_offset = (mins + maxs) / 2
     obb_center = center + np.dot(obb_offset, eigenvectors.T)
     return obb_center, eigenvectors, dimensions
-
 
 def refine_object_points(points, obb_center, obb_vectors, obb_dims, tolerance=1.1):
     """Geometric refinement — removes outlier points (same as provided code)."""
@@ -226,6 +228,23 @@ class PerceptionModule:
         bgr = cv2.cvtColor(rgb_array, cv2.COLOR_RGBA2BGR)
 
         detections = detect_objects_by_color(bgr)
+        results = {...}
+        # --- Extract 3D position of RED object only (MOVE HERE) ---
+        red_objects = [d for d in detections if d['color'] == 'red']
+        if len(red_objects) > 0:
+            red_obj = max(red_objects, key=lambda d: d['area'])
+            x, y, w, h = red_obj['bbox']
+            roi_depth = depth_arr[y:y+h, x:x+w]
+            if roi_depth.size > 0:
+                roi_pts, _ = depth_to_point_cloud(roi_depth.flatten(), w, h)
+                if len(roi_pts) > 10:
+                    center, vectors, dims = compute_pca(roi_pts)
+                    results['target_pose'] = {
+                        'color': 'red',
+                        'center': center.tolist(),
+                        'axes': vectors.tolist(),
+                        'dimensions': dims.tolist()
+                    }
 
         seg_mask, _ = edge_contour_segmentation(bgr, min_contour_area=300)
 
@@ -246,10 +265,21 @@ class PerceptionModule:
         plane_mask, plane_model = ransac.run()
 
         if plane_model is not None:
+            num_inliers = int(np.sum(plane_mask)) # Reject small planes (cubes, walls, etc.) 
+            if num_inliers < 1500:
+                return results
+            
             results['table_plane'] = {
                 'model': plane_model,
                 'num_inliers': int(np.sum(plane_mask))
             }
+
+                        # --- Compute table center (CRITICAL) ---
+            table_points = points_3d[plane_mask]
+            if len(table_points) > 20:
+                table_center = np.mean(table_points, axis=0)
+                results['table_center'] = table_center.tolist()
+
 
         # --- F) Separate plane (table) from objects ---
         object_points = points_3d[~plane_mask]
@@ -257,18 +287,21 @@ class PerceptionModule:
             return results
 
         # --- G) PCA on all object points for target pose ---
-        try:
-            center, vectors, dims = compute_pca(object_points)
-            refined = refine_object_points(object_points, center, vectors, dims)
-            if len(refined) > 10:
-                center, vectors, dims = compute_pca(refined)
-            results['target_pose'] = {
-                'center': center.tolist(),
-                'axes': vectors.tolist(),
-                'dimensions': dims.tolist()
-            }
-        except ValueError:
-            pass
+        # Only compute generic PCA if no red target was found
+        if results['target_pose'] is None:
+            try:
+                center, vectors, dims = compute_pca(object_points)
+                refined = refine_object_points(object_points, center, vectors, dims)
+                if len(refined) > 10:
+                    center, vectors, dims = compute_pca(refined)
+                results['target_pose'] = {
+                    'color': 'unknown',
+                    'center': center.tolist(),
+                    'axes': vectors.tolist(),
+                    'dimensions': dims.tolist()
+                }
+            except ValueError:
+                pass
 
         for det in detections:
             if det['color'] in ['blue', 'pink', 'orange', 'yellow', 'black']:

@@ -86,6 +86,8 @@ def build_world(gui=True):
     # Floor top at z=0, so for wheels to touch: base_z - 0.1 = 0 → base_z = 0.1
     robot_start_pos = [0, 0, 0.1]  # Wheels will rest on floor at z=0
     robot_start_orn = p.getQuaternionFromEuler([0, 0, 0])
+    print("ROBOT_URDF:", ROBOT_URDF)
+    print("exists?", os.path.exists(ROBOT_URDF))
     robot_id = p.loadURDF(ROBOT_URDF, robot_start_pos, robot_start_orn)
     
     # Configure wheel dynamics for proper driving

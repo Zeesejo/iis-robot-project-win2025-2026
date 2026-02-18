@@ -8,7 +8,7 @@ import math
 
 # --- Configuration ---
 ROOM_DIM = 10.0
-OBSTACLE_COUNT = 5
+OBSTACLE_COUNT = 10
 OBSTACLE_COLORS = [
     [0, 0, 1, 1],  # Blue
     [1, 0.75, 0.8, 1],  # Pink
@@ -21,8 +21,8 @@ TABLE_HEIGHT = 0.625
 TARGET_HEIGHT = 0.12
 
 # File Paths (Relative to where python is executed)
-URDF_PATH = "../src/environment/"
-ROBOT_URDF = "../src/robot/robot.urdf"
+URDF_PATH = "./src/environment/"
+ROBOT_URDF = "./src/robot/robot.urdf"
 
 
 def get_random_pos(bounds, min_dist_from_origin=1.0):
@@ -119,10 +119,10 @@ def build_world(gui=True):
 
         obs_pos = [o_pos_xy[0], o_pos_xy[1], 0.2]  # Half height of 0.4 box
         obs_orn = p.getQuaternionFromEuler([0, 0, random.uniform(0, 3.14)])
-        obs_id = p.loadURDF(os.path.join(URDF_PATH, "obstacle.urdf"), obs_pos, obs_orn, useFixedBase=False)
+        obs_id = p.loadURDF(os.path.join(URDF_PATH, "obstacle.urdf"), obs_pos, obs_orn, useFixedBase=True)
 
         # Apply Color
-        color = OBSTACLE_COLORS[i]
+        color = OBSTACLE_COLORS[i % len(OBSTACLE_COLORS)]
         p.changeVisualShape(obs_id, -1, rgbaColor=color)
         p.changeDynamics(obs_id, -1, mass=10.0)
 

@@ -111,6 +111,7 @@ class CognitiveArchitecture:
         else:
             self.apply_parameters(DEFAULT_PARAMETERS)
             print("[Learning] No learned parameters found, using defaults")
+        # self.apply_parameters(DEFAULT_PARAMETERS)
         
         # Robot configuration - wheel joints [FL, FR, BL, BR]
         self.wheel_joints = [0, 1, 2, 3]
@@ -286,7 +287,7 @@ class CognitiveArchitecture:
         Approaches from the long side (1.5m) of the table so the arm
         only needs to reach across the short dimension (0.4m from edge to center).
         """
-        standoff_dist = 1.10  # meters from target center (table half-width 0.4 + robot 0.3 + margin 0.4)
+        standoff_dist = 1.30  # meters from target center (table half-width 0.4 + robot 0.3 + margin 0.4)
         
         if self.table_orientation is not None:
             # Get table yaw from orientation quaternion
@@ -746,11 +747,7 @@ class CognitiveArchitecture:
                 'gripper': 'open',
                 'lidar': sensor_data['lidar']
             }
-
-        print(f"[DEBUG] Control command: {control_commands}")
-        print(f"[DEBUG] approach_standoff: {self.approach_standoff}, current_waypoint: {self.current_waypoint}")
-
-        
+       
         return control_commands
     
     # ==================== ACT ====================
@@ -792,18 +789,25 @@ class CognitiveArchitecture:
             heading_error = angle_to_target - pose[2]
             heading_error = np.arctan2(np.sin(heading_error), np.cos(heading_error))
             
-            forward_vel = np.clip(2.0 * dist, -self.max_linear_speed, self.max_linear_speed)
-            angular_vel = np.clip(4.0 * heading_error, -self.max_angular_speed, self.max_angular_speed)
-
+            forward_vel = np.clip(2.0 * dist,
+                                -self.max_linear_speed,
+                                self.max_linear_speed)
+            angular_vel = np.clip(4.0 * heading_error,
+                                -self.max_angular_speed,
+                                self.max_angular_speed)
             
-            # M4: Lidar obstacle avoidance
+            # Lidar + table safety
             forward_vel, avoidance_turn = self._get_lidar_obstacle_avoidance(
-                lidar, forward_vel, robot_pose=pose)
+                lidar, forward_vel, robot_pose=pose
+            )
             angular_vel += avoidance_turn
 
-            max_turn = abs(forward_vel) + 0.1
-            angular_vel = np.clip(angular_vel, -max_turn, max_turn)
+            # NEW: in SEARCH, never drive backwards – only forward or rotate
+            if forward_vel < 0.0:
+                forward_vel = 0.0
 
+            max_turn = 0.5 * abs(forward_vel) + 0.1
+            angular_vel = np.clip(angular_vel, -max_turn, max_turn)
 
             forward_vel = np.clip(forward_vel, -self.max_linear_speed, self.max_linear_speed)
             angular_vel = np.clip(angular_vel, -self.max_angular_speed, self.max_angular_speed)
@@ -858,6 +862,9 @@ class CognitiveArchitecture:
                 lidar, forward_vel, robot_pose=pose)
             angular_vel += avoidance_turn
 
+            if forward_vel < 0.0:
+                forward_vel = 0.0
+
             forward_vel = np.clip(forward_vel, -self.max_linear_speed, self.max_linear_speed)
             angular_vel = np.clip(angular_vel, -self.max_angular_speed, self.max_angular_speed)
             
@@ -880,40 +887,49 @@ class CognitiveArchitecture:
             target = control_commands['target']
             pose = control_commands['pose']
             lidar = control_commands.get('lidar')
-            
+
             dx = target[0] - pose[0]
             dy = target[1] - pose[1]
             dist = np.hypot(dx, dy)
-            
+
             angle_to_target = np.arctan2(dy, dx)
             heading_error = angle_to_target - pose[2]
             heading_error = np.arctan2(np.sin(heading_error), np.cos(heading_error))
 
+            # Use either fixed gains or your learned PIDs
+            # forward_vel = self.nav_pid_dist.compute(dist, self.dt)
+            # angular_vel = self.nav_pid_angle.compute(heading_error, self.dt)
 
-            forward_vel = self.nav_pid_dist.compute(dist, self.dt)
-            angular_vel = self.nav_pid_angle.compute(heading_error, self.dt)
-        
-            
+            Kp_dist = 2.5
+            Kp_angle = 1.0
+            forward_vel = np.clip(Kp_dist * dist,
+                                -self.max_linear_speed,
+                                self.max_linear_speed)
+            angular_vel = np.clip(Kp_angle * heading_error,
+                                -self.max_angular_speed,
+                                self.max_angular_speed)
+
             # M4: Lidar obstacle avoidance (relaxed near table during approach)
             relaxed = control_commands.get('relaxed_avoidance', False)
             forward_vel, avoidance_turn = self._get_lidar_obstacle_avoidance(
-                lidar, forward_vel, relaxed=relaxed, robot_pose=pose)
+                lidar, forward_vel, relaxed=relaxed, robot_pose=pose
+            )
             angular_vel += avoidance_turn
 
-            forward_vel = np.clip(
-                forward_vel,
-                -self.max_linear_speed,
-                self.max_linear_speed
-            )
+            # 1) Bound turn so it cannot dominate forward motion
+            max_turn = 0.5 * abs(forward_vel) + 0.1
+            angular_vel = np.clip(angular_vel, -max_turn, max_turn)
 
-            angular_vel = np.clip(
-                angular_vel,
-                -self.max_angular_speed,
-                self.max_angular_speed
-            )
-            
-            left_vel = forward_vel - angular_vel
-            right_vel = forward_vel + angular_vel
+            # 2) Do not start NAVIGATE/APPROACH by backing up
+            if self.step_counter < 200 and forward_vel < 0.0:
+                forward_vel = 0.0
+
+            forward_vel = np.clip(forward_vel,
+                                -self.max_linear_speed,
+                                self.max_linear_speed)
+            angular_vel = np.clip(angular_vel,
+                                -self.max_angular_speed,
+                                self.max_angular_speed)
 
             wheel_limit = self.max_linear_speed + self.max_angular_speed
             left_vel = np.clip(forward_vel - angular_vel, -wheel_limit, wheel_limit)
@@ -921,18 +937,18 @@ class CognitiveArchitecture:
 
             print(f"[DEBUG ACT] Mode={mode}, left_vel={left_vel:.2f}, right_vel={right_vel:.2f}")
 
-
             if self.step_counter % 240 == 0:
-                print(f"[Act] {mode.upper()}: dist={dist:.2f}m, heading={np.degrees(heading_error):.0f} deg, "
-                      f"fwd={forward_vel:.1f}, turn={angular_vel:.1f}")
-            
+                print(f"[Act] {mode.upper()}: dist={dist:.2f}m, "
+                    f"heading={np.degrees(heading_error):.0f} deg, "
+                    f"fwd={forward_vel:.1f}, turn={angular_vel:.1f}")
+
             for i in [0, 2]:
                 p.setJointMotorControl2(self.robot_id, i, p.VELOCITY_CONTROL,
-                                       targetVelocity=left_vel, force=5000)
+                                    targetVelocity=left_vel, force=5000)
             for i in [1, 3]:
                 p.setJointMotorControl2(self.robot_id, i, p.VELOCITY_CONTROL,
-                                       targetVelocity=right_vel, force=5000)
-                                       
+                                    targetVelocity=right_vel, force=5000)
+                             
         elif mode == 'grasp':
             # M6: Stop wheels, multi-phase arm control for grasping
             for i in self.wheel_joints:
@@ -1079,8 +1095,8 @@ class CognitiveArchitecture:
         )
 
         self.vision_threshold = get_param("vision_threshold", 0.5)
-        self.max_linear_speed = np.clip(get_param("max_linear_speed", 0.5), 0.1, 1.0)
-        self.max_angular_speed = np.clip(get_param("max_angular_speed", 1.0), 0.2, 2.0)
+        self.max_linear_speed = np.clip(get_param("max_linear_speed", 0.5), 0.6, 0.8)
+        self.max_angular_speed = np.clip(get_param("max_angular_speed", 1.0), 1.0, 1.2)
 
         print("[Learning] Parameters applied successfully")
 
@@ -1092,7 +1108,7 @@ class CognitiveArchitecture:
             p.connect(p.DIRECT)
 
         # rebuild world again
-        robot_id, table_id, room_id, target_id = build_world(gui=False)
+        robot_id, table_id, room_id, target_id = build_world(gui=True)
 
         self.robot_id = robot_id
         self.table_id = table_id
@@ -1117,6 +1133,32 @@ class CognitiveArchitecture:
         if hasattr(self, "nav_pid_angle"):
             self.nav_pid_angle.reset()
 
+    def run_episode(self, parameters):
+        """
+        Run one full episode with given parameters for the learner.
+        Returns dict: {"success": bool, "steps": int}.
+        """
+        # 1) Apply parameters (PID gains, speeds, etc.)
+        self.apply_parameters(parameters)
+
+        # 2) Reset FSM and internal state
+        self.fsm.reset()
+        self.approach_standoff = None
+        self.current_waypoint = None
+        self.step_counter = 0
+
+        max_steps = 5000  # or some limit
+
+        while not self.fsm.is_task_complete() and self.step_counter < max_steps:
+            sensor_data = self.sense()
+            control_commands = self.think(sensor_data)
+            self.act(control_commands)
+
+            self.step_counter += 1
+            p.stepSimulation()
+
+        success = (self.fsm.state == RobotState.SUCCESS)
+        return {"success": success, "steps": self.step_counter}    
 
 def main():
     """Main execution loop with Sense-Think-Act cycle"""
@@ -1139,6 +1181,14 @@ def main():
     else:
         print("[Init] Table position unknown - will search")
     print("[Init] Mission: Navigate to table and grasp red cylinder\n")
+
+    # learner = cog_arch.learner
+    # baseline_scores = learner.baseline(episodes=3)
+    # print("Baseline scores:", baseline_scores)
+
+    # Example: 3 online episodes starting from defaults
+    # online_scores = learner.online_learning(episodes=3, initial_parameters=DEFAULT_PARAMETERS)
+    # print("Online scores:", online_scores)
     
     # Main Sense-Think-Act loop
     while p.isConnected():  # DO NOT TOUCH
@@ -1150,6 +1200,9 @@ def main():
         
         # ========== ACT ==========
         cog_arch.act(control_commands)
+
+        
+
         
         # Status output every ~1 second
         if cog_arch.step_counter % 240 == 0:

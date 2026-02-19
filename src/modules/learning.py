@@ -4,11 +4,10 @@ import csv
 import os
 import matplotlib.pyplot as plt
 import sys
+import numpy as np
 
 # Add project root to sys.path so Python can find 'executables'
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
-
-# from executables.cognitive_architecture import CognitiveArchitecture, build_world
 
 
 # =========================
@@ -17,9 +16,9 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../'
 DEFAULT_PARAMETERS = {
     "nav_kp": 2.5,      # strong enough to move
     "nav_ki": 0,
-    "nav_kd": 0.5,     # small derivative
+    "nav_kd": 0.1,     # small derivative
 
-    "angle_kp": 3.0,    # moderate turn
+    "angle_kp": 5.0,    # moderate turn
     "angle_ki": 0.0,
     "angle_kd": 0.01,
 
@@ -28,7 +27,7 @@ DEFAULT_PARAMETERS = {
     "arm_kd": 0.05,
     
     "vision_threshold": 0.5,
-    "max_linear_speed": 0.5,
+    "max_linear_speed": 0.6,
     "max_angular_speed": 1.0
 }
 
@@ -72,13 +71,22 @@ class Evaluator:
 class Optimizer:
 
     def random_parameters(self):
-        return {
-            key: value + random.uniform(-0.3, 0.3)
-            for key, value in DEFAULT_PARAMETERS.items()
-        }
+        # Start from all default keys
+        params = DEFAULT_PARAMETERS.copy()
+
+        # Perturb only the ones you care about
+        params["nav_kp"] = params["nav_kp"] + random.uniform(-0.3, 0.3)
+        params["angle_kp"] = params["angle_kp"] + random.uniform(-0.3, 0.3)
+        params["max_linear_speed"] = params["max_linear_speed"] + random.uniform(-0.1, 0.1)
+        params["max_angular_speed"] = params["max_angular_speed"] + random.uniform(-0.1, 0.1)
+        return params
 
     def mutate(self, params, scale=0.05):
-        return {k: v + random.uniform(-scale, scale) for k,v in params.items()}
+        new = params.copy()
+        for k in ["nav_kp", "angle_kp", "max_linear_speed", "max_angular_speed"]:
+            new[k] = new[k] + random.uniform(-scale, scale)
+        return new
+
 
 
     def get_best(self, memory):
@@ -149,8 +157,6 @@ class Learner:
         """
         
         return self.robot.run_episode(parameters)
-
-
 
     def run_and_store(self, parameters):
 

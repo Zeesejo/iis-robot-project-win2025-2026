@@ -63,7 +63,8 @@ from src.modules.learning import Learner, DEFAULT_PARAMETERS as LEARNING_DEFAULT
 # Robot physical constants (must match URDF and state_estimation)
 WHEEL_RADIUS = 0.1
 WHEEL_BASELINE = 0.45
-CAMERA_HEIGHT = 0.25    # Base spawn height (0.1) + camera Z offset (0.15)
+CAMERA_HEIGHT = 0.55    # Base spawn (0.1) + torso origin (0.3) + camera Z (0.15)
+CAMERA_FORWARD = 0.25   # Camera is 0.25m forward of robot center on torso
 DEPTH_NEAR = 0.1
 DEPTH_FAR = 10.0
 
@@ -164,18 +165,24 @@ class CognitiveArchitecture:
             if 'left_finger_joint' in joint_name or 'right_finger_joint' in joint_name:
                 self.gripper_joints.append(i)
             
-            # Lift joint (prismatic on torso)
+            # Lift joint (only if movable - prismatic/revolute)
             if joint_name == 'lift_joint':
-                self.lift_joint_idx = i
+                joint_type = joint_info[2]
+                if joint_type != p.JOINT_FIXED:
+                    self.lift_joint_idx = i
+                else:
+                    self.lift_joint_idx = None  # Fixed in new URDF, can't actuate
             
             # Camera link
             if 'rgbd_camera' in link_name or 'camera' in link_name:
                 self.camera_link_idx = i
             
-            # Arm joints (revolute joints in the arm chain)
+            # Arm joints (revolute joints in the arm chain, skip fixed cosmetic joints)
             if joint_name in ['arm_base_joint', 'shoulder_joint', 'elbow_joint',
                               'wrist_pitch_joint', 'wrist_roll_joint']:
-                self.arm_joints.append(i)
+                joint_type = joint_info[2]
+                if joint_type != p.JOINT_FIXED:
+                    self.arm_joints.append(i)
         
         print(f"[CogArch] Detected: {len(self.gripper_joints)} gripper joints, "
               f"{len(self.arm_joints)} arm joints, "
@@ -520,7 +527,10 @@ class CognitiveArchitecture:
                             continue
                         
                         # Camera intrinsics (FOV=60 deg, width=320, height=240)
-                        fx = fy = (320 / 2.0) / np.tan(np.deg2rad(60 / 2.0))
+                        # Projection uses aspect=1.0 so both H and V FOV are 60 deg
+                        # But image is 4:3, so fx ≠ fy (non-square pixels)
+                        fx = (320 / 2.0) / np.tan(np.deg2rad(60 / 2.0))   # horizontal
+                        fy = (240 / 2.0) / np.tan(np.deg2rad(60 / 2.0))   # vertical
                         cx, cy_cam = 160.0, 120.0
                         
                         # Convert pixel + depth to camera coordinates
@@ -533,10 +543,10 @@ class CognitiveArchitecture:
                         cos_t = math.cos(robot_theta)
                         sin_t = math.sin(robot_theta)
                         
-                        # Camera frame to robot body frame:
-                        #   robot_forward(+X) = cam_z (depth)
+                        # Camera frame to robot body frame (no tilt, camera level on torso):
+                        #   robot_forward(+X) = cam_z (depth) + camera forward offset
                         #   robot_left(+Y)    = -cam_x (camera right is robot -Y)
-                        robot_body_x = cam_z
+                        robot_body_x = cam_z + CAMERA_FORWARD  # camera is 0.25m ahead of robot center
                         robot_body_y = -cam_x
                         
                         world_x = robot_x + robot_body_x * cos_t - robot_body_y * sin_t
@@ -703,6 +713,7 @@ class CognitiveArchitecture:
             # Use relaxed avoidance when target is visible nearby (near the table)
             # This reduces table keepout from 0.6m to 0.2m so we can approach
             use_relaxed = cam_depth < 2.5 and sensor_data['target_detected']
+            self._in_approach = False  # reset approach depth smoother flag
             
             # Waypoint navigation toward standoff position
             nav_goal = self.approach_standoff if self.approach_standoff else (
@@ -731,6 +742,10 @@ class CognitiveArchitecture:
                     self.current_waypoint = self.action_planner.get_next_waypoint()
                     
         elif self.fsm.state == RobotState.APPROACH:
+            # Reset depth smoother on first approach tick
+            if not hasattr(self, '_in_approach') or not self._in_approach:
+                self._approach_depth_smooth = float('inf')
+                self._in_approach = True
             if target_pos:
                 # During approach, use camera-relative visual servoing for reactive control
                 control_commands = {
@@ -792,11 +807,23 @@ class CognitiveArchitecture:
         return control_commands
     
     # ==================== ACT ====================
+    def _stow_arm(self):
+        """Hold arm joints at stowed (zero) positions to prevent flailing during driving."""
+        for joint_idx in self.arm_joints:
+            p.setJointMotorControl2(self.robot_id, joint_idx,
+                                   p.POSITION_CONTROL,
+                                   targetPosition=0.0, force=500,
+                                   maxVelocity=2.0)
+    
     def act(self, control_commands):
         """
         ACT phase: Execute motion commands on the robot.
         """
         mode = control_commands.get('mode', 'idle')
+        
+        # Stow arm during all non-grasp/lift modes to prevent spinning
+        if mode not in ('grasp', 'lift', 'success'):
+            self._stow_arm()
         
         if mode == 'search_rotate':
             # Rotate in place to search for target
@@ -947,22 +974,35 @@ class CognitiveArchitecture:
             lidar = control_commands.get('lidar')
             pose = control_commands.get('pose')
             
+            # Smooth depth to avoid jumps (e.g. detection flicker to far pixel)
+            if not hasattr(self, '_approach_depth_smooth'):
+                self._approach_depth_smooth = camera_depth
+            # Only allow depth to INCREASE slowly (prevents overshoot on flicker)
+            if camera_depth < self._approach_depth_smooth:
+                self._approach_depth_smooth = camera_depth  # trust closer readings immediately
+            else:
+                self._approach_depth_smooth = 0.7 * self._approach_depth_smooth + 0.3 * camera_depth
+            smooth_depth = self._approach_depth_smooth
+            
             # Use camera bearing directly for steering (no state estimation needed)
             kp_bearing = 8.0
-            max_speed = 8.0
-            kp_dist = 5.0
+            max_speed = 4.0   # gentler max speed during approach
+            kp_dist = 3.0
             
-            forward_vel = np.clip(kp_dist * camera_depth, 1.0, max_speed)
+            forward_vel = np.clip(kp_dist * smooth_depth, 0.5, max_speed)
             angular_vel = kp_bearing * camera_bearing
             
-            # Slow down when very close
-            if camera_depth < 0.5:
-                forward_vel = np.clip(2.0 * camera_depth, 0.3, 2.0)
+            # Slow down progressively when close
+            if smooth_depth < 1.0:
+                forward_vel = np.clip(2.0 * smooth_depth, 0.3, 2.0)
             
-            # M4: Lidar obstacle avoidance (relaxed near table)
-            forward_vel, avoidance_turn = self._get_lidar_obstacle_avoidance(
-                lidar, forward_vel, relaxed=True, robot_pose=pose)
-            angular_vel += avoidance_turn
+            # M4: Lidar obstacle avoidance - only use when far from target
+            # When close to target, lidar seeing the table pushes robot sideways
+            if smooth_depth > 1.5:
+                forward_vel, avoidance_turn = self._get_lidar_obstacle_avoidance(
+                    lidar, forward_vel, relaxed=True, robot_pose=pose)
+                angular_vel += avoidance_turn
+            # When close, skip lidar avoidance to go straight at target
             
             left_vel = forward_vel - angular_vel
             right_vel = forward_vel + angular_vel

@@ -144,7 +144,7 @@ class RobotFSM:
         elif self.state == RobotState.NAVIGATE:
             self.distance_to_target = sensor_data.get('distance_to_target', float('inf'))
             
-            if self.distance_to_target < 1.5:  # Close enough to approach
+            if self.distance_to_target < 2.0:  # Close enough to switch to visual servoing approach
                 print(f"[FSM] Reached navigation waypoint (dist={self.distance_to_target:.2f}m)")
                 self.transition_to(RobotState.APPROACH)
             elif sensor_data.get('collision_detected', False):

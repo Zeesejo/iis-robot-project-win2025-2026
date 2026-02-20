@@ -58,7 +58,7 @@ from src.modules.action_planning import get_action_planner, get_grasp_planner
 from src.modules.knowledge_reasoning import get_knowledge_base
 
 # M9: Learning
-from src.modules.learning import Learner
+from src.modules.learning import Learner, DEFAULT_PARAMETERS as LEARNING_DEFAULTS
 
 # Robot physical constants (must match URDF and state_estimation)
 WHEEL_RADIUS = 0.1
@@ -90,14 +90,21 @@ class CognitiveArchitecture:
         self.action_planner = get_action_planner()
         self.grasp_planner = get_grasp_planner()
         
-        # M8: Knowledge Base
+        # M8: Knowledge Base (backed by Dynamic_KB.pl via PySwip)
         self.kb = get_knowledge_base()
         
         # M9: Learner (for parameter optimization)
-        self.learner = Learner()
+        # Pass self as robot so learner can call run_episode if needed
+        self.learner = Learner(robot=None)  # No live robot connection during main loop
         
-        # M6: PID Controllers
-        self.nav_pid = PIDController(Kp=2.5, Ki=0.0, Kd=0.1)
+        # M9: Use learned or default PID parameters
+        best_params = self.learner.get_best_parameters()
+        nav_kp = best_params.get('nav_kp', LEARNING_DEFAULTS['nav_kp'])
+        nav_ki = best_params.get('nav_ki', LEARNING_DEFAULTS['nav_ki'])
+        nav_kd = best_params.get('nav_kd', LEARNING_DEFAULTS['nav_kd'])
+        
+        # M6: PID Controllers (initialized from M9 learning parameters)
+        self.nav_pid = PIDController(Kp=nav_kp, Ki=nav_ki, Kd=nav_kd)
         
         # Robot configuration - wheel joints [FL, FR, BL, BR]
         self.wheel_joints = [0, 1, 2, 3]
@@ -171,7 +178,8 @@ class CognitiveArchitecture:
               f"lift_joint={self.lift_joint_idx}, camera_link={self.camera_link_idx}")
         
     def _initialize_world_knowledge(self):
-        """Initialize knowledge base with world state from initial map"""
+        """Initialize knowledge base with world state from initial map.
+        Updates Dynamic_KB.pl positions via Prolog update_position/4."""
         map_file = "initial_map.json"
         if os.path.exists(map_file):
             with open(map_file, 'r') as f:
@@ -196,12 +204,21 @@ class CognitiveArchitecture:
                 for i, obs in enumerate(world_map['obstacles']):
                     pos = obs['position']
                     color = self._rgba_to_color_name(obs['color_rgba'])
-                    obj_id = f'obstacle{i+1}'
+                    obj_id = f'obstacle{i}'
                     self.kb.add_position(obj_id, pos[0], pos[1], pos[2])
                     self.kb.add_detected_object(obj_id, 'static', color, pos)
                     self.obstacles.append(pos[:2])
                     
             print(f"[CogArch] Loaded {len(self.obstacles)} obstacles from initial map")
+            
+            # M8: Log KB state
+            try:
+                known_objects = self.kb.objects()
+                pickable = self.kb.pickable_objects()
+                print(f"[CogArch] KB objects: {known_objects}")
+                print(f"[CogArch] KB pickable: {pickable}")
+            except Exception as e:
+                print(f"[CogArch] KB query info: {e}")
     
     def _rgba_to_color_name(self, rgba):
         """Convert RGBA to color name"""
@@ -457,6 +474,12 @@ class CognitiveArchitecture:
         
         estimated_pose = self.state_estimator.estimate_pose()
         
+        # M8: Update robot position in Knowledge Base (Prolog)
+        if self.step_counter % 50 == 0:
+            self.kb.add_position('robot', 
+                                float(estimated_pose[0]), 
+                                float(estimated_pose[1]), 0.0)
+        
         # M4: Perception - Detect objects every 10 steps
         if rgb is not None and self.step_counter % 10 == 0:
             rgb_array = np.reshape(rgb, (240, 320, 4)).astype(np.uint8)
@@ -542,17 +565,26 @@ class CognitiveArchitecture:
     def think(self, sensor_data):
         """
         THINK phase: Process sensor data, update knowledge, plan actions.
+        Uses M8 Knowledge Base for reasoning and M7 FSM for state management.
         Returns control commands for ACT phase.
         """
         pose = sensor_data['pose']
         
-        # M8: Query knowledge base for decision making
-        # M8: Query knowledge base
+        # M8: Query knowledge base for target position
         target_pos = self.kb.query_position('target')
         
-        # Override with sensor data if available
+        # Override with sensor data if available (more recent)
         if sensor_data['target_detected']:
             target_pos = sensor_data['target_position']
+        
+        # M8: Check if target is the goal object (Prolog reasoning)
+        if target_pos and self.step_counter % 240 == 0:
+            is_goal = self.kb.is_goal_object('target')
+            can_grasp = self.kb.check_can_grasp()
+            if is_goal:
+                print(f"[M8-KB] Target confirmed as goal object (red)")
+            if can_grasp:
+                print(f"[M8-KB] Prolog confirms: robot can grasp target")
         
         # Calculate 2D horizontal distance to target
         if target_pos:
@@ -986,6 +1018,17 @@ def main():
     print("  IIS Cognitive Architecture - Navigate-to-Grasp Mission")
     print("  Integrating all 10 modules in Sense-Think-Act loop")
     print("="*60)
+    print("  M1:  Task Specification (README)")
+    print("  M2:  URDF Robot Hardware & Environment")
+    print("  M3:  Sensor Preprocessing (sensor_wrapper.py)")
+    print("  M4:  Perception (HSV color, SIFT, RANSAC)")
+    print("  M5:  State Estimation (Particle Filter)")
+    print("  M6:  Motion Control (PID, IK, Differential Drive)")
+    print("  M7:  Action Planning (FSM + Waypoint Planner)")
+    print("  M8:  Knowledge Representation (Prolog Dynamic_KB.pl)")
+    print("  M9:  Learning (Parameter Optimization)")
+    print("  M10: Cognitive Architecture (Sense-Think-Act)")
+    print("="*60)
     
     # M2: Build world (hardware initialization)
     robot_id, table_id, room_id, target_id = build_world(gui=True)
@@ -999,6 +1042,21 @@ def main():
         print(f"[Init] Table at: ({cog_arch.table_position[0]:.2f}, {cog_arch.table_position[1]:.2f})")
     else:
         print("[Init] Table position unknown - will search")
+    
+    # M8: Report KB state
+    try:
+        sensors = cog_arch.kb.sensors()
+        caps = cog_arch.kb.robot_capabilities()
+        print(f"[Init] M8 KB sensors: {sensors}")
+        print(f"[Init] M8 KB robot capabilities: {caps}")
+    except Exception:
+        pass
+    
+    # M9: Report learning state
+    best_params = cog_arch.learner.get_best_parameters()
+    print(f"[Init] M9 Learning params: nav_kp={best_params.get('nav_kp', '?'):.2f}, "
+          f"angle_kp={best_params.get('angle_kp', '?'):.2f}")
+    
     print("[Init] Mission: Navigate to table and grasp red cylinder\n")
     
     # Main Sense-Think-Act loop

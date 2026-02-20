@@ -124,12 +124,18 @@ class KnowledgeBase:
     def add_detected_object(self, object_id, object_type, color, position):
         """Add a detected object to the knowledge base"""
         if self.prolog:
+            # Only assert object_type if not already known
             try:
-                self.prolog.assertz(f"object_type({object_id}, {object_type})")
+                existing = list(self.prolog.query(f"object_type({object_id}, _)"))
+                if not existing:
+                    self.prolog.assertz(f"object_type({object_id}, {object_type})")
             except Exception:
                 pass
+            # Only assert color if not already known
             try:
-                self.prolog.assertz(f"color({object_id}, {color})")
+                existing = list(self.prolog.query(f"color({object_id}, _)"))
+                if not existing:
+                    self.prolog.assertz(f"color({object_id}, {color})")
             except Exception:
                 pass
             if position:

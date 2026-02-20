@@ -120,6 +120,10 @@ class CognitiveArchitecture:
         
         # Task state
         self.target_position = None
+        self.target_position_smoothed = None  # EMA-filtered target position
+        self.target_detection_count = 0
+        self.target_camera_bearing = 0.0  # Camera-relative bearing to target (rad)
+        self.target_camera_depth = float('inf')  # Camera depth to target (m)
         self.table_position = None
         self.table_orientation = None
         self.table_size = None
@@ -288,7 +292,7 @@ class CognitiveArchitecture:
         Approaches from the long side (1.5m) of the table so the arm
         only needs to reach across the short dimension (0.4m from edge to center).
         """
-        standoff_dist = 1.10  # meters from target center (table half-width 0.4 + robot 0.3 + margin 0.4)
+        standoff_dist = 0.65  # meters from target center (table half-width 0.4 + robot 0.2 + margin 0.05)
         
         if self.table_orientation is not None:
             # Get table yaw from orientation quaternion
@@ -492,9 +496,11 @@ class CognitiveArchitecture:
                 colors_found = [d['color'] for d in detections]
                 print(f"[Perception] Detected {len(detections)} objects: {colors_found}")
             
-            # Look for red target
-            for det in detections:
-                if det['color'] == 'red':
+            # Look for red target - pick the CLOSEST (largest bounding box) red detection
+            red_detections = [d for d in detections if d['color'] == 'red']
+            # Sort by bbox area (larger = closer), take biggest
+            red_detections.sort(key=lambda d: d['bbox'][2] * d['bbox'][3], reverse=True)
+            for det in red_detections[:1]:  # Only process the single closest red detection
                     bbox = det['bbox']
                     center_x = int(bbox[0] + bbox[2] / 2)
                     center_y = int(bbox[1] + bbox[3] / 2)
@@ -538,12 +544,37 @@ class CognitiveArchitecture:
                         # Height: camera is at CAMERA_HEIGHT, cam_y positive = object lower
                         world_z = CAMERA_HEIGHT - cam_y
                         
-                        self.target_position = [world_x, world_y, world_z]
+                        new_target = [world_x, world_y, world_z]
                         
-                        # Add to knowledge base
-                        self.kb.add_position('target', *self.target_position)
-                        print(f"[CogArch] TARGET DETECTED at ({world_x:.2f}, {world_y:.2f}, {world_z:.2f}), "
-                              f"depth={true_depth:.2f}m")
+                        # Filter: reject detections that jump > 2m from smoothed estimate
+                        accept = True
+                        if self.target_position_smoothed is not None:
+                            jump = np.hypot(new_target[0] - self.target_position_smoothed[0],
+                                            new_target[1] - self.target_position_smoothed[1])
+                            if jump > 2.0 and self.target_detection_count > 5:
+                                accept = False  # Likely false positive
+                        
+                        if accept:
+                            self.target_detection_count += 1
+                            # Store camera-relative bearing and depth for reactive steering
+                            self.target_camera_bearing = math.atan2(-(center_x - cx), fx)
+                            self.target_camera_depth = true_depth
+                            # Exponential moving average for stability
+                            alpha = 0.4 if self.target_detection_count > 3 else 0.8
+                            if self.target_position_smoothed is None:
+                                self.target_position_smoothed = list(new_target)
+                            else:
+                                for k in range(3):
+                                    self.target_position_smoothed[k] = (
+                                        alpha * new_target[k]
+                                        + (1 - alpha) * self.target_position_smoothed[k]
+                                    )
+                            self.target_position = list(self.target_position_smoothed)
+                            
+                            # Add to knowledge base
+                            self.kb.add_position('target', *self.target_position)
+                            print(f"[CogArch] TARGET DETECTED at ({world_x:.2f}, {world_y:.2f}, {world_z:.2f}), "
+                                  f"depth={true_depth:.2f}m")
                         break
         
         # M3: Check gripper contact using joint state feedback (legal)
@@ -558,6 +589,8 @@ class CognitiveArchitecture:
             'joint_states': joint_states,
             'target_detected': self.target_position is not None,
             'target_position': self.target_position,
+            'target_camera_bearing': self.target_camera_bearing,
+            'target_camera_depth': self.target_camera_depth,
             'gripper_contact': gripper_contact
         }
     
@@ -600,9 +633,12 @@ class CognitiveArchitecture:
                 print(f"[CogArch] Computed approach standoff: "
                       f"({self.approach_standoff[0]:.2f}, {self.approach_standoff[1]:.2f})")
             
-            # In NAVIGATE/APPROACH states, FSM distance = dist to standoff
-            if self.approach_standoff is not None and self.fsm.state in (
-                    RobotState.NAVIGATE, RobotState.APPROACH):
+            # Use camera depth for FSM distance during NAVIGATE and APPROACH
+            # Camera depth is a direct measurement - no state estimation drift
+            cam_depth = sensor_data.get('target_camera_depth', float('inf'))
+            if cam_depth < 10.0 and self.fsm.state in (RobotState.NAVIGATE, RobotState.APPROACH):
+                distance_for_fsm = cam_depth
+            elif self.approach_standoff is not None and self.fsm.state == RobotState.NAVIGATE:
                 sdx = self.approach_standoff[0] - pose[0]
                 sdy = self.approach_standoff[1] - pose[1]
                 distance_for_fsm = np.sqrt(sdx**2 + sdy**2)
@@ -663,7 +699,12 @@ class CognitiveArchitecture:
                 }
             
         elif self.fsm.state == RobotState.NAVIGATE:
-            # Navigate to standoff point (not directly at the cylinder)
+            cam_depth = sensor_data.get('target_camera_depth', float('inf'))
+            # Use relaxed avoidance when target is visible nearby (near the table)
+            # This reduces table keepout from 0.6m to 0.2m so we can approach
+            use_relaxed = cam_depth < 2.5 and sensor_data['target_detected']
+            
+            # Waypoint navigation toward standoff position
             nav_goal = self.approach_standoff if self.approach_standoff else (
                 target_pos[:2] if target_pos else None
             )
@@ -678,7 +719,8 @@ class CognitiveArchitecture:
                     'mode': 'navigate',
                     'target': self.current_waypoint,
                     'pose': pose,
-                    'lidar': sensor_data['lidar']
+                    'lidar': sensor_data['lidar'],
+                    'relaxed_avoidance': use_relaxed
                 }
                 
                 # Check if waypoint reached
@@ -690,12 +732,15 @@ class CognitiveArchitecture:
                     
         elif self.fsm.state == RobotState.APPROACH:
             if target_pos:
+                # During approach, use camera-relative visual servoing for reactive control
                 control_commands = {
-                    'mode': 'approach',
-                    'target': self.approach_standoff if self.approach_standoff else target_pos[:2],
+                    'mode': 'approach_visual',
+                    'target': target_pos[:2],
                     'pose': pose,
                     'lidar': sensor_data['lidar'],
-                    'relaxed_avoidance': True
+                    'relaxed_avoidance': True,
+                    'camera_bearing': sensor_data.get('target_camera_bearing', 0.0),
+                    'camera_depth': sensor_data.get('target_camera_depth', float('inf'))
                 }
                 
         elif self.fsm.state == RobotState.GRASP:
@@ -733,9 +778,11 @@ class CognitiveArchitecture:
             }
             
         elif self.fsm.state == RobotState.FAILURE:
-            # Reset standoff and waypoint so new ones are computed on retry
+            # Reset standoff, waypoint, and target smoothing so new ones are computed on retry
             self.approach_standoff = None
             self.current_waypoint = None
+            self.target_position_smoothed = None
+            self.target_detection_count = 0
             control_commands = {
                 'mode': 'failure',
                 'gripper': 'open',
@@ -861,7 +908,7 @@ class CognitiveArchitecture:
             
             # Speed control
             if mode == 'approach':
-                max_speed = 2.0
+                max_speed = 5.0
                 kp_dist = 3.0
                 kp_angle = 5.0
             else:
@@ -883,6 +930,45 @@ class CognitiveArchitecture:
             
             if self.step_counter % 240 == 0:
                 print(f"[Act] {mode.upper()}: dist={dist:.2f}m, heading={np.degrees(heading_error):.0f} deg, "
+                      f"fwd={forward_vel:.1f}, turn={angular_vel:.1f}")
+            
+            for i in [0, 2]:
+                p.setJointMotorControl2(self.robot_id, i, p.VELOCITY_CONTROL,
+                                       targetVelocity=left_vel, force=5000)
+            for i in [1, 3]:
+                p.setJointMotorControl2(self.robot_id, i, p.VELOCITY_CONTROL,
+                                       targetVelocity=right_vel, force=5000)
+        
+        elif mode == 'approach_visual':
+            # M6: Reactive visual servoing - steer using camera pixel offset
+            # Bypasses state estimation heading drift for approach accuracy
+            camera_bearing = control_commands.get('camera_bearing', 0.0)
+            camera_depth = control_commands.get('camera_depth', float('inf'))
+            lidar = control_commands.get('lidar')
+            pose = control_commands.get('pose')
+            
+            # Use camera bearing directly for steering (no state estimation needed)
+            kp_bearing = 8.0
+            max_speed = 8.0
+            kp_dist = 5.0
+            
+            forward_vel = np.clip(kp_dist * camera_depth, 1.0, max_speed)
+            angular_vel = kp_bearing * camera_bearing
+            
+            # Slow down when very close
+            if camera_depth < 0.5:
+                forward_vel = np.clip(2.0 * camera_depth, 0.3, 2.0)
+            
+            # M4: Lidar obstacle avoidance (relaxed near table)
+            forward_vel, avoidance_turn = self._get_lidar_obstacle_avoidance(
+                lidar, forward_vel, relaxed=True, robot_pose=pose)
+            angular_vel += avoidance_turn
+            
+            left_vel = forward_vel - angular_vel
+            right_vel = forward_vel + angular_vel
+            
+            if self.step_counter % 240 == 0:
+                print(f"[Act] APPROACH_VISUAL: depth={camera_depth:.2f}m, bearing={np.degrees(camera_bearing):.0f} deg, "
                       f"fwd={forward_vel:.1f}, turn={angular_vel:.1f}")
             
             for i in [0, 2]:

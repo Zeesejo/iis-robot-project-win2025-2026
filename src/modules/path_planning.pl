@@ -114,7 +114,7 @@ neighbor([X, Y], [Xn, Yn]) :-
 
 is_free_pos([X, Y]) :- is_free(X, Y).
 
-cost([X, Y], Path, G) :-
+cost([_X, _Y], Path, G) :-
     length(Path, Len),
     G is Len * 0.5.
 

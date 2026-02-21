@@ -149,7 +149,7 @@
   <link name="torso_link">
     <visual>
       <geometry>
-        <cylinder length="0.4" radius="0.05"/>
+          <box size="0.3 0.3 0.6"/>
       </geometry>
       <material name="white"/>
     </visual>
@@ -159,8 +159,8 @@
       </geometry>
     </collision>
     <inertial>
-      <mass value="10.0"/>
-      <inertia ixx="0.1" iyy="0.1" izz="0.1"/>
+      <mass value="4.0"/>
+      <inertia ixx="0.02" iyy="0.02" izz="0.02"/>
     </inertial>
   </link>
 

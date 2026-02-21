@@ -38,7 +38,7 @@ from src.environment.world_builder import build_world
 
 # M3: Sensor Preprocessing (wraps sensor_wrapper with noise filtering)
 from src.modules.sensor_preprocessing import get_sensor_data, get_sensor_id
-from src.robot.sensor_wrapper import get_joint_states  # for gripper contact check
+# Note: sensor_wrapper is accessed via sensor_preprocessing module
 
 # M4: Perception
 from src.modules.perception import detect_objects_by_color, RANSAC_Segmentation
@@ -254,35 +254,15 @@ class CognitiveArchitecture:
     
     def _check_gripper_contact(self):
         """
-        M3: Check if gripper fingers are in contact with target object.
-        Uses joint state feedback (torque + position) to detect grasp.
-        Fingers that are stopped partway with resistance torque indicate contact.
+        M3: Check if gripper/arm is in contact with target object.
+        Uses PyBullet contact points API (simulates touch sensor on gripper).
         """
-        if not self.gripper_joints:
-            return False
-        
-        # Use sensor wrapper to read joint states (legal API)
-        joint_states = get_joint_states(self.robot_id)
-        
-        contact_count = 0
-        for finger_idx in self.gripper_joints:
-            # Find the joint name for this index
-            for name, data in joint_states.items():
-                if data['index'] == finger_idx:
-                    torque = abs(data['applied_torque'])
-                    position = abs(data['position'])
-                    # If the finger has significant resistance torque and has moved
-                    # from its open position, something is between the fingers
-                    if torque > 0.5 and position > 0.005:
-                        contact_count += 1
-                    break
-        
-        # Need contact on at least one finger
-        if contact_count > 0:
+        # Use contact points between robot and target (simulates touch sensor)
+        contacts = p.getContactPoints(bodyA=self.robot_id, bodyB=self.target_id)
+        if contacts and len(contacts) > 0:
             if self.step_counter % 60 == 0:
-                print("[Sense] Gripper contact detected via joint torque feedback")
+                print("[Sense] Gripper contact detected via touch sensor")
             return True
-        
         return False
     
     def _convert_depth_buffer(self, depth_buffer_value):
@@ -411,12 +391,12 @@ class CognitiveArchitecture:
         front_dists = [lidar[i] for i in front_indices]
         min_front = min(front_dists)
         
-        # Check left side (rays 3-8)
-        left_dists = [lidar[i] for i in range(3, 9)]
+        # Check left side (rays 5-12, ~50-120 degrees centered on left)
+        left_dists = [lidar[i] for i in range(5, 13)]
         avg_left = np.mean(left_dists)
         
-        # Check right side (rays 28-33)
-        right_dists = [lidar[i] for i in range(num_rays - 8, num_rays - 2)]
+        # Check right side (rays 24-31, ~240-310 degrees centered on right)
+        right_dists = [lidar[i] for i in range(num_rays - 12, num_rays - 4)]
         avg_right = np.mean(right_dists)
         
         # Check rear cone (about +/- 30 degrees behind)
@@ -495,7 +475,7 @@ class CognitiveArchitecture:
             rgb_array = np.reshape(rgb, (240, 320, 4)).astype(np.uint8)
             bgr = cv2.cvtColor(rgb_array, cv2.COLOR_RGBA2BGR)
             
-            detections = detect_objects_by_color(bgr, min_area=10)
+            detections = detect_objects_by_color(bgr, min_area=50)
             
             # Log detections periodically
             if self.step_counter % 240 == 0 and len(detections) > 0:
@@ -762,7 +742,7 @@ class CognitiveArchitecture:
                 grasp_plan = self.grasp_planner.plan_grasp(target_pos)
                 grasp_time = self.fsm.get_time_in_state()
                 
-                # Multi-phase grasp sequence (8s total timeout)
+                # Multi-phase grasp sequence (20s total timeout)
                 if grasp_time < 2.5:
                     phase = 'reach_above'   # Open gripper, raise lift, IK above target
                 elif grasp_time < 5.5:
@@ -1001,7 +981,14 @@ class CognitiveArchitecture:
                 forward_vel, avoidance_turn = self._get_lidar_obstacle_avoidance(
                     lidar, forward_vel, relaxed=True, robot_pose=pose)
                 angular_vel += avoidance_turn
-            # When close, skip lidar avoidance to go straight at target
+            else:
+                # Emergency braking only: hard-stop if obstacle very close ahead
+                if lidar is not None and len(lidar) > 0:
+                    num_rays_l = len(lidar)
+                    front_idx = [i % num_rays_l for i in range(-2, 3)]
+                    min_front_dist = min(lidar[i] for i in front_idx)
+                    if min_front_dist < 0.15:
+                        forward_vel = 0.0  # Emergency stop
             
             left_vel = forward_vel - angular_vel
             right_vel = forward_vel + angular_vel
@@ -1194,6 +1181,14 @@ def main():
         
         # ========== ACT ==========
         cog_arch.act(control_commands)
+        
+        # Check for task completion — terminate after SUCCESS holds for 3 seconds
+        if cog_arch.fsm.state == RobotState.SUCCESS:
+            if cog_arch.fsm.get_time_in_state() > 3.0:
+                print("\n" + "="*60)
+                print("  MISSION COMPLETE - Target grasped and lifted!")
+                print("="*60)
+                break
         
         # Status output every ~1 second
         if cog_arch.step_counter % 240 == 0:

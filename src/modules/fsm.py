@@ -172,7 +172,7 @@ class RobotFSM:
                 self.object_grasped = True
                 print("[FSM] Object grasped successfully!")
                 self.transition_to(RobotState.LIFT)
-            elif self.get_time_in_state() > 8.0:  # Grasp timeout (multi-phase needs more time)
+            elif self.get_time_in_state() > 20.0:  # Grasp timeout (multi-phase needs more time)
                 print("[FSM] Grasp attempt failed (timeout)")
                 self.failure_reason = 'grasp_failed'
                 self.transition_to(RobotState.FAILURE)

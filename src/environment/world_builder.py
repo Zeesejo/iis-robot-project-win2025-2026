@@ -20,9 +20,10 @@ TABLE_DIM = [1.5, 0.8]  # x, y
 TABLE_HEIGHT = 0.625
 TARGET_HEIGHT = 0.12
 
-# File Paths (Relative to where python is executed)
-URDF_PATH = "../src/environment/"
-ROBOT_URDF = "../src/robot/robot.urdf"
+# File Paths (relative to this file's location for portability)
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+URDF_PATH = _THIS_DIR
+ROBOT_URDF = os.path.join(os.path.dirname(_THIS_DIR), "robot", "robot.urdf")
 
 
 def get_random_pos(bounds, min_dist_from_origin=1.0):
@@ -137,11 +138,14 @@ def build_world(gui=True):
     dx = random.uniform(-0.6, 0.6)  # Table is 1.5 long
     dy = random.uniform(-0.3, 0.3)  # Table is 0.8 wide
 
-    # Transform local offset to world
-    # (Simple logic: just place it centered for now to ensure stability, or use getMatrix)
-    # To keep it simple and robust for student code:
+    # Transform local offset to world frame using table rotation
+    table_euler = p.getEulerFromQuaternion(table_orn)
+    table_yaw = table_euler[2]
+    world_dx = dx * math.cos(table_yaw) - dy * math.sin(table_yaw)
+    world_dy = dx * math.sin(table_yaw) + dy * math.cos(table_yaw)
+
     target_z = 0.625 + (0.12 / 2.0) + 0.01  # table height + half cyl height + margin
-    target_pos = [t_pos_xy[0], t_pos_xy[1], target_z]
+    target_pos = [t_pos_xy[0] + world_dx, t_pos_xy[1] + world_dy, target_z]
 
     target_id = p.loadURDF(os.path.join(URDF_PATH, "target.urdf"), target_pos, useFixedBase=False)
     # Note: We do NOT add target to knowledge_base['target_pose'] because the robot must find it.

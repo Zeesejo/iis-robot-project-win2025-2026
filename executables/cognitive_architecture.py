@@ -5,7 +5,7 @@ Integrates all 10 modules for autonomous navigate-to-grasp mission.
 This is the main executive controller that combines:
 - M1: Task specification (defined in README)
 - M2: URDF robot hardware
-- M3: Sensor preprocessing (sensor_wrapper.py)
+- M3: Sensor preprocessing (sensor_preprocessing.py wrapping sensor_wrapper.py)
 - M4: Perception (object detection, RANSAC)
 - M5: State estimation (Particle Filter)  
 - M6: Motion control (PID, IK)
@@ -36,16 +36,15 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 # M2: Hardware (URDF) & Environment
 from src.environment.world_builder import build_world
 
-# M3: Sensors
-from src.robot.sensor_wrapper import (
-    get_camera_image, get_lidar_data, get_imu_data, get_joint_states
-)
+# M3: Sensor Preprocessing (wraps sensor_wrapper with noise filtering)
+from src.modules.sensor_preprocessing import get_sensor_data, get_sensor_id
+from src.robot.sensor_wrapper import get_joint_states  # for gripper contact check
 
 # M4: Perception
 from src.modules.perception import detect_objects_by_color, RANSAC_Segmentation
 
 # M5: State Estimation
-from src.modules.state_estimation import ParticleFilter
+from src.modules.state_estimation import state_estimate, initialize_state_estimator
 
 # M6: Motion Control
 from src.modules.motion_control import PIDController, move_to_goal, grasp_object
@@ -81,8 +80,11 @@ class CognitiveArchitecture:
         self.room_id = room_id
         self.target_id = target_id
         
-        # M5: State Estimator (Particle Filter)
-        self.state_estimator = ParticleFilter(num_particles=500)
+        # M5: State Estimator (via state_estimate function)
+        initialize_state_estimator()
+        
+        # M3: Get sensor link IDs from URDF
+        self.sensor_camera_id, self.sensor_lidar_id = get_sensor_id(self.robot_id)
         
         # M7: FSM for high-level control
         self.fsm = RobotFSM()
@@ -454,12 +456,13 @@ class CognitiveArchitecture:
         SENSE phase: Acquire sensor data and update state estimate.
         Returns sensor_data dict for use in THINK phase.
         """
-        # M3: Get raw sensor data using sensor wrapper (legal API)
-        camera_link = self.camera_link_idx if self.camera_link_idx is not None else -1
-        rgb, depth, _ = get_camera_image(self.robot_id, sensor_link_id=camera_link)
-        lidar = get_lidar_data(self.robot_id, num_rays=36)
-        imu = get_imu_data(self.robot_id)
-        joint_states = get_joint_states(self.robot_id)
+        # M3: Get preprocessed sensor data via sensor_preprocessing module
+        preprocessed = get_sensor_data(self.robot_id, self.sensor_camera_id, self.sensor_lidar_id)
+        rgb = preprocessed['camera_rgb']
+        depth = preprocessed['camera_depth']
+        lidar = preprocessed['lidar']
+        imu = preprocessed['imu']
+        joint_states = preprocessed['joint_states']
         
         # M5: Get wheel velocities from joint states using correct URDF joint names
         wheel_vels = []
@@ -469,21 +472,17 @@ class CognitiveArchitecture:
             else:
                 wheel_vels.append(0.0)
         
-        # M5: Update state estimate with sensor fusion
-        sensor_data_for_pf = {
+        # M5: State estimation via state_estimate() function
+        sensors_for_pf = {
             'imu': imu,
             'lidar': lidar,
             'joint_states': joint_states
         }
-        
-        self.state_estimator.predict(wheel_vels, self.dt)
-        self.state_estimator.measurement_update(sensor_data_for_pf)
-        
-        # Resample periodically to prevent particle degeneracy
-        if self.step_counter % 10 == 0:
-            self.state_estimator.resample()
-        
-        estimated_pose = self.state_estimator.estimate_pose()
+        control_inputs = {
+            'wheel_left': (wheel_vels[0] + wheel_vels[2]) / 2.0,   # avg of FL + BL
+            'wheel_right': (wheel_vels[1] + wheel_vels[3]) / 2.0,  # avg of FR + BR
+        }
+        estimated_pose = state_estimate(sensors_for_pf, control_inputs)
         
         # M8: Update robot position in Knowledge Base (Prolog)
         if self.step_counter % 50 == 0:
@@ -1146,7 +1145,7 @@ def main():
     print("="*60)
     print("  M1:  Task Specification (README)")
     print("  M2:  URDF Robot Hardware & Environment")
-    print("  M3:  Sensor Preprocessing (sensor_wrapper.py)")
+    print("  M3:  Sensor Preprocessing (sensor_preprocessing.py)")
     print("  M4:  Perception (HSV color, SIFT, RANSAC)")
     print("  M5:  State Estimation (Particle Filter)")
     print("  M6:  Motion Control (PID, IK, Differential Drive)")

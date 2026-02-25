@@ -20,9 +20,10 @@ TABLE_DIM = [1.5, 0.8]  # x, y
 TABLE_HEIGHT = 0.625
 TARGET_HEIGHT = 0.12
 
-# File Paths (Relative to where python is executed)
-URDF_PATH = "./src/environment/"
-ROBOT_URDF = "./src/robot/robot.urdf"
+# File Paths (relative to this file's location for portability)
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+URDF_PATH = _THIS_DIR
+ROBOT_URDF = os.path.join(os.path.dirname(_THIS_DIR), "robot", "robot.urdf")
 
 
 def get_random_pos(bounds, min_dist_from_origin=1.0):
@@ -48,11 +49,31 @@ def is_overlapping(pos, radius, existing_objects):
 def build_world(gui=True):
     if gui:
         p.connect(p.GUI)
+        # Set camera to view robot from above/side
+        p.resetDebugVisualizerCamera(
+            cameraDistance=8.0,
+            cameraYaw=45,
+            cameraPitch=-30,
+            cameraTargetPosition=[0, 0, 0]
+        )
+        # Configure GUI settings
+        p.configureDebugVisualizer(p.COV_ENABLE_GUI, 1)
+        p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 1)
+        print("[WorldBuilder] GUI enabled with camera positioned at robot")
     else:
         p.connect(p.DIRECT)
 
     p.setAdditionalSearchPath(pybullet_data.getDataPath())
     p.setGravity(0, 0, -9.81)
+    
+    # Tune physics engine for better wheel-ground contact
+    p.setPhysicsEngineParameter(
+        numSolverIterations=150,  # Increase from default 50 for better contact
+        erp=0.8,                   # Error reduction parameter
+        contactERP=0.8,            # Contact-specific ERP
+        frictionERP=0.8,           # Friction constraint ERP
+        enableConeFriction=1       # Better anisotropic friction
+    )
 
     # 1. Load Room (Which now includes the floor)
     room_id = p.loadURDF(os.path.join(URDF_PATH, "room.urdf"), useFixedBase=True)
@@ -60,13 +81,30 @@ def build_world(gui=True):
     # 2. Set Floor Friction (Requirement: mu=0.5)
     # The floor is link index 0 in our new URDF (since it's the first child of world)
     # We set lateral friction to 0.5
-    p.changeDynamics(room_id, -1, lateralFriction=0.5)
-    p.changeDynamics(room_id, 0, lateralFriction=0.5)
+    p.changeDynamics(room_id, -1, lateralFriction=0.5)  # Base walls
+    p.changeDynamics(room_id, 0, lateralFriction=0.5)  # Floor (mu=0.5 per spec)
 
-    # 3. Load Robot (at 0,0,0) - Loaded to ensure we don't spawn obstacles on top of it
-    robot_start_pos = [0, 0, 0]
+    # 3. Load Robot - Calculate proper spawn height for wheel contact
+    # Wheel radius = 0.1m, wheel joint z-offset = 0, so wheel bottom at base_z - 0.1
+    # Floor top at z=0, so for wheels to touch: base_z - 0.1 = 0 → base_z = 0.1
+    robot_start_pos = [0, 0, 0.1]  # Wheels will rest on floor at z=0
     robot_start_orn = p.getQuaternionFromEuler([0, 0, 0])
     robot_id = p.loadURDF(ROBOT_URDF, robot_start_pos, robot_start_orn)
+    
+    # Configure wheel dynamics for proper driving
+    # Wheel joints are 0-3: fl_wheel, fr_wheel, bl_wheel, br_wheel
+    for wheel_joint in [0, 1, 2, 3]:
+        p.changeDynamics(robot_id, wheel_joint,
+                        lateralFriction=1.5,  # High friction for traction
+                        spinningFriction=0.001,  # Low spinning friction
+                        rollingFriction=0.001)  # Low rolling friction
+    
+    # Set base_link collision properties
+    p.changeDynamics(robot_id, -1,
+                    lateralFriction=0.5)  # Use mass from URDF (5.0kg)
+    
+    print(f"[WorldBuilder] Robot loaded at {robot_start_pos} with wheel dynamics configured")
+
 
     # Store spawned objects for collision checking logic
     # Structure: {'pos': [x,y], 'radius': r}
@@ -101,11 +139,14 @@ def build_world(gui=True):
     dx = random.uniform(-0.6, 0.6)  # Table is 1.5 long
     dy = random.uniform(-0.3, 0.3)  # Table is 0.8 wide
 
-    # Transform local offset to world
-    # (Simple logic: just place it centered for now to ensure stability, or use getMatrix)
-    # To keep it simple and robust for student code:
+    # Transform local offset to world frame using table rotation
+    table_euler = p.getEulerFromQuaternion(table_orn)
+    table_yaw = table_euler[2]
+    world_dx = dx * math.cos(table_yaw) - dy * math.sin(table_yaw)
+    world_dy = dx * math.sin(table_yaw) + dy * math.cos(table_yaw)
+
     target_z = 0.625 + (0.12 / 2.0) + 0.01  # table height + half cyl height + margin
-    target_pos = [t_pos_xy[0], t_pos_xy[1], target_z]
+    target_pos = [t_pos_xy[0] + world_dx, t_pos_xy[1] + world_dy, target_z]
 
     target_id = p.loadURDF(os.path.join(URDF_PATH, "target.urdf"), target_pos, useFixedBase=False)
     # Note: We do NOT add target to knowledge_base['target_pose'] because the robot must find it.
@@ -124,7 +165,6 @@ def build_world(gui=True):
         # Apply Color
         color = OBSTACLE_COLORS[i % len(OBSTACLE_COLORS)]
         p.changeVisualShape(obs_id, -1, rgbaColor=color)
-        p.changeDynamics(obs_id, -1, mass=10.0)
 
         spawned_objects.append({'pos': o_pos_xy, 'radius': 0.4})
         knowledge_base['obstacles'].append({

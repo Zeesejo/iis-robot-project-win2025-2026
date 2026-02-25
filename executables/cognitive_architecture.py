@@ -1124,83 +1124,62 @@ class CognitiveArchitecture:
 
 
 def main():
-    """Main execution loop with Sense-Think-Act cycle"""
-    
     print("="*60)
     print("  IIS Cognitive Architecture - Navigate-to-Grasp Mission")
-    print("  Integrating all 10 modules in Sense-Think-Act loop")
     print("="*60)
-    print("  M1:  Task Specification (README)")
-    print("  M2:  URDF Robot Hardware & Environment")
-    print("  M3:  Sensor Preprocessing (sensor_preprocessing.py)")
-    print("  M4:  Perception (HSV color, SIFT, RANSAC)")
-    print("  M5:  State Estimation (Particle Filter)")
-    print("  M6:  Motion Control (PID, IK, Differential Drive)")
-    print("  M7:  Action Planning (FSM + Waypoint Planner)")
-    print("  M8:  Knowledge Representation (Prolog Dynamic_KB.pl)")
-    print("  M9:  Learning (Parameter Optimization)")
-    print("  M10: Cognitive Architecture (Sense-Think-Act)")
+    print("  M4:  Perception - PerceptionModule (full pipeline)")
+    print("       • detect_objects_by_color  (HSV)")
+    print("       • edge_contour_segmentation")
+    print("       • depth_to_point_cloud")
+    print("       • RANSAC_Segmentation      (table plane)")
+    print("       • compute_pca / refine_object_points (target pose)")
+    print("       • SiftFeatureExtractor     (SIFT KB)")
+    print("  M9:  Learning DISABLED - hardcoded defaults")
     print("="*60)
-    
-    # M2: Build world (hardware initialization)
+
     robot_id, table_id, room_id, target_id = build_world(gui=True)
-    
-    # M10: Create cognitive architecture
-    cog_arch = CognitiveArchitecture(robot_id, table_id, room_id, target_id)
-    
-    # Report initial state
-    print("\n[Init] Robot at: (0.00, 0.00) - starting position")
-    if cog_arch.table_position:
-        print(f"[Init] Table at: ({cog_arch.table_position[0]:.2f}, {cog_arch.table_position[1]:.2f})")
-    else:
-        print("[Init] Table position unknown - will search")
-    
-    # M8: Report KB state
+    cog = CognitiveArchitecture(robot_id, table_id, room_id, target_id)
+
+    print(f"\n[Init] Robot at (0.00, 0.00)")
+    if cog.table_position:
+        print(f"[Init] Table at ({cog.table_position[0]:.2f}, "
+              f"{cog.table_position[1]:.2f})")
     try:
-        sensors = cog_arch.kb.sensors()
-        caps = cog_arch.kb.robot_capabilities()
-        print(f"[Init] M8 KB sensors: {sensors}")
-        print(f"[Init] M8 KB robot capabilities: {caps}")
+        print(f"[Init] M8 sensors:      {cog.kb.sensors()}")
+        print(f"[Init] M8 capabilities: {cog.kb.robot_capabilities()}")
     except Exception:
         pass
-    
-    # M9: Report learning state
-    best_params = cog_arch.learner.get_best_parameters()
-    print(f"[Init] M9 Learning params: nav_kp={best_params.get('nav_kp', '?'):.2f}, "
-          f"angle_kp={best_params.get('angle_kp', '?'):.2f}")
-    
-    print("[Init] Mission: Navigate to table and grasp red cylinder\n")
-    
-    # Main Sense-Think-Act loop
-    while p.isConnected():  # DO NOT TOUCH
-        # ========== SENSE ==========
-        sensor_data = cog_arch.sense()
-        
-        # ========== THINK ==========
-        control_commands = cog_arch.think(sensor_data)
-        
-        # ========== ACT ==========
-        cog_arch.act(control_commands)
-        
-        # Check for task completion — terminate after SUCCESS holds for 3 seconds
-        if cog_arch.fsm.state == RobotState.SUCCESS:
-            if cog_arch.fsm.get_time_in_state() > 3.0:
+    print(f"[Init] M9 DISABLED – "
+          f"nav_kp={LEARNING_DEFAULTS['nav_kp']:.2f}  "
+          f"angle_kp={LEARNING_DEFAULTS['angle_kp']:.2f}")
+    print("[Init] Mission: navigate to table, grasp red cylinder\n")
+
+    # ── SENSE-THINK-ACT loop ────────────────────────────────────────────────
+    while p.isConnected():                      # DO NOT TOUCH
+        try:
+            sensor_data      = cog.sense()
+            control_commands = cog.think(sensor_data)
+            cog.act(control_commands)
+        except p.error as e:
+            print(f"[Main] PyBullet disconnected: {e}")
+            break
+
+        if cog.fsm.state == RobotState.SUCCESS:
+            if cog.fsm.get_time_in_state() > 3.0:
                 print("\n" + "="*60)
-                print("  MISSION COMPLETE - Target grasped and lifted!")
+                print("  MISSION COMPLETE – target grasped and lifted!")
                 print("="*60)
                 break
-        
-        # Status output every ~1 second
-        if cog_arch.step_counter % 240 == 0:
+
+        if cog.step_counter % 240 == 0:
             pose = sensor_data['pose']
-            state_name = cog_arch.fsm.state.name
-            print(f"[t={cog_arch.step_counter/240:.0f}s] State: {state_name}, "
-                  f"Pose: ({pose[0]:.2f}, {pose[1]:.2f}, {np.degrees(pose[2]):.0f} deg)")
-        
-        cog_arch.step_counter += 1
-        
-        p.stepSimulation()  # DO NOT TOUCH
-        time.sleep(1./240.)  # DO NOT TOUCH
+            print(f"[t={cog.step_counter/240:.0f}s] "
+                  f"State={cog.fsm.state.name}  "
+                  f"Pose=({pose[0]:.2f},{pose[1]:.2f},{np.degrees(pose[2]):.0f}°)")
+
+        cog.step_counter += 1
+        p.stepSimulation()                      # DO NOT TOUCH
+        time.sleep(1./240.)                     # DO NOT TOUCH
 
 
 if __name__ == "__main__":

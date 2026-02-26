@@ -12,14 +12,16 @@ _SIGMA_OMEGA = 0.10   # fractional angular-velocity noise (10 %)
 _SIGMA_V_MIN     = 0.005   # floor when stationary
 _SIGMA_OMEGA_MIN = 0.010
 
-# Measurement model
-_SIGMA_LIDAR = 0.3    # expected lidar noise (m)  – wider = softer update
+# [F44] Tightened from 0.3 -> 0.15 m for faster wall-anchoring.
+# With 36 rays all contributing, a tighter sigma gives sharper weight peaks
+# and faster convergence without starving low-probability particles.
+_SIGMA_LIDAR = 0.15
 
 
 class ParticleFilter:
     def __init__(self, num_particles=500, map_size=10.0):
         self.num_particles = num_particles
-        self.map_size      = map_size       # 10 m × 10 m room
+        self.map_size      = map_size       # 10 m x 10 m room
 
         # Initialise particles tightly around the known start pose (0, 0, 0)
         self.particles = np.zeros((num_particles, 3))
@@ -31,7 +33,7 @@ class ParticleFilter:
         self.weights    = np.ones(num_particles) / num_particles
         self.robot_pose = np.array([0.0, 0.0, 0.0])
 
-    # ── helpers ──────────────────────────────────────────────────────────────
+    # -- helpers ----------------------------------------------------------
 
     def _wrap_angles(self):
         self.particles[:, 2] = (
@@ -43,15 +45,15 @@ class ParticleFilter:
         self.particles[:, 0] = np.clip(self.particles[:, 0], -half, half)
         self.particles[:, 1] = np.clip(self.particles[:, 1], -half, half)
 
-    # ── predict ──────────────────────────────────────────────────────────────
+    # -- predict ----------------------------------------------------------
 
     def predict(self, wheel_velocities, dt=1.0 / 240.0):
         """
         Differential-drive motion update.
 
         Accepts either:
-          • 4 wheel angular velocities [fl, fr, bl, br]  (rad/s)
-          • [v, omega] already in m/s and rad/s
+          * 4 wheel angular velocities [fl, fr, bl, br]  (rad/s)
+          * [v, omega] already in m/s and rad/s
         """
         if len(wheel_velocities) == 4:
             left_avg  = (wheel_velocities[0] + wheel_velocities[2]) / 2.0
@@ -70,7 +72,7 @@ class ParticleFilter:
         dv     = v     + np.random.normal(0, sigma_v,     n)
         domega = omega + np.random.normal(0, sigma_omega, n)
 
-        # FIX: use the heading at the START of the step for position integration
+        # Use the heading at the START of the step for position integration
         theta_old = self.particles[:, 2].copy()
 
         self.particles[:, 2] += domega * dt
@@ -82,21 +84,16 @@ class ParticleFilter:
         self.particles[:, 1] += dv * np.sin(theta_mid) * dt
         self._clip_positions()
 
-    # ── measurement update ───────────────────────────────────────────────────
+    # -- measurement update -----------------------------------------------
 
     def measurement_update(self, sensors):
         """
         Vectorised weight update using all 36 lidar rays vs. wall model.
 
-        The room is axis-aligned, so the expected wall distance in direction α
-        from position (px, py) is the minimum positive slab distance:
-
-            d_x = (±half - px) / cos(α)  if cos(α) ≠ 0
-            d_y = (±half - py) / sin(α)  if sin(α) ≠ 0
-            d   = min of positive values
-
-        Using all 36 rays (not just 4) gives the filter much more information
-        to anchor the pose against wall-geometry, reducing drift.
+        The room is axis-aligned, so the expected wall distance in direction a
+        from position (px, py) is the minimum positive slab distance.
+        Using all 36 rays gives the filter much more information to anchor
+        the pose against wall geometry, reducing drift.
         """
         if 'lidar' not in sensors:
             return
@@ -108,7 +105,7 @@ class ParticleFilter:
 
         half = self.map_size / 2.0
 
-        # Ray angles in robot frame: ray 0 = forward (0°), evenly spaced CCW
+        # Ray angles in robot frame: ray 0 = forward (0 deg), evenly spaced CCW
         ray_angles_rel = np.linspace(0, 2 * math.pi, n_rays, endpoint=False)
 
         # Particles: shape (P, 3)
@@ -122,8 +119,7 @@ class ParticleFilter:
         cos_a = np.cos(abs_angles)   # (P, R)
         sin_a = np.sin(abs_angles)
 
-        # Wall slab distances – vectorised
-        # Positive-x wall (+half) and negative-x wall (-half)
+        # Wall slab distances - vectorised
         with np.errstate(divide='ignore', invalid='ignore'):
             dx_pos = np.where(cos_a >  1e-6, ( half - px[:, None]) / cos_a, np.inf)
             dx_neg = np.where(cos_a < -1e-6, (-half - px[:, None]) / cos_a, np.inf)
@@ -138,7 +134,7 @@ class ParticleFilter:
         d_min = np.clip(d_min, 0.0, half * math.sqrt(2))
 
         # Gaussian likelihood: compare expected vs. measured
-        err = d_min - lidar_data[None, :]          # (P, R)
+        err   = d_min - lidar_data[None, :]          # (P, R)
         log_w = -0.5 * np.sum(err ** 2, axis=1) / (_SIGMA_LIDAR ** 2)
 
         # Numerically stable weight update
@@ -147,7 +143,7 @@ class ParticleFilter:
         self.weights += 1e-200
         self.weights /= self.weights.sum()
 
-    # ── resample ─────────────────────────────────────────────────────────────
+    # -- resample ---------------------------------------------------------
 
     def resample(self):
         """Systematic (low-variance) resampling."""
@@ -159,7 +155,7 @@ class ParticleFilter:
         self.particles = self.particles[indices]
         self.weights   = np.ones(n) / n
 
-    # ── estimate ─────────────────────────────────────────────────────────────
+    # -- estimate ---------------------------------------------------------
 
     def estimate_pose(self):
         """Weighted mean pose [x, y, theta]."""
@@ -172,7 +168,7 @@ class ParticleFilter:
         return self.robot_pose
 
 
-# ── module-level API ─────────────────────────────────────────────────────────
+# -- module-level API ---------------------------------------------------------
 
 pf = None
 
@@ -192,7 +188,7 @@ def state_estimate(sensors, control_inputs):
         control_inputs: dict with 'wheel_left' and 'wheel_right' (rad/s)
 
     Returns:
-        np.array([x, y, theta])  – estimated robot pose in world frame
+        np.array([x, y, theta])  - estimated robot pose in world frame
     """
     global pf
     if pf is None:
@@ -201,7 +197,7 @@ def state_estimate(sensors, control_inputs):
     wheel_left  = control_inputs.get('wheel_left',  0.0)
     wheel_right = control_inputs.get('wheel_right', 0.0)
 
-    # Convert wheel angular velocities (rad/s) → [v (m/s), omega (rad/s)]
+    # Convert wheel angular velocities (rad/s) -> [v (m/s), omega (rad/s)]
     v     = (wheel_left + wheel_right) / 2.0 * WHEEL_RADIUS
     omega = (wheel_right - wheel_left) / WHEEL_BASELINE * WHEEL_RADIUS
 

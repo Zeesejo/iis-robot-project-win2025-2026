@@ -2,20 +2,8 @@
 Module 10: Cognitive Architecture - SENSE-THINK-ACT Loop
 Integrates all 10 modules for autonomous navigate-to-grasp mission.
 
-This is the main executive controller that combines:
-- M1: Task specification (defined in README)
-- M2: URDF robot hardware
-- M3: Sensor preprocessing (sensor_preprocessing.py wrapping sensor_wrapper.py)
-- M4: Perception (object detection, RANSAC)
-- M5: State estimation (Particle Filter)  
-- M6: Motion control (PID, IK)
-- M7: Action planning (FSM, task sequencing)
-- M8: Knowledge representation (Prolog KB)
-- M9: Learning (parameter optimization)
-- M10: This cognitive architecture
-
 SENSE-THINK-ACT Cycle:
-    SENSE:  Read sensors, estimate state, detect objects
+    SENSE:  Read sensors, run full M4 PerceptionModule, estimate state
     THINK:  Update knowledge, plan actions, make decisions
     ACT:    Execute motion commands, control gripper
 """
@@ -30,1098 +18,828 @@ import sys
 import os
 import json
 
-# Add project paths
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-# M2: Hardware (URDF) & Environment
+# M2
 from src.environment.world_builder import build_world
-
-# M3: Sensor Preprocessing (wraps sensor_wrapper with noise filtering)
+# M3
 from src.modules.sensor_preprocessing import get_sensor_data, get_sensor_id
-# Note: sensor_wrapper is accessed via sensor_preprocessing module
-
-# M4: Perception
-from src.modules.perception import detect_objects_by_color, RANSAC_Segmentation
-
-# M5: State Estimation
+# M4 - full perception module
+from src.modules.perception import (
+    PerceptionModule,
+    detect_objects_by_color,
+    RANSAC_Segmentation,
+    depth_to_point_cloud,
+    edge_contour_segmentation,
+    compute_pca,
+    refine_object_points,
+    SCENE_OBJECTS,
+    COLOR_RANGES_HSV,
+)
+# M5
 from src.modules.state_estimation import state_estimate, initialize_state_estimator
-
-# M6: Motion Control
+# M6
 from src.modules.motion_control import PIDController, move_to_goal, grasp_object
-
-# M7: Action Planning
+# M7
 from src.modules.fsm import RobotFSM, RobotState
 from src.modules.action_planning import get_action_planner, get_grasp_planner
-
-# M8: Knowledge Representation
+# M8
 from src.modules.knowledge_reasoning import get_knowledge_base
+# M9: Learning [DISABLED]
+# from src.modules.learning import Learner, DEFAULT_PARAMETERS as LEARNING_DEFAULTS
+LEARNING_DEFAULTS = {'nav_kp': 1.0, 'nav_ki': 0.0, 'nav_kd': 0.1, 'angle_kp': 1.0}
 
-# M9: Learning
-from src.modules.learning import Learner, DEFAULT_PARAMETERS as LEARNING_DEFAULTS
+# ── Robot physical constants ──────────────────────────────────────────────────
+WHEEL_RADIUS    = 0.1
+WHEEL_BASELINE  = 0.45
+CAMERA_HEIGHT   = 0.55   # base(0.1) + torso(0.3) + cam_z(0.15)
+CAMERA_FORWARD  = 0.25   # camera 0.25 m ahead of robot centre (kept for PCA path only)
+DEPTH_NEAR      = 0.1
+DEPTH_FAR       = 10.0
 
-# Robot physical constants (must match URDF and state_estimation)
-WHEEL_RADIUS = 0.1
-WHEEL_BASELINE = 0.45
-CAMERA_HEIGHT = 0.55    # Base spawn (0.1) + torso origin (0.3) + camera Z (0.15)
-CAMERA_FORWARD = 0.25   # Camera is 0.25m forward of robot center on torso
-DEPTH_NEAR = 0.1
-DEPTH_FAR = 10.0
+# ── Perception tuning ─────────────────────────────────────────────────────────
+# Correct horizontal FOV for PyBullet's 4:3 camera (aspect = 320/240)
+_FOV_V   = 60.0
+_ASPECT  = 320.0 / 240.0
+_FOV_H   = 2 * np.degrees(np.arctan(np.tan(np.radians(_FOV_V / 2)) * _ASPECT))
+CAM_FX   = (320 / 2.0) / np.tan(np.radians(_FOV_H / 2))   # ≈ 370
+CAM_FY   = (240 / 2.0) / np.tan(np.radians(_FOV_V / 2))   # ≈ 277
+CAM_CX, CAM_CY = 160.0, 120.0
+
+TARGET_COLOR     = 'red'
+MAX_TARGET_DEPTH = 3.0   # FIX 1: was 3.5 – tighter gate prevents false cold-start
+MIN_TARGET_DEPTH = 0.2
+MAX_JUMP_M       = 1.0   # EMA jump filter threshold
 
 
 class CognitiveArchitecture:
-    """
-    Main cognitive architecture implementing the Sense-Think-Act loop.
-    """
-    
+    """Main cognitive architecture: Sense-Think-Act loop."""
+
     def __init__(self, robot_id, table_id, room_id, target_id):
-        # Robot IDs from PyBullet
-        self.robot_id = robot_id
-        self.table_id = table_id
-        self.room_id = room_id
+        self.robot_id  = robot_id
+        self.table_id  = table_id
+        self.room_id   = room_id
         self.target_id = target_id
-        
-        # M5: State Estimator (via state_estimate function)
+
+        # M5
         initialize_state_estimator()
-        
-        # M3: Get sensor link IDs from URDF
+
+        # M3
         self.sensor_camera_id, self.sensor_lidar_id = get_sensor_id(self.robot_id)
-        
-        # M7: FSM for high-level control
-        self.fsm = RobotFSM()
-        
-        # M7: Action Planners
+
+        # M4 – full perception module (owns SIFT extractor + KB)
+        self.perception = PerceptionModule()
+
+        # M7
+        self.fsm            = RobotFSM()
         self.action_planner = get_action_planner()
-        self.grasp_planner = get_grasp_planner()
-        
-        # M8: Knowledge Base (backed by Dynamic_KB.pl via PySwip)
+        self.grasp_planner  = get_grasp_planner()
+
+        # M8
         self.kb = get_knowledge_base()
-        
-        # M9: Learner (for parameter optimization)
-        # Pass self as robot so learner can call run_episode if needed
-        self.learner = Learner(robot=None)  # No live robot connection during main loop
-        
-        # M9: Use learned or default PID parameters
-        best_params = self.learner.get_best_parameters()
-        nav_kp = best_params.get('nav_kp', LEARNING_DEFAULTS['nav_kp'])
-        nav_ki = best_params.get('nav_ki', LEARNING_DEFAULTS['nav_ki'])
-        nav_kd = best_params.get('nav_kd', LEARNING_DEFAULTS['nav_kd'])
-        
-        # M6: PID Controllers (initialized from M9 learning parameters)
+
+        # M9 [DISABLED] – hardcoded defaults
+        nav_kp = LEARNING_DEFAULTS['nav_kp']
+        nav_ki = LEARNING_DEFAULTS['nav_ki']
+        nav_kd = LEARNING_DEFAULTS['nav_kd']
+
+        # M6
         self.nav_pid = PIDController(Kp=nav_kp, Ki=nav_ki, Kd=nav_kd)
-        
-        # Robot configuration - wheel joints [FL, FR, BL, BR]
+
+        # Robot joints
         self.wheel_joints = [0, 1, 2, 3]
-        self.wheel_names = ['fl_wheel_joint', 'fr_wheel_joint',
-                            'bl_wheel_joint', 'br_wheel_joint']
-        
-        # Auto-detect special joint indices from URDF
-        self.arm_joints = []
-        self.gripper_joints = []
-        self.lift_joint_idx = None
+        self.wheel_names  = ['fl_wheel_joint', 'fr_wheel_joint',
+                             'bl_wheel_joint', 'br_wheel_joint']
+        self.arm_joints      = []
+        self.gripper_joints  = []
+        self.lift_joint_idx  = None
         self.camera_link_idx = None
         self._detect_robot_joints()
-        
+
         # Task state
-        self.target_position = None
-        self.target_position_smoothed = None  # EMA-filtered target position
-        self.target_detection_count = 0
-        self.target_camera_bearing = 0.0  # Camera-relative bearing to target (rad)
-        self.target_camera_depth = float('inf')  # Camera depth to target (m)
-        self.table_position = None
-        self.table_orientation = None
-        self.table_size = None
-        self.obstacles = []
-        self.current_waypoint = None
-        self.approach_standoff = None
-        
+        self.target_position           = None
+        self.target_position_smoothed  = None   # EMA-stabilised world position
+        self.target_detection_count    = 0
+        self.target_camera_bearing     = 0.0
+        self.target_camera_depth       = float('inf')
+        self.table_position            = None
+        self.table_orientation         = None
+        self.table_size                = None
+        self.obstacles                 = []
+        self.current_waypoint          = None
+        self.approach_standoff         = None
+
+        # M4: last full perception result (updated every 10 steps in SENSE)
+        self.last_perception_result    = None
+        # M4: confirmed table plane model from RANSAC (A,B,C,D)
+        self.table_plane_model         = None
+        # M4: PCA-derived target pose from point cloud
+        self.pca_target_pose           = None
+
+        # Bug-2 fix: gate FAILURE-state resets to first tick only
+        self._failure_reset_done = False
+
         # Timing
         self.step_counter = 0
-        self.dt = 1.0 / 240.0
-        
-        # Initialize robot knowledge
+        self.dt           = 1.0 / 240.0
+
         self._initialize_world_knowledge()
-        
-        # Enable wheel motors
         self._initialize_motors()
-        
+
+    # ──────────────────────────── initialisation ─────────────────────────────
+
     def _initialize_motors(self):
-        """Enable and reset wheel motors"""
         for i in self.wheel_joints:
-            p.setJointMotorControl2(
-                self.robot_id, i, p.VELOCITY_CONTROL,
-                targetVelocity=0, force=5000
-            )
+            p.setJointMotorControl2(self.robot_id, i, p.VELOCITY_CONTROL,
+                                    targetVelocity=0, force=5000)
             p.enableJointForceTorqueSensor(self.robot_id, i, True)
         print("[CogArch] Motors initialized")
-        
+
     def _detect_robot_joints(self):
-        """Detect all special joint indices from robot URDF"""
-        num_joints = p.getNumJoints(self.robot_id)
-        
-        for i in range(num_joints):
-            joint_info = p.getJointInfo(self.robot_id, i)
-            joint_name = joint_info[1].decode('utf-8')
-            link_name = joint_info[12].decode('utf-8')
-            
-            # Gripper finger joints
-            if 'left_finger_joint' in joint_name or 'right_finger_joint' in joint_name:
+        for i in range(p.getNumJoints(self.robot_id)):
+            info      = p.getJointInfo(self.robot_id, i)
+            jname     = info[1].decode('utf-8')
+            lname     = info[12].decode('utf-8')
+            jtype     = info[2]
+            if 'left_finger_joint' in jname or 'right_finger_joint' in jname:
                 self.gripper_joints.append(i)
-            
-            # Lift joint (only if movable - prismatic/revolute)
-            if joint_name == 'lift_joint':
-                joint_type = joint_info[2]
-                if joint_type != p.JOINT_FIXED:
-                    self.lift_joint_idx = i
-                else:
-                    self.lift_joint_idx = None  # Fixed in new URDF, can't actuate
-            
-            # Camera link
-            if 'rgbd_camera' in link_name or 'camera' in link_name:
+            if jname == 'lift_joint':
+                self.lift_joint_idx = i if jtype != p.JOINT_FIXED else None
+            if 'rgbd_camera' in lname or 'camera' in lname:
                 self.camera_link_idx = i
-            
-            # Arm joints (revolute joints in the arm chain, skip fixed cosmetic joints)
-            if joint_name in ['arm_base_joint', 'shoulder_joint', 'elbow_joint',
-                              'wrist_pitch_joint', 'wrist_roll_joint']:
-                joint_type = joint_info[2]
-                if joint_type != p.JOINT_FIXED:
+            if jname in ['arm_base_joint', 'shoulder_joint', 'elbow_joint',
+                         'wrist_pitch_joint', 'wrist_roll_joint']:
+                if jtype != p.JOINT_FIXED:
                     self.arm_joints.append(i)
-        
         print(f"[CogArch] Detected: {len(self.gripper_joints)} gripper joints, "
               f"{len(self.arm_joints)} arm joints, "
-              f"lift_joint={self.lift_joint_idx}, camera_link={self.camera_link_idx}")
-        
+              f"lift={self.lift_joint_idx}, cam_link={self.camera_link_idx}")
+
     def _initialize_world_knowledge(self):
-        """Initialize knowledge base with world state from initial map.
-        Updates Dynamic_KB.pl positions via Prolog update_position/4."""
-        map_file = "initial_map.json"
-        if os.path.exists(map_file):
-            with open(map_file, 'r') as f:
-                world_map = json.load(f)
-                
-            # Add table to knowledge base
-            if 'table' in world_map:
-                table_data = world_map['table']
-                pos = table_data['position']
-                self.kb.add_position('table', pos[0], pos[1], pos[2])
-                self.kb.add_detected_object('table', 'furniture', 'brown', pos)
-                self.table_position = pos
-                if 'orientation' in table_data:
-                    self.table_orientation = table_data['orientation']
-                if 'size' in table_data:
-                    self.table_size = table_data['size']
-                # Add table as a large obstacle so path planner routes around it
+        if not os.path.exists("initial_map.json"):
+            return
+        with open("initial_map.json", 'r') as f:
+            world_map = json.load(f)
+        if 'table' in world_map:
+            td  = world_map['table']
+            pos = td['position']
+            self.kb.add_position('table', pos[0], pos[1], pos[2])
+            self.kb.add_detected_object('table', 'furniture', 'brown', pos)
+            self.table_position    = pos
+            self.table_orientation = td.get('orientation')
+            self.table_size        = td.get('size')
+            self.obstacles.append(pos[:2])
+        if 'obstacles' in world_map:
+            for i, obs in enumerate(world_map['obstacles']):
+                pos   = obs['position']
+                color = self._rgba_to_color_name(obs['color_rgba'])
+                oid   = f'obstacle{i}'
+                self.kb.add_position(oid, pos[0], pos[1], pos[2])
+                self.kb.add_detected_object(oid, 'static', color, pos)
                 self.obstacles.append(pos[:2])
-                
-            # Add obstacles to knowledge base
-            if 'obstacles' in world_map:
-                for i, obs in enumerate(world_map['obstacles']):
-                    pos = obs['position']
-                    color = self._rgba_to_color_name(obs['color_rgba'])
-                    obj_id = f'obstacle{i}'
-                    self.kb.add_position(obj_id, pos[0], pos[1], pos[2])
-                    self.kb.add_detected_object(obj_id, 'static', color, pos)
-                    self.obstacles.append(pos[:2])
-                    
-            print(f"[CogArch] Loaded {len(self.obstacles)} obstacles from initial map")
-            
-            # M8: Log KB state
-            try:
-                known_objects = self.kb.objects()
-                pickable = self.kb.pickable_objects()
-                print(f"[CogArch] KB objects: {known_objects}")
-                print(f"[CogArch] KB pickable: {pickable}")
-            except Exception as e:
-                print(f"[CogArch] KB query info: {e}")
-    
+        print(f"[CogArch] Loaded {len(self.obstacles)} obstacles from initial map")
+        try:
+            print(f"[CogArch] KB objects:  {self.kb.objects()}")
+            print(f"[CogArch] KB pickable: {self.kb.pickable_objects()}")
+        except Exception as e:
+            print(f"[CogArch] KB query info: {e}")
+
     def _rgba_to_color_name(self, rgba):
-        """Convert RGBA to color name"""
         r, g, b, _ = rgba
-        if r > 0.9 and g < 0.1 and b < 0.1:
-            return 'red'
-        elif r < 0.1 and g < 0.1 and b > 0.9:
-            return 'blue'
-        elif r > 0.9 and g > 0.6 and b < 0.1:
-            return 'orange'
-        elif r > 0.9 and g > 0.9 and b < 0.1:
-            return 'yellow'
-        elif r > 0.9 and g > 0.7:
-            return 'pink'
-        elif r < 0.1 and g < 0.1 and b < 0.1:
-            return 'black'
-        elif r > 0.4 and r < 0.6 and g > 0.2 and g < 0.4:
-            return 'brown'
+        if   r > 0.9 and g < 0.1 and b < 0.1:              return 'red'
+        elif r < 0.1 and g < 0.1 and b > 0.9:              return 'blue'
+        elif r > 0.9 and g > 0.6 and b < 0.1:              return 'orange'
+        elif r > 0.9 and g > 0.9 and b < 0.1:              return 'yellow'
+        elif r > 0.9 and g > 0.7:                           return 'pink'
+        elif r < 0.1 and g < 0.1 and b < 0.1:              return 'black'
+        elif 0.4 < r < 0.6 and 0.2 < g < 0.4:              return 'brown'
         return 'unknown'
-    
+
+    # ──────────────────────────── helpers ────────────────────────────────────
+
     def _check_gripper_contact(self):
-        """
-        M3: Check if gripper/arm is in contact with target object.
-        Uses PyBullet contact points API (simulates touch sensor on gripper).
-        """
-        # Use contact points between robot and target (simulates touch sensor)
         contacts = p.getContactPoints(bodyA=self.robot_id, bodyB=self.target_id)
         if contacts and len(contacts) > 0:
             if self.step_counter % 60 == 0:
-                print("[Sense] Gripper contact detected via touch sensor")
+                print("[Sense] Gripper contact detected")
             return True
         return False
-    
-    def _convert_depth_buffer(self, depth_buffer_value):
-        """
-        Convert PyBullet's normalized depth buffer to actual depth in meters.
-        Depth buffer values are in [0, 1] range.
-        """
-        if depth_buffer_value <= 0 or depth_buffer_value >= 1.0:
-            return float('inf')
-        true_depth = DEPTH_FAR * DEPTH_NEAR / (DEPTH_FAR - (DEPTH_FAR - DEPTH_NEAR) * depth_buffer_value)
-        return true_depth
-    
+
     def _compute_approach_standoff(self, target_pos, robot_pose):
-        """
-        Compute optimal approach standoff position near the table.
-        Approaches from the long side (1.5m) of the table so the arm
-        only needs to reach across the short dimension (0.4m from edge to center).
-        """
-        standoff_dist = 0.65  # meters from target center (table half-width 0.4 + robot 0.2 + margin 0.05)
-        
+        standoff_dist = 0.65
         if self.table_orientation is not None:
-            # Get table yaw from orientation quaternion
-            euler = p.getEulerFromQuaternion(self.table_orientation)
-            table_yaw = euler[2]
-            
-            # Approach directions perpendicular to long side (along short axis)
-            dir1 = [-math.sin(table_yaw), math.cos(table_yaw)]
-            dir2 = [math.sin(table_yaw), -math.cos(table_yaw)]
-            
-            # Choose direction that faces the robot
-            dx = robot_pose[0] - target_pos[0]
-            dy = robot_pose[1] - target_pos[1]
-            dot1 = dx * dir1[0] + dy * dir1[1]
-            dot2 = dx * dir2[0] + dy * dir2[1]
-            
-            approach_dir = dir1 if dot1 > dot2 else dir2
-            
-            standoff = [
-                target_pos[0] + standoff_dist * approach_dir[0],
-                target_pos[1] + standoff_dist * approach_dir[1]
-            ]
-        else:
-            # Fallback: approach from robot's current direction
-            dx = target_pos[0] - robot_pose[0]
-            dy = target_pos[1] - robot_pose[1]
-            dist = np.hypot(dx, dy)
-            if dist > 0.01:
-                standoff = [
-                    target_pos[0] - standoff_dist * dx / dist,
-                    target_pos[1] - standoff_dist * dy / dist
-                ]
-            else:
-                standoff = list(target_pos[:2])
-        
-        return standoff
+            yaw   = p.getEulerFromQuaternion(self.table_orientation)[2]
+            dir1  = [-math.sin(yaw),  math.cos(yaw)]
+            dir2  = [ math.sin(yaw), -math.cos(yaw)]
+            dx    = robot_pose[0] - target_pos[0]
+            dy    = robot_pose[1] - target_pos[1]
+            adir  = dir1 if (dx*dir1[0]+dy*dir1[1]) > (dx*dir2[0]+dy*dir2[1]) else dir2
+            return [target_pos[0] + standoff_dist*adir[0],
+                    target_pos[1] + standoff_dist*adir[1]]
+        dx, dy = target_pos[0]-robot_pose[0], target_pos[1]-robot_pose[1]
+        d      = np.hypot(dx, dy)
+        if d > 0.01:
+            return [target_pos[0] - standoff_dist*dx/d,
+                    target_pos[1] - standoff_dist*dy/d]
+        return list(target_pos[:2])
 
     def _distance_to_table(self, x, y):
-        """
-        Compute approximate 2D distance from point (x,y) to table footprint.
-        Returns 0 if point is inside the table, positive if outside.
-        """
         if self.table_position is None:
             return float('inf')
-        # Transform point into table-local frame
-        tx, ty = self.table_position[0], self.table_position[1]
-        dx, dy = x - tx, y - ty
+        dx, dy = x - self.table_position[0], y - self.table_position[1]
         if self.table_orientation is not None:
-            euler = p.getEulerFromQuaternion(self.table_orientation)
-            yaw = -euler[2]  # inverse rotation
-            local_x = dx * math.cos(yaw) - dy * math.sin(yaw)
-            local_y = dx * math.sin(yaw) + dy * math.cos(yaw)
+            yaw    = -p.getEulerFromQuaternion(self.table_orientation)[2]
+            lx     = dx*math.cos(yaw) - dy*math.sin(yaw)
+            ly     = dx*math.sin(yaw) + dy*math.cos(yaw)
         else:
-            local_x, local_y = dx, dy
-        # Table half-dimensions (1.5 x 0.8)
-        hx, hy = 0.75, 0.40
-        # Distance from box boundary
-        cx = max(abs(local_x) - hx, 0.0)
-        cy = max(abs(local_y) - hy, 0.0)
-        return math.hypot(cx, cy)
+            lx, ly = dx, dy
+        return math.hypot(max(abs(lx)-0.75, 0.0), max(abs(ly)-0.40, 0.0))
 
-    def _get_lidar_obstacle_avoidance(self, lidar, forward_vel, relaxed=False, robot_pose=None):
-        """
-        M4/M6: Adjust motion to avoid obstacles detected by lidar.
-        Also enforces a virtual keep-out zone around the table (lidar can't see it).
-        
-        Args:
-            lidar: list of 36 ray distances (0=forward, going counter-clockwise)
-            forward_vel: desired forward velocity
-            relaxed: if True, use smaller thresholds (for approaching the table)
-            robot_pose: [x, y, theta] for table keep-out check
-            
-        Returns:
-            (adjusted_forward_vel, avoidance_angular_vel)
-        """
+    def _lidar_avoidance(self, lidar, fwd, relaxed=False, pose=None):
         if lidar is None or len(lidar) == 0:
-            return forward_vel, 0.0
-        
-        # Virtual table keep-out zone (lidar can't detect the table)
-        if robot_pose is not None and self.table_position is not None:
-            table_dist = self._distance_to_table(robot_pose[0], robot_pose[1])
-            table_keepout = 0.2 if relaxed else 0.6
-            if table_dist < table_keepout:
-                # Robot is dangerously close to or inside table footprint
-                # Override: push away from table center
-                away_angle = math.atan2(
-                    robot_pose[1] - self.table_position[1],
-                    robot_pose[0] - self.table_position[0]
+            return fwd, 0.0
+        if pose is not None and self.table_position is not None:
+            td = self._distance_to_table(pose[0], pose[1])
+            ko = 0.2 if relaxed else 0.6
+            if td < ko:
+                away  = math.atan2(pose[1]-self.table_position[1],
+                                   pose[0]-self.table_position[0])
+                hdiff = math.atan2(math.sin(away-pose[2]), math.cos(away-pose[2]))
+                if abs(hdiff) < math.pi/2:
+                    return min(fwd, 3.0),  5.0*hdiff
+                return -2.0, 5.0 if hdiff > 0 else -5.0
+        n   = len(lidar)
+        oth = 0.3 if relaxed else 0.8
+        eth = 0.15 if relaxed else 0.3
+        mf  = min(lidar[i % n] for i in range(-3, 4))
+        al  = np.mean([lidar[i] for i in range(5, 13)])
+        ar  = np.mean([lidar[i] for i in range(n-12, n-4)])
+        mr  = min(lidar[i % n] for i in range(n//2-3, n//2+4))
+        av  = 0.0
+        if fwd < 0:
+            if mr < eth:  fwd = 1.0;  av = 5.0 if al > ar else -5.0
+            elif mr < oth:
+                s = mr/oth; fwd *= s; av = 3.0*(1-s)*(1 if al>ar else -1)
+        else:
+            if mf < eth:  fwd = -1.0; av = 5.0 if al > ar else -5.0
+            elif mf < oth:
+                s = mf/oth; fwd *= s; av = 3.0*(1-s)*(1 if al>ar else -1)
+        return fwd, av
+
+    # ──────────────────────── camera → world projection ──────────────────────
+
+    def _pixel_depth_to_world(self, px, py, depth_m, robot_pose):
+        """
+        Convert a single (pixel, depth_metres) observation to world-frame [x,y,z].
+        FIX 2: body_x = cam_z only (removed erroneous + CAMERA_FORWARD offset).
+        The depth reading is the distance from the camera optical centre;
+        adding CAMERA_FORWARD was double-counting the camera mount offset.
+        """
+        cam_x = (px - CAM_CX) * depth_m / CAM_FX
+        cam_y = (py - CAM_CY) * depth_m / CAM_FY
+        cam_z = depth_m
+        rx, ry, rt = robot_pose
+        body_x     = cam_z          # FIX 2: was cam_z + CAMERA_FORWARD
+        body_y     = -cam_x
+        world_x    = rx + body_x*math.cos(rt) - body_y*math.sin(rt)
+        world_y    = ry + body_x*math.sin(rt) + body_y*math.cos(rt)
+        world_z    = CAMERA_HEIGHT - cam_y
+        return [world_x, world_y, world_z]
+
+    def _update_target_from_detection(self, new_pos, depth_m, bearing):
+        """
+        Apply EMA filter to a new raw target detection and update
+        self.target_position / self.target_position_smoothed.
+        Returns True if the detection was accepted.
+        """
+        # Jump filter – tight threshold, no count exemption
+        if self.target_position_smoothed is not None:
+            jump = np.hypot(new_pos[0] - self.target_position_smoothed[0],
+                            new_pos[1] - self.target_position_smoothed[1])
+            if jump > MAX_JUMP_M:
+                return False
+
+        self.target_detection_count += 1
+        self.target_camera_bearing  = bearing
+        self.target_camera_depth    = depth_m
+
+        # Trust new readings more early on (cold start), less once stable
+        alpha = 0.5 if self.target_detection_count <= 5 else 0.15
+        if self.target_position_smoothed is None:
+            self.target_position_smoothed = list(new_pos)
+        else:
+            for k in range(3):
+                self.target_position_smoothed[k] = (
+                    alpha * new_pos[k] + (1 - alpha) * self.target_position_smoothed[k]
                 )
-                heading_diff = away_angle - robot_pose[2]
-                heading_diff = math.atan2(math.sin(heading_diff), math.cos(heading_diff))
-                if abs(heading_diff) < math.pi / 2:
-                    return min(forward_vel, 3.0), 5.0 * heading_diff  # drive away
-                else:
-                    return -2.0, 5.0 if heading_diff > 0 else -5.0  # back up and turn
-        
-        num_rays = len(lidar)
-        if relaxed:
-            obstacle_threshold = 0.3   # meters - allow getting close to table
-            emergency_threshold = 0.15
-        else:
-            obstacle_threshold = 0.8  # meters
-            emergency_threshold = 0.3  # meters
-        
-        # Check front cone (about +/- 30 degrees)
-        front_indices = [i % num_rays for i in range(-3, 4)]
-        front_dists = [lidar[i] for i in front_indices]
-        min_front = min(front_dists)
-        
-        # Check left side (rays 5-12, ~50-120 degrees centered on left)
-        left_dists = [lidar[i] for i in range(5, 13)]
-        avg_left = np.mean(left_dists)
-        
-        # Check right side (rays 24-31, ~240-310 degrees centered on right)
-        right_dists = [lidar[i] for i in range(num_rays - 12, num_rays - 4)]
-        avg_right = np.mean(right_dists)
-        
-        # Check rear cone (about +/- 30 degrees behind)
-        rear_center = num_rays // 2  # ray 18 for 36-ray
-        rear_indices = [i % num_rays for i in range(rear_center - 3, rear_center + 4)]
-        rear_dists = [lidar[i] for i in rear_indices]
-        min_rear = min(rear_dists)
-        
-        avoidance_angular = 0.0
-        
-        if forward_vel < 0:
-            # Moving backward: check rear obstacles
-            if min_rear < emergency_threshold:
-                forward_vel = 1.0  # Drive forward to escape
-                avoidance_angular = 5.0 if avg_left > avg_right else -5.0
-            elif min_rear < obstacle_threshold:
-                slowdown = min_rear / obstacle_threshold
-                forward_vel *= slowdown
-                turn_strength = 3.0 * (1.0 - slowdown)
-                avoidance_angular = turn_strength if avg_left > avg_right else -turn_strength
-        else:
-            # Moving forward: check front obstacles
-            if min_front < emergency_threshold:
-                forward_vel = -1.0  # Back up slightly
-                avoidance_angular = 5.0 if avg_left > avg_right else -5.0
-            elif min_front < obstacle_threshold:
-                slowdown = min_front / obstacle_threshold
-                forward_vel *= slowdown
-                turn_strength = 3.0 * (1.0 - slowdown)
-                avoidance_angular = turn_strength if avg_left > avg_right else -turn_strength
-        
-        return forward_vel, avoidance_angular
-    
-    # ==================== SENSE ====================
+        self.target_position = list(self.target_position_smoothed)
+        self.kb.add_position('target', *self.target_position)
+        return True
+
+    # ══════════════════════════════ SENSE ════════════════════════════════════
+
     def sense(self):
         """
-        SENSE phase: Acquire sensor data and update state estimate.
-        Returns sensor_data dict for use in THINK phase.
+        SENSE phase.
+        Runs the full M4 PerceptionModule every 10 steps:
+          • detect_objects_by_color  (HSV detection for all objects)
+          • edge_contour_segmentation (structural segmentation)
+          • depth_to_point_cloud     (3-D reconstruction from depth buffer)
+          • RANSAC_Segmentation      (table-plane extraction)
+          • compute_pca / refine_object_points (target pose estimation)
+        Target world position is derived from PCA centre when available,
+        with per-pixel depth projection as fallback.
         """
-        # M3: Get preprocessed sensor data via sensor_preprocessing module
-        preprocessed = get_sensor_data(self.robot_id, self.sensor_camera_id, self.sensor_lidar_id)
-        rgb = preprocessed['camera_rgb']
-        depth = preprocessed['camera_depth']
-        lidar = preprocessed['lidar']
-        imu = preprocessed['imu']
-        joint_states = preprocessed['joint_states']
-        
-        # M5: Get wheel velocities from joint states using correct URDF joint names
-        wheel_vels = []
-        for name in self.wheel_names:
-            if name in joint_states:
-                wheel_vels.append(joint_states[name]['velocity'])
-            else:
-                wheel_vels.append(0.0)
-        
-        # M5: State estimation via state_estimate() function
-        sensors_for_pf = {
-            'imu': imu,
-            'lidar': lidar,
-            'joint_states': joint_states
-        }
-        control_inputs = {
-            'wheel_left': (wheel_vels[0] + wheel_vels[2]) / 2.0,   # avg of FL + BL
-            'wheel_right': (wheel_vels[1] + wheel_vels[3]) / 2.0,  # avg of FR + BR
-        }
-        estimated_pose = state_estimate(sensors_for_pf, control_inputs)
-        
-        # M8: Update robot position in Knowledge Base (Prolog)
+        pre          = get_sensor_data(self.robot_id,
+                                       self.sensor_camera_id,
+                                       self.sensor_lidar_id)
+        rgb          = pre['camera_rgb']
+        depth        = pre['camera_depth']
+        lidar        = pre['lidar']
+        imu          = pre['imu']
+        joint_states = pre['joint_states']
+
+        # M5: wheel odometry + particle filter
+        wheel_vels = [joint_states[n]['velocity'] if n in joint_states else 0.0
+                      for n in self.wheel_names]
+        estimated_pose = state_estimate(
+            {'imu': imu, 'lidar': lidar, 'joint_states': joint_states},
+            {'wheel_left':  (wheel_vels[0]+wheel_vels[2])/2.0,
+             'wheel_right': (wheel_vels[1]+wheel_vels[3])/2.0}
+        )
+
+        # M8: push robot pose to KB periodically
         if self.step_counter % 50 == 0:
-            self.kb.add_position('robot', 
-                                float(estimated_pose[0]), 
-                                float(estimated_pose[1]), 0.0)
-        
-        # M4: Perception - Detect objects every 10 steps
-        if rgb is not None and self.step_counter % 10 == 0:
-            rgb_array = np.reshape(rgb, (240, 320, 4)).astype(np.uint8)
-            bgr = cv2.cvtColor(rgb_array, cv2.COLOR_RGBA2BGR)
-            
-            detections = detect_objects_by_color(bgr, min_area=50)
-            
-            # Log detections periodically
-            if self.step_counter % 240 == 0 and len(detections) > 0:
-                colors_found = [d['color'] for d in detections]
-                print(f"[Perception] Detected {len(detections)} objects: {colors_found}")
-            
-            # Look for red target - pick the CLOSEST (largest bounding box) red detection
-            red_detections = [d for d in detections if d['color'] == 'red']
-            # Sort by bbox area (larger = closer), take biggest
-            red_detections.sort(key=lambda d: d['bbox'][2] * d['bbox'][3], reverse=True)
-            for det in red_detections[:1]:  # Only process the single closest red detection
-                    bbox = det['bbox']
-                    center_x = int(bbox[0] + bbox[2] / 2)
-                    center_y = int(bbox[1] + bbox[3] / 2)
-                    
-                    if depth is not None and 0 <= center_y < 240 and 0 <= center_x < 320:
-                        if len(depth.shape) == 1:
-                            depth_reshaped = np.reshape(depth, (240, 320))
-                        else:
-                            depth_reshaped = depth
-                        
-                        raw_depth = depth_reshaped[center_y, center_x]
-                        
-                        # Convert normalized depth buffer to actual meters
-                        true_depth = self._convert_depth_buffer(raw_depth)
-                        
-                        if true_depth < 0.1 or true_depth > 10.0 or np.isnan(true_depth) or np.isinf(true_depth):
-                            continue
-                        
-                        # Camera intrinsics (FOV=60 deg, width=320, height=240)
-                        # Projection uses aspect=1.0 so both H and V FOV are 60 deg
-                        # But image is 4:3, so fx ≠ fy (non-square pixels)
-                        fx = (320 / 2.0) / np.tan(np.deg2rad(60 / 2.0))   # horizontal
-                        fy = (240 / 2.0) / np.tan(np.deg2rad(60 / 2.0))   # vertical
-                        cx, cy_cam = 160.0, 120.0
-                        
-                        # Convert pixel + depth to camera coordinates
-                        cam_x = (center_x - cx) * true_depth / fx
-                        cam_y = (center_y - cy_cam) * true_depth / fy
-                        cam_z = true_depth  # forward distance
-                        
-                        # Transform to world frame
-                        robot_x, robot_y, robot_theta = estimated_pose
-                        cos_t = math.cos(robot_theta)
-                        sin_t = math.sin(robot_theta)
-                        
-                        # Camera frame to robot body frame (no tilt, camera level on torso):
-                        #   robot_forward(+X) = cam_z (depth) + camera forward offset
-                        #   robot_left(+Y)    = -cam_x (camera right is robot -Y)
-                        robot_body_x = cam_z + CAMERA_FORWARD  # camera is 0.25m ahead of robot center
-                        robot_body_y = -cam_x
-                        
-                        world_x = robot_x + robot_body_x * cos_t - robot_body_y * sin_t
-                        world_y = robot_y + robot_body_x * sin_t + robot_body_y * cos_t
-                        # Height: camera is at CAMERA_HEIGHT, cam_y positive = object lower
-                        world_z = CAMERA_HEIGHT - cam_y
-                        
-                        new_target = [world_x, world_y, world_z]
-                        
-                        # Filter: reject detections that jump > 2m from smoothed estimate
-                        accept = True
-                        if self.target_position_smoothed is not None:
-                            jump = np.hypot(new_target[0] - self.target_position_smoothed[0],
-                                            new_target[1] - self.target_position_smoothed[1])
-                            if jump > 2.0 and self.target_detection_count > 5:
-                                accept = False  # Likely false positive
-                        
-                        if accept:
-                            self.target_detection_count += 1
-                            # Store camera-relative bearing and depth for reactive steering
-                            self.target_camera_bearing = math.atan2(-(center_x - cx), fx)
-                            self.target_camera_depth = true_depth
-                            # Exponential moving average for stability
-                            alpha = 0.4 if self.target_detection_count > 3 else 0.8
-                            if self.target_position_smoothed is None:
-                                self.target_position_smoothed = list(new_target)
-                            else:
-                                for k in range(3):
-                                    self.target_position_smoothed[k] = (
-                                        alpha * new_target[k]
-                                        + (1 - alpha) * self.target_position_smoothed[k]
-                                    )
-                            self.target_position = list(self.target_position_smoothed)
-                            
-                            # Add to knowledge base
-                            self.kb.add_position('target', *self.target_position)
-                            print(f"[CogArch] TARGET DETECTED at ({world_x:.2f}, {world_y:.2f}, {world_z:.2f}), "
-                                  f"depth={true_depth:.2f}m")
-                        break
-        
-        # M3: Check gripper contact using joint state feedback (legal)
+            self.kb.add_position('robot',
+                                 float(estimated_pose[0]),
+                                 float(estimated_pose[1]), 0.0)
+
+        # ── M4: Full PerceptionModule every 10 steps ──────────────────────
+        if rgb is not None and depth is not None and self.step_counter % 10 == 0:
+            # process_frame runs: color detection, edge segmentation,
+            # depth→point-cloud, RANSAC plane, PCA object pose
+            perc = self.perception.process_frame(rgb, depth, width=320, height=240)
+            self.last_perception_result = perc
+
+            # ── A) RANSAC table plane ──────────────────────────────────────
+            if perc['table_plane'] is not None:
+                model   = perc['table_plane']['model']
+                inliers = perc['table_plane']['num_inliers']
+                if abs(model[2]) > 0.7 and inliers > 200:
+                    self.table_plane_model = model
+                    if self.step_counter % 240 == 0:
+                        print(f"[M4-RANSAC] Table plane confirmed: "
+                              f"A={model[0]:.3f} B={model[1]:.3f} "
+                              f"C={model[2]:.3f} D={model[3]:.3f} "
+                              f"({inliers} inliers)")
+
+            # ── B) PCA target pose from object point cloud ─────────────────
+            if perc['target_pose'] is not None:
+                pca = perc['target_pose']
+                self.pca_target_pose = pca
+                if self.step_counter % 240 == 0:
+                    print(f"[M4-PCA] Object cloud centre (cam-frame): "
+                          f"{[f'{v:.3f}' for v in pca['center']]}, "
+                          f"dims={[f'{v:.3f}' for v in pca['dimensions']]}")
+
+            # ── C) Obstacle poses from PCA (blue/pink/orange/yellow/black) ─
+            if perc['obstacle_poses'] and self.step_counter % 240 == 0:
+                for op in perc['obstacle_poses']:
+                    print(f"[M4-PCA] Obstacle '{op['color']}' centre: "
+                          f"{[f'{v:.3f}' for v in op['center']]}")
+
+            # ── D) Color detection → target position ──────────────────────
+            rgb_array  = np.reshape(rgb, (240, 320, 4)).astype(np.uint8)
+            bgr        = cv2.cvtColor(rgb_array, cv2.COLOR_RGBA2BGR)
+            detections = perc['detections']
+
+            if self.step_counter % 240 == 0 and detections:
+                print(f"[M4-Color] {len(detections)} detections: "
+                      f"{[d['color'] for d in detections]}")
+
+            # ── E) Edge/contour segmentation feedback ─────────────────────
+            if self.step_counter % 240 == 0:
+                depth_arr  = np.array(depth).reshape(240, 320)
+                seg_mask, edge_map = edge_contour_segmentation(
+                    bgr, min_contour_area=300)
+                n_seg = int(np.sum(seg_mask > 0))
+                n_edg = int(np.sum(edge_map > 0))
+                print(f"[M4-Edge] seg_pixels={n_seg}, edge_pixels={n_edg}")
+
+            # ── F) Red target → world position ────────────────────────────
+            depth_arr = np.array(depth).reshape(240, 320)
+            red_dets  = sorted(
+                [d for d in detections if d['color'] == TARGET_COLOR],
+                key=lambda d: d['area'], reverse=True
+            )
+
+            for det in red_dets[:1]:
+                x, y, w, h = det['bbox']
+                cx_px  = int(x + w / 2)
+                cy_px  = int(y + h / 2)
+
+                if not (0 <= cy_px < 240 and 0 <= cx_px < 320):
+                    continue
+
+                raw_d = depth_arr[cy_px, cx_px]
+                if raw_d <= 0 or raw_d >= 1.0:
+                    continue
+                true_d = DEPTH_FAR * DEPTH_NEAR / (
+                    DEPTH_FAR - (DEPTH_FAR - DEPTH_NEAR) * raw_d)
+
+                if not (MIN_TARGET_DEPTH < true_d < MAX_TARGET_DEPTH):
+                    continue
+                if np.isnan(true_d) or np.isinf(true_d):
+                    continue
+
+                # FIX 3a: block cold-start EMA on far/uncertain readings
+                if self.target_position_smoothed is None and true_d > 2.5:
+                    continue
+
+                bearing = math.atan2(-(cx_px - CAM_CX), CAM_FX)
+                wp      = self._pixel_depth_to_world(cx_px, cy_px,
+                                                     true_d, estimated_pose)
+
+                # FIX 3b: reject detections geometrically far from known table
+                if self.table_position is not None:
+                    dist_to_table = np.hypot(wp[0] - self.table_position[0],
+                                             wp[1] - self.table_position[1])
+                    if dist_to_table > 1.5:
+                        if self.step_counter % 60 == 0:
+                            print(f"[M4] Rejected detection at "
+                                  f"({wp[0]:.2f},{wp[1]:.2f}) – "
+                                  f"{dist_to_table:.2f}m from table")
+                        continue
+
+                # ── G) Prefer PCA-refined 3-D centre when available ────────
+                if self.pca_target_pose is not None:
+                    pca_c      = self.pca_target_pose['center']
+                    pca_body_x = pca_c[2] + CAMERA_FORWARD
+                    pca_body_y = -pca_c[0]
+                    rx, ry, rt = estimated_pose
+                    pca_wx     = rx + pca_body_x*math.cos(rt) - pca_body_y*math.sin(rt)
+                    pca_wy     = ry + pca_body_x*math.sin(rt) + pca_body_y*math.cos(rt)
+                    pca_wz     = CAMERA_HEIGHT - pca_c[1]
+                    pca_world  = [pca_wx, pca_wy, pca_wz]
+                    diff = np.hypot(pca_world[0]-wp[0], pca_world[1]-wp[1])
+                    if diff < 0.5:
+                        wp = pca_world
+                        if self.step_counter % 60 == 0:
+                            print(f"[M4-PCA] Using PCA target centre: "
+                                  f"({wp[0]:.2f}, {wp[1]:.2f}, {wp[2]:.2f})")
+
+                accepted = self._update_target_from_detection(wp, true_d, bearing)
+                if accepted and self.step_counter % 10 == 0:
+                    print(f"[CogArch] TARGET DETECTED at "
+                          f"({wp[0]:.2f}, {wp[1]:.2f}, {wp[2]:.2f}), "
+                          f"depth={true_d:.2f}m")
+                break
+
+        # M3: touch sensor
         gripper_contact = self._check_gripper_contact()
-        
+
         return {
-            'pose': estimated_pose,
-            'rgb': rgb,
-            'depth': depth,
-            'lidar': lidar,
-            'imu': imu,
-            'joint_states': joint_states,
-            'target_detected': self.target_position is not None,
-            'target_position': self.target_position,
+            'pose':                  estimated_pose,
+            'rgb':                   rgb,
+            'depth':                 depth,
+            'lidar':                 lidar,
+            'imu':                   imu,
+            'joint_states':          joint_states,
+            'target_detected':       self.target_position is not None,
+            'target_position':       self.target_position,
             'target_camera_bearing': self.target_camera_bearing,
-            'target_camera_depth': self.target_camera_depth,
-            'gripper_contact': gripper_contact
+            'target_camera_depth':   self.target_camera_depth,
+            'gripper_contact':       gripper_contact,
+            'perception':            self.last_perception_result,
         }
-    
-    # ==================== THINK ====================
+
+    # ══════════════════════════════ THINK ════════════════════════════════════
+
     def think(self, sensor_data):
-        """
-        THINK phase: Process sensor data, update knowledge, plan actions.
-        Uses M8 Knowledge Base for reasoning and M7 FSM for state management.
-        Returns control commands for ACT phase.
-        """
+        """THINK phase: FSM update + action planning."""
         pose = sensor_data['pose']
-        
-        # M8: Query knowledge base for target position
+
+        if self.fsm.state != RobotState.FAILURE:
+            self._failure_reset_done = False
+
+        # M8: query KB for target (sensor override if fresher)
         target_pos = self.kb.query_position('target')
-        
-        # Override with sensor data if available (more recent)
         if sensor_data['target_detected']:
             target_pos = sensor_data['target_position']
-        
-        # M8: Check if target is the goal object (Prolog reasoning)
+
+        # M8: Prolog reasoning log
         if target_pos and self.step_counter % 240 == 0:
-            is_goal = self.kb.is_goal_object('target')
-            can_grasp = self.kb.check_can_grasp()
-            if is_goal:
-                print(f"[M8-KB] Target confirmed as goal object (red)")
-            if can_grasp:
-                print(f"[M8-KB] Prolog confirms: robot can grasp target")
-        
-        # Calculate 2D horizontal distance to target
+            try:
+                if self.kb.is_goal_object('target'):
+                    print("[M8-KB] Target confirmed as goal object (red)")
+                if self.kb.check_can_grasp():
+                    print("[M8-KB] Prolog confirms: robot can grasp target")
+            except Exception:
+                pass
+
+        # Distance computation
         if target_pos:
-            dx = target_pos[0] - pose[0]
-            dy = target_pos[1] - pose[1]
-            distance_2d = np.sqrt(dx**2 + dy**2)
-            
-            # Compute standoff as soon as we know the target
+            dx, dy      = target_pos[0]-pose[0], target_pos[1]-pose[1]
+            distance_2d = np.hypot(dx, dy)
             if self.approach_standoff is None:
                 self.approach_standoff = self._compute_approach_standoff(
-                    target_pos, pose
-                )
+                    target_pos, pose)
                 print(f"[CogArch] Computed approach standoff: "
-                      f"({self.approach_standoff[0]:.2f}, {self.approach_standoff[1]:.2f})")
-            
-            # Use camera depth for FSM distance during NAVIGATE and APPROACH
-            # Camera depth is a direct measurement - no state estimation drift
-            cam_depth = sensor_data.get('target_camera_depth', float('inf'))
-            if cam_depth < 10.0 and self.fsm.state in (RobotState.NAVIGATE, RobotState.APPROACH):
-                distance_for_fsm = cam_depth
-            elif self.approach_standoff is not None and self.fsm.state == RobotState.NAVIGATE:
-                sdx = self.approach_standoff[0] - pose[0]
-                sdy = self.approach_standoff[1] - pose[1]
-                distance_for_fsm = np.sqrt(sdx**2 + sdy**2)
+                      f"({self.approach_standoff[0]:.2f}, "
+                      f"{self.approach_standoff[1]:.2f})")
+            cam_d = sensor_data.get('target_camera_depth', float('inf'))
+            if cam_d < MAX_TARGET_DEPTH and self.fsm.state in (
+                    RobotState.NAVIGATE, RobotState.APPROACH):
+                distance_for_fsm = cam_d
+            elif (self.approach_standoff is not None and
+                  self.fsm.state == RobotState.NAVIGATE):
+                sdx = self.approach_standoff[0]-pose[0]
+                sdy = self.approach_standoff[1]-pose[1]
+                distance_for_fsm = np.hypot(sdx, sdy)
             else:
                 distance_for_fsm = distance_2d
         else:
-            distance_2d = float('inf')
-            distance_for_fsm = float('inf')
-        
-        # M7: Update FSM with sensor feedback
-        fsm_sensor_data = {
-            'target_visible': sensor_data['target_detected'],
-            'target_position': target_pos,
+            distance_2d = distance_for_fsm = float('inf')
+
+        # M7: FSM update
+        self.fsm.update({
+            'target_visible':     sensor_data['target_detected'],
+            'target_position':    target_pos,
             'distance_to_target': distance_for_fsm,
             'collision_detected': False,
-            'gripper_contact': sensor_data.get('gripper_contact', False),
-            'object_grasped': sensor_data.get('gripper_contact', False),
-            'estimated_pose': pose
-        }
-        
-        self.fsm.update(fsm_sensor_data)
-        
-        # M7: Action planning based on FSM state
-        control_commands = {
-            'mode': 'idle',
-            'target': None,
-            'gripper': 'open'
-        }
-        
+            'gripper_contact':    sensor_data.get('gripper_contact', False),
+            'object_grasped':     sensor_data.get('gripper_contact', False),
+            'estimated_pose':     pose,
+        })
+
+        ctrl = {'mode': 'idle', 'target': None, 'gripper': 'open'}
+
+        # ── SEARCH ────────────────────────────────────────────────────────
         if self.fsm.state == RobotState.SEARCH:
-            # If table position is known, navigate toward it while searching
             if self.table_position:
-                table_dx = self.table_position[0] - pose[0]
-                table_dy = self.table_position[1] - pose[1]
-                table_dist = np.hypot(table_dx, table_dy)
-                
-                if table_dist < 2.0:
-                    # Close to table: orbit around it to scan all sides
-                    control_commands = {
-                        'mode': 'search_orbit',
-                        'table_pos': self.table_position[:2],
-                        'pose': pose,
-                        'orbit_radius': 2.0,
-                        'lidar': sensor_data['lidar']
-                    }
+                td = np.hypot(self.table_position[0]-pose[0],
+                              self.table_position[1]-pose[1])
+                if td < 2.0:
+                    ctrl = {'mode': 'search_orbit',
+                            'table_pos': self.table_position[:2],
+                            'pose': pose, 'orbit_radius': 2.0,
+                            'lidar': sensor_data['lidar']}
                 else:
-                    control_commands = {
-                        'mode': 'search_approach',
-                        'target': self.table_position[:2],
-                        'pose': pose,
-                        'angular_vel': 2.0,
-                        'lidar': sensor_data['lidar']
-                    }
+                    ctrl = {'mode': 'search_approach',
+                            'target': self.table_position[:2],
+                            'pose': pose, 'angular_vel': 2.0,
+                            'lidar': sensor_data['lidar']}
             else:
-                control_commands = {
-                    'mode': 'search_rotate',
-                    'angular_vel': 3.0
-                }
-            
+                ctrl = {'mode': 'search_rotate', 'angular_vel': 3.0}
+
+        # ── NAVIGATE ──────────────────────────────────────────────────────
         elif self.fsm.state == RobotState.NAVIGATE:
-            cam_depth = sensor_data.get('target_camera_depth', float('inf'))
-            # Use relaxed avoidance when target is visible nearby (near the table)
-            # This reduces table keepout from 0.6m to 0.2m so we can approach
-            use_relaxed = cam_depth < 2.5 and sensor_data['target_detected']
-            self._in_approach = False  # reset approach depth smoother flag
-            
-            # Waypoint navigation toward standoff position
-            nav_goal = self.approach_standoff if self.approach_standoff else (
-                target_pos[:2] if target_pos else None
-            )
+            cam_d       = sensor_data.get('target_camera_depth', float('inf'))
+            use_relaxed = cam_d < 2.5 and sensor_data['target_detected']
+            self._in_approach = False
+            nav_goal    = (self.approach_standoff or
+                           (target_pos[:2] if target_pos else None))
             if nav_goal and self.current_waypoint is None:
-                self.action_planner.create_plan(
-                    pose[:2], nav_goal, self.obstacles
-                )
+                self.action_planner.create_plan(pose[:2], nav_goal, self.obstacles)
                 self.current_waypoint = self.action_planner.get_next_waypoint()
-                
             if self.current_waypoint:
-                control_commands = {
-                    'mode': 'navigate',
-                    'target': self.current_waypoint,
-                    'pose': pose,
-                    'lidar': sensor_data['lidar'],
-                    'relaxed_avoidance': use_relaxed
-                }
-                
-                # Check if waypoint reached
-                dist = np.hypot(self.current_waypoint[0] - pose[0],
-                               self.current_waypoint[1] - pose[1])
-                if dist < 0.3:
+                ctrl = {'mode': 'navigate', 'target': self.current_waypoint,
+                        'pose': pose, 'lidar': sensor_data['lidar'],
+                        'relaxed_avoidance': use_relaxed}
+                if np.hypot(self.current_waypoint[0]-pose[0],
+                            self.current_waypoint[1]-pose[1]) < 0.3:
                     self.action_planner.advance_waypoint()
                     self.current_waypoint = self.action_planner.get_next_waypoint()
-                    
+
+        # ── APPROACH ──────────────────────────────────────────────────────
         elif self.fsm.state == RobotState.APPROACH:
-            # Reset depth smoother on first approach tick
-            if not hasattr(self, '_in_approach') or not self._in_approach:
+            if not getattr(self, '_in_approach', False):
                 self._approach_depth_smooth = float('inf')
-                self._in_approach = True
+                self._in_approach           = True
             if target_pos:
-                # During approach, use camera-relative visual servoing for reactive control
-                control_commands = {
-                    'mode': 'approach_visual',
-                    'target': target_pos[:2],
-                    'pose': pose,
-                    'lidar': sensor_data['lidar'],
-                    'relaxed_avoidance': True,
-                    'camera_bearing': sensor_data.get('target_camera_bearing', 0.0),
-                    'camera_depth': sensor_data.get('target_camera_depth', float('inf'))
-                }
-                
+                ctrl = {'mode': 'approach_visual',
+                        'target': target_pos[:2], 'pose': pose,
+                        'lidar': sensor_data['lidar'],
+                        'relaxed_avoidance': True,
+                        'camera_bearing': sensor_data.get('target_camera_bearing', 0.0),
+                        'camera_depth':   sensor_data.get('target_camera_depth', float('inf'))}
+
+        # ── GRASP ─────────────────────────────────────────────────────────
         elif self.fsm.state == RobotState.GRASP:
             if target_pos:
-                grasp_plan = self.grasp_planner.plan_grasp(target_pos)
-                grasp_time = self.fsm.get_time_in_state()
-                
-                # Multi-phase grasp sequence (20s total timeout)
-                if grasp_time < 2.5:
-                    phase = 'reach_above'   # Open gripper, raise lift, IK above target
-                elif grasp_time < 5.5:
-                    phase = 'reach_target'  # IK to grasp position, gripper still open
-                else:
-                    phase = 'close_gripper' # Close gripper on target
-                
-                control_commands = {
-                    'mode': 'grasp',
-                    'approach_pos': grasp_plan['approach_pos'],
-                    'grasp_pos': grasp_plan['grasp_pos'],
-                    'orientation': grasp_plan['orientation'],
-                    'phase': phase
-                }
-                
+                gp    = self.grasp_planner.plan_grasp(target_pos)
+                gt    = self.fsm.get_time_in_state()
+                phase = ('reach_above'   if gt < 2.5 else
+                         'reach_target'  if gt < 5.5 else
+                         'close_gripper')
+                ctrl = {'mode': 'grasp',
+                        'approach_pos': gp['approach_pos'],
+                        'grasp_pos':    gp['grasp_pos'],
+                        'orientation':  gp['orientation'],
+                        'phase':        phase}
+
+        # ── LIFT ──────────────────────────────────────────────────────────
         elif self.fsm.state == RobotState.LIFT:
-            control_commands = {
-                'mode': 'lift',
-                'lift_height': 0.2,
-                'gripper': 'close'
-            }
-            
+            ctrl = {'mode': 'lift', 'lift_height': 0.2, 'gripper': 'close'}
+
+        # ── SUCCESS ───────────────────────────────────────────────────────
         elif self.fsm.state == RobotState.SUCCESS:
-            control_commands = {
-                'mode': 'success',
-                'gripper': 'close'
-            }
-            
+            ctrl = {'mode': 'success', 'gripper': 'close'}
+
+        # ── FAILURE ───────────────────────────────────────────────────────
         elif self.fsm.state == RobotState.FAILURE:
-            # Reset standoff, waypoint, and target smoothing so new ones are computed on retry
-            self.approach_standoff = None
-            self.current_waypoint = None
-            self.target_position_smoothed = None
-            self.target_detection_count = 0
-            control_commands = {
-                'mode': 'failure',
-                'gripper': 'open',
-                'lidar': sensor_data['lidar']
-            }
-        
-        return control_commands
-    
-    # ==================== ACT ====================
+            if not self._failure_reset_done:
+                self.approach_standoff        = None
+                self.current_waypoint         = None
+                self.target_position_smoothed = None
+                self.target_detection_count   = 0
+                self.pca_target_pose          = None
+                self.table_plane_model        = None
+                self._failure_reset_done      = True
+            ctrl = {'mode': 'failure', 'gripper': 'open',
+                    'lidar': sensor_data['lidar']}
+
+        return ctrl
+
+    # ══════════════════════════════ ACT ══════════════════════════════════════
+
     def _stow_arm(self):
-        """Hold arm joints at stowed (zero) positions to prevent flailing during driving."""
-        for joint_idx in self.arm_joints:
-            p.setJointMotorControl2(self.robot_id, joint_idx,
-                                   p.POSITION_CONTROL,
-                                   targetPosition=0.0, force=500,
-                                   maxVelocity=2.0)
-    
-    def act(self, control_commands):
-        """
-        ACT phase: Execute motion commands on the robot.
-        """
-        mode = control_commands.get('mode', 'idle')
-        
-        # Stow arm during all non-grasp/lift modes to prevent spinning
+        for j in self.arm_joints:
+            p.setJointMotorControl2(self.robot_id, j, p.POSITION_CONTROL,
+                                    targetPosition=0.0, force=500, maxVelocity=2.0)
+
+    def _set_wheels(self, left, right):
+        for i in [0, 2]:
+            p.setJointMotorControl2(self.robot_id, i, p.VELOCITY_CONTROL,
+                                    targetVelocity=left,  force=5000)
+        for i in [1, 3]:
+            p.setJointMotorControl2(self.robot_id, i, p.VELOCITY_CONTROL,
+                                    targetVelocity=right, force=5000)
+
+    def act(self, ctrl):
+        mode = ctrl.get('mode', 'idle')
         if mode not in ('grasp', 'lift', 'success'):
             self._stow_arm()
-        
+
+        # ── search: rotate in place ────────────────────────────────────────
         if mode == 'search_rotate':
-            # Rotate in place to search for target
-            angular_vel = control_commands.get('angular_vel', 3.0)
+            av = ctrl.get('angular_vel', 3.0)
             if self.step_counter % 240 == 0:
-                print(f"[Act] SEARCH: rotating at {angular_vel:.1f} rad/s")
-            
-            # Differential drive: left backward, right forward -> counter-clockwise
-            for i in [0, 2]:  # Left wheels
-                p.setJointMotorControl2(self.robot_id, i, p.VELOCITY_CONTROL,
-                                       targetVelocity=-angular_vel, force=5000)
-            for i in [1, 3]:  # Right wheels
-                p.setJointMotorControl2(self.robot_id, i, p.VELOCITY_CONTROL,
-                                       targetVelocity=angular_vel, force=5000)
-        
+                print(f"[Act] SEARCH rotate {av:.1f} rad/s")
+            self._set_wheels(-av, av)
+
+        # ── search: drive toward table ─────────────────────────────────────
         elif mode == 'search_approach':
-            # Navigate toward table while searching for red cylinder
-            target = control_commands['target']
-            pose = control_commands['pose']
-            lidar = control_commands.get('lidar')
-            
-            dx = target[0] - pose[0]
-            dy = target[1] - pose[1]
-            dist = np.hypot(dx, dy)
-            
-            angle_to_target = np.arctan2(dy, dx)
-            heading_error = angle_to_target - pose[2]
-            heading_error = np.arctan2(np.sin(heading_error), np.cos(heading_error))
-            
-            forward_vel = min(3.0, 2.0 * dist)
-            angular_vel = 4.0 * heading_error
-            
-            # M4: Lidar obstacle avoidance
-            forward_vel, avoidance_turn = self._get_lidar_obstacle_avoidance(
-                lidar, forward_vel, robot_pose=pose)
-            angular_vel += avoidance_turn
-            
-            left_vel = forward_vel - angular_vel
-            right_vel = forward_vel + angular_vel
-            
+            tgt, pose, lidar = ctrl['target'], ctrl['pose'], ctrl.get('lidar')
+            dx, dy   = tgt[0]-pose[0], tgt[1]-pose[1]
+            dist     = np.hypot(dx, dy)
+            he       = math.atan2(dy, dx) - pose[2]
+            he       = math.atan2(math.sin(he), math.cos(he))
+            fv       = min(3.0, 2.0*dist)
+            av       = 4.0*he
+            fv, at   = self._lidar_avoidance(lidar, fv, pose=pose)
+            av      += at
             if self.step_counter % 240 == 0:
-                print(f"[Act] SEARCH_APPROACH: dist={dist:.2f}m, heading={np.degrees(heading_error):.0f} deg")
-            
-            for i in [0, 2]:
-                p.setJointMotorControl2(self.robot_id, i, p.VELOCITY_CONTROL,
-                                       targetVelocity=left_vel, force=5000)
-            for i in [1, 3]:
-                p.setJointMotorControl2(self.robot_id, i, p.VELOCITY_CONTROL,
-                                       targetVelocity=right_vel, force=5000)
-        
+                print(f"[Act] SEARCH_APPROACH: dist={dist:.2f}m, "
+                      f"heading={np.degrees(he):.0f} deg")
+            self._set_wheels(fv-av, fv+av)
+
+        # ── search: orbit table ────────────────────────────────────────────
         elif mode == 'search_orbit':
-            # Orbit around the table at a fixed radius to scan all sides
-            table_pos = control_commands['table_pos']
-            pose = control_commands['pose']
-            orbit_radius = control_commands.get('orbit_radius', 2.0)
-            lidar = control_commands.get('lidar')
-            
-            dx = pose[0] - table_pos[0]
-            dy = pose[1] - table_pos[1]
-            current_dist = np.hypot(dx, dy)
-            
-            # Desired tangent direction (counter-clockwise orbit)
-            angle_from_table = np.arctan2(dy, dx)
-            tangent_angle = angle_from_table + np.pi / 2  # perpendicular, CCW
-            
-            # Radial correction to maintain orbit radius
-            radial_error = current_dist - orbit_radius
-            correction_angle = angle_from_table + np.pi  # toward table
-            
-            # Blend tangent and radial correction
-            desired_angle = tangent_angle + 0.5 * radial_error
-            heading_error = desired_angle - pose[2]
-            heading_error = np.arctan2(np.sin(heading_error), np.cos(heading_error))
-            
-            forward_vel = 2.0
-            angular_vel = 4.0 * heading_error
-            
-            # M4: Lidar obstacle avoidance
-            forward_vel, avoidance_turn = self._get_lidar_obstacle_avoidance(
-                lidar, forward_vel, robot_pose=pose)
-            angular_vel += avoidance_turn
-            
-            left_vel = forward_vel - angular_vel
-            right_vel = forward_vel + angular_vel
-            
+            tp, pose = ctrl['table_pos'], ctrl['pose']
+            r_orb    = ctrl.get('orbit_radius', 2.0)
+            lidar    = ctrl.get('lidar')
+            dx, dy   = pose[0]-tp[0], pose[1]-tp[1]
+            cur_r    = np.hypot(dx, dy)
+            ang_ft   = math.atan2(dy, dx)
+            tangent  = ang_ft + math.pi/2
+            rerr     = cur_r - r_orb
+            desired  = tangent + 0.5*rerr
+            he       = math.atan2(math.sin(desired-pose[2]), math.cos(desired-pose[2]))
+            fv       = 2.0
+            av       = 4.0*he
+            fv, at   = self._lidar_avoidance(lidar, fv, pose=pose)
+            av      += at
             if self.step_counter % 240 == 0:
-                print(f"[Act] SEARCH_ORBIT: r={current_dist:.2f}m (target={orbit_radius:.1f}m)")
-            
-            for i in [0, 2]:
-                p.setJointMotorControl2(self.robot_id, i, p.VELOCITY_CONTROL,
-                                       targetVelocity=left_vel, force=5000)
-            for i in [1, 3]:
-                p.setJointMotorControl2(self.robot_id, i, p.VELOCITY_CONTROL,
-                                       targetVelocity=right_vel, force=5000)
-                                       
-        elif mode in ['navigate', 'approach']:
-            # M6: Navigate using differential drive with PID
-            target = control_commands['target']
-            pose = control_commands['pose']
-            lidar = control_commands.get('lidar')
-            
-            dx = target[0] - pose[0]
-            dy = target[1] - pose[1]
-            dist = np.hypot(dx, dy)
-            
-            angle_to_target = np.arctan2(dy, dx)
-            heading_error = angle_to_target - pose[2]
-            heading_error = np.arctan2(np.sin(heading_error), np.cos(heading_error))
-            
-            # Speed control
-            if mode == 'approach':
-                max_speed = 5.0
-                kp_dist = 3.0
-                kp_angle = 5.0
-            else:
-                max_speed = 5.0
-                kp_dist = 4.0
-                kp_angle = 5.0
-            
-            forward_vel = np.clip(kp_dist * dist, 0, max_speed)
-            angular_vel = kp_angle * heading_error
-            
-            # M4: Lidar obstacle avoidance (relaxed near table during approach)
-            relaxed = control_commands.get('relaxed_avoidance', False)
-            forward_vel, avoidance_turn = self._get_lidar_obstacle_avoidance(
-                lidar, forward_vel, relaxed=relaxed, robot_pose=pose)
-            angular_vel += avoidance_turn
-            
-            left_vel = forward_vel - angular_vel
-            right_vel = forward_vel + angular_vel
-            
+                print(f"[Act] ORBIT r={cur_r:.2f}m (target {r_orb:.1f}m)")
+            self._set_wheels(fv-av, fv+av)
+
+        # ── navigate / approach (waypoint) ────────────────────────────────
+        elif mode in ('navigate', 'approach'):
+            tgt, pose = ctrl['target'], ctrl['pose']
+            lidar     = ctrl.get('lidar')
+            dx, dy    = tgt[0]-pose[0], tgt[1]-pose[1]
+            dist      = np.hypot(dx, dy)
+            he        = math.atan2(dy, dx) - pose[2]
+            he        = math.atan2(math.sin(he), math.cos(he))
+            kpd       = 4.0 if mode == 'navigate' else 3.0
+            fv        = np.clip(kpd*dist, 0, 5.0)
+            av        = 5.0*he
+            relaxed   = ctrl.get('relaxed_avoidance', False)
+            fv, at    = self._lidar_avoidance(lidar, fv, relaxed=relaxed, pose=pose)
+            av       += at
             if self.step_counter % 240 == 0:
-                print(f"[Act] {mode.upper()}: dist={dist:.2f}m, heading={np.degrees(heading_error):.0f} deg, "
-                      f"fwd={forward_vel:.1f}, turn={angular_vel:.1f}")
-            
-            for i in [0, 2]:
-                p.setJointMotorControl2(self.robot_id, i, p.VELOCITY_CONTROL,
-                                       targetVelocity=left_vel, force=5000)
-            for i in [1, 3]:
-                p.setJointMotorControl2(self.robot_id, i, p.VELOCITY_CONTROL,
-                                       targetVelocity=right_vel, force=5000)
-        
+                print(f"[Act] {mode.upper()}: dist={dist:.2f}m, "
+                      f"heading={np.degrees(he):.0f} deg, "
+                      f"fwd={fv:.1f}, turn={av:.1f}")
+            self._set_wheels(fv-av, fv+av)
+
+        # ── visual servoing approach ───────────────────────────────────────
         elif mode == 'approach_visual':
-            # M6: Reactive visual servoing - steer using camera pixel offset
-            # Bypasses state estimation heading drift for approach accuracy
-            camera_bearing = control_commands.get('camera_bearing', 0.0)
-            camera_depth = control_commands.get('camera_depth', float('inf'))
-            lidar = control_commands.get('lidar')
-            pose = control_commands.get('pose')
-            
-            # Smooth depth to avoid jumps (e.g. detection flicker to far pixel)
+            bearing   = ctrl.get('camera_bearing', 0.0)
+            cam_depth = ctrl.get('camera_depth', float('inf'))
+            lidar     = ctrl.get('lidar')
+            pose      = ctrl.get('pose')
             if not hasattr(self, '_approach_depth_smooth'):
-                self._approach_depth_smooth = camera_depth
-            # Only allow depth to INCREASE slowly (prevents overshoot on flicker)
-            if camera_depth < self._approach_depth_smooth:
-                self._approach_depth_smooth = camera_depth  # trust closer readings immediately
+                self._approach_depth_smooth = cam_depth
+            if cam_depth < self._approach_depth_smooth:
+                self._approach_depth_smooth = cam_depth
             else:
-                self._approach_depth_smooth = 0.7 * self._approach_depth_smooth + 0.3 * camera_depth
-            smooth_depth = self._approach_depth_smooth
-            
-            # Use camera bearing directly for steering (no state estimation needed)
-            kp_bearing = 8.0
-            max_speed = 4.0   # gentler max speed during approach
-            kp_dist = 3.0
-            
-            forward_vel = np.clip(kp_dist * smooth_depth, 0.5, max_speed)
-            angular_vel = kp_bearing * camera_bearing
-            
-            # Slow down progressively when close
-            if smooth_depth < 1.0:
-                forward_vel = np.clip(2.0 * smooth_depth, 0.3, 2.0)
-            
-            # M4: Lidar obstacle avoidance - only use when far from target
-            # When close to target, lidar seeing the table pushes robot sideways
-            if smooth_depth > 1.5:
-                forward_vel, avoidance_turn = self._get_lidar_obstacle_avoidance(
-                    lidar, forward_vel, relaxed=True, robot_pose=pose)
-                angular_vel += avoidance_turn
+                self._approach_depth_smooth = (0.7*self._approach_depth_smooth
+                                               + 0.3*cam_depth)
+            sd  = self._approach_depth_smooth
+            fv  = np.clip(3.0*sd, 0.5, 4.0)
+            if sd < 1.0:
+                fv = np.clip(2.0*sd, 0.3, 2.0)
+            av  = 8.0*bearing
+            if sd > 1.5:
+                fv, at = self._lidar_avoidance(lidar, fv, relaxed=True, pose=pose)
+                av    += at
             else:
-                # Emergency braking only: hard-stop if obstacle very close ahead
-                if lidar is not None and len(lidar) > 0:
-                    num_rays_l = len(lidar)
-                    front_idx = [i % num_rays_l for i in range(-2, 3)]
-                    min_front_dist = min(lidar[i] for i in front_idx)
-                    if min_front_dist < 0.15:
-                        forward_vel = 0.0  # Emergency stop
-            
-            left_vel = forward_vel - angular_vel
-            right_vel = forward_vel + angular_vel
-            
+                if lidar:
+                    mf = min(lidar[i % len(lidar)] for i in range(-2, 3))
+                    if mf < 0.15:
+                        fv = 0.0
             if self.step_counter % 240 == 0:
-                print(f"[Act] APPROACH_VISUAL: depth={camera_depth:.2f}m, bearing={np.degrees(camera_bearing):.0f} deg, "
-                      f"fwd={forward_vel:.1f}, turn={angular_vel:.1f}")
-            
-            for i in [0, 2]:
-                p.setJointMotorControl2(self.robot_id, i, p.VELOCITY_CONTROL,
-                                       targetVelocity=left_vel, force=5000)
-            for i in [1, 3]:
-                p.setJointMotorControl2(self.robot_id, i, p.VELOCITY_CONTROL,
-                                       targetVelocity=right_vel, force=5000)
-                                       
+                print(f"[Act] APPROACH_VISUAL: depth={cam_depth:.2f}m, "
+                      f"bearing={np.degrees(bearing):.0f} deg, "
+                      f"fwd={fv:.1f}, turn={av:.1f}")
+            self._set_wheels(fv-av, fv+av)
+
+        # ── grasp sequence ────────────────────────────────────────────────
         elif mode == 'grasp':
-            # M6: Stop wheels, multi-phase arm control for grasping
-            for i in self.wheel_joints:
-                p.setJointMotorControl2(self.robot_id, i, p.VELOCITY_CONTROL,
-                                       targetVelocity=0, force=5000)
-            
-            phase = control_commands.get('phase', 'close_gripper')
-            approach_pos = control_commands['approach_pos']
-            grasp_pos = control_commands['grasp_pos']
-            orientation = control_commands['orientation']
-            orn_quat = p.getQuaternionFromEuler(orientation)
-            
-            # Raise lift joint to bring arm near table height (all phases)
+            self._set_wheels(0, 0)
+            phase = ctrl.get('phase', 'close_gripper')
+            ap    = ctrl['approach_pos']
+            gpos  = ctrl['grasp_pos']
+            orn   = p.getQuaternionFromEuler(ctrl['orientation'])
             if self.lift_joint_idx is not None:
                 p.setJointMotorControl2(self.robot_id, self.lift_joint_idx,
-                                       p.POSITION_CONTROL,
-                                       targetPosition=0.3,  # Max lift
-                                       force=100, maxVelocity=0.5)
-            
-            if phase == 'reach_above':
-                # Phase 1: Open gripper, IK arm to position above target
-                if self.step_counter % 120 == 0:
-                    print(f"[Act] GRASP phase 1: reaching above target at {approach_pos}")
-                grasp_object(self.robot_id, approach_pos, orn_quat,
-                             arm_joints=self.arm_joints if self.arm_joints else None,
-                             close_gripper=False)
-            
-            elif phase == 'reach_target':
-                # Phase 2: IK arm down to grasp position, gripper still open
-                if self.step_counter % 120 == 0:
-                    print(f"[Act] GRASP phase 2: lowering to target at {grasp_pos}")
-                grasp_object(self.robot_id, grasp_pos, orn_quat,
-                             arm_joints=self.arm_joints if self.arm_joints else None,
-                             close_gripper=False)
-            
-            elif phase == 'close_gripper':
-                # Phase 3: Hold arm at grasp position and close gripper
-                if self.step_counter % 120 == 0:
-                    print("[Act] GRASP phase 3: closing gripper")
-                grasp_object(self.robot_id, grasp_pos, orn_quat,
-                             arm_joints=self.arm_joints if self.arm_joints else None,
-                             close_gripper=True)
-            
-        elif mode == 'lift':
-            # M6: Stop wheels, keep gripper closed, raise lift joint
-            for i in self.wheel_joints:
-                p.setJointMotorControl2(self.robot_id, i, p.VELOCITY_CONTROL,
-                                       targetVelocity=0, force=5000)
-            
-            # Keep gripper closed
-            for finger_idx in self.gripper_joints:
-                joint_info = p.getJointInfo(self.robot_id, finger_idx)
-                joint_name = joint_info[1].decode('utf-8')
-                if 'left' in joint_name:
-                    target_pos = -0.04
-                else:
-                    target_pos = 0.04
-                p.setJointMotorControl2(self.robot_id, finger_idx,
-                                       p.POSITION_CONTROL,
-                                       targetPosition=target_pos, force=50)
-            
-            # Raise lift joint
-            if self.lift_joint_idx is not None:
-                p.setJointMotorControl2(self.robot_id, self.lift_joint_idx,
-                                       p.POSITION_CONTROL,
-                                       targetPosition=0.3,  # Max lift
-                                       force=100, maxVelocity=0.5)
-            
+                                        p.POSITION_CONTROL,
+                                        targetPosition=0.3, force=100,
+                                        maxVelocity=0.5)
+            close = (phase == 'close_gripper')
+            tgt_p = ap if phase == 'reach_above' else gpos
             if self.step_counter % 120 == 0:
-                print("[Act] LIFT: Raising object")
-            
-        elif mode in ['idle', 'success', 'failure']:
+                print(f"[Act] GRASP phase={phase}")
+            grasp_object(self.robot_id, tgt_p, orn,
+                         arm_joints=self.arm_joints or None,
+                         close_gripper=close)
+
+        # ── lift ──────────────────────────────────────────────────────────
+        elif mode == 'lift':
+            self._set_wheels(0, 0)
+            for fi in self.gripper_joints:
+                jn = p.getJointInfo(self.robot_id, fi)[1].decode('utf-8')
+                tp = -0.04 if 'left' in jn else 0.04
+                p.setJointMotorControl2(self.robot_id, fi, p.POSITION_CONTROL,
+                                        targetPosition=tp, force=50)
+            if self.lift_joint_idx is not None:
+                p.setJointMotorControl2(self.robot_id, self.lift_joint_idx,
+                                        p.POSITION_CONTROL,
+                                        targetPosition=0.3, force=100,
+                                        maxVelocity=0.5)
+            if self.step_counter % 120 == 0:
+                print("[Act] LIFT: raising object")
+
+        # ── idle / success / failure ───────────────────────────────────────
+        elif mode in ('idle', 'success', 'failure'):
             if mode == 'failure':
-                # Back up to clear the table, stow arm, open gripper
                 if self.step_counter % 240 == 0:
-                    print("[Act] FAILURE: backing up, stowing arm, opening gripper")
-                
-                # Use lidar rear avoidance to prevent reversing into obstacles
-                lidar = control_commands.get('lidar')
-                reverse_vel = -3.0
-                if lidar is not None:
-                    reverse_vel, avoidance_turn = self._get_lidar_obstacle_avoidance(
-                        lidar, reverse_vel, relaxed=False, robot_pose=None)
-                else:
-                    avoidance_turn = 0.0
-                
-                left_vel = reverse_vel - avoidance_turn
-                right_vel = reverse_vel + avoidance_turn
-                
-                for i in [0, 2]:  # Left wheels
-                    p.setJointMotorControl2(self.robot_id, i, p.VELOCITY_CONTROL,
-                                           targetVelocity=left_vel, force=5000)
-                for i in [1, 3]:  # Right wheels
-                    p.setJointMotorControl2(self.robot_id, i, p.VELOCITY_CONTROL,
-                                           targetVelocity=right_vel, force=5000)
-                # Stow arm joints back to zero
-                for joint_idx in self.arm_joints:
-                    p.setJointMotorControl2(self.robot_id, joint_idx,
-                                           p.POSITION_CONTROL,
-                                           targetPosition=0.0, force=200,
-                                           maxVelocity=1.0)
-                # Lower lift
+                    print("[Act] FAILURE: backing up")
+                lidar  = ctrl.get('lidar')
+                rv     = -3.0
+                rv, at = self._lidar_avoidance(lidar, rv)
+                self._set_wheels(rv-at, rv+at)
+                for j in self.arm_joints:
+                    p.setJointMotorControl2(self.robot_id, j, p.POSITION_CONTROL,
+                                            targetPosition=0.0, force=200,
+                                            maxVelocity=1.0)
                 if self.lift_joint_idx is not None:
                     p.setJointMotorControl2(self.robot_id, self.lift_joint_idx,
-                                           p.POSITION_CONTROL,
-                                           targetPosition=0.0, force=100,
-                                           maxVelocity=0.5)
-                # Open gripper
-                for finger_idx in self.gripper_joints:
-                    p.setJointMotorControl2(self.robot_id, finger_idx,
-                                           p.POSITION_CONTROL,
-                                           targetPosition=0.0, force=50)
+                                            p.POSITION_CONTROL,
+                                            targetPosition=0.0, force=100,
+                                            maxVelocity=0.5)
+                for fi in self.gripper_joints:
+                    p.setJointMotorControl2(self.robot_id, fi, p.POSITION_CONTROL,
+                                            targetPosition=0.0, force=50)
             else:
-                # Idle/Success: stop all wheels  
                 for i in self.wheel_joints:
                     p.setJointMotorControl2(self.robot_id, i, p.VELOCITY_CONTROL,
-                                           targetVelocity=0, force=1500)
+                                            targetVelocity=0, force=1500)
 
+
+# ══════════════════════════════════ MAIN ═════════════════════════════════════
 
 def main():
     print("="*60)

@@ -10,14 +10,13 @@ FIX HISTORY:
   F32 - IK XY from ground-truth (tx,ty); orientation [0,0,0]
   F33 - lift=0.0 during grasp; IK EE=link15 (wrist_roll, movable);
         Z offset +0.075 for palm length inside grasp_object().
-  F34 - STABLE SPAWN FIX:
-        p.resetJointState() called on EVERY non-fixed joint immediately
-        after teleport, BEFORE any p.stepSimulation(). This is
-        instantaneous (no physics) and puts the robot in a tucked,
-        stable config so it doesn't tip over on spawn.
-        Tuck config: lift=0, shoulder=-0.3 (arm back), elbow=0.5 (folded),
-        others=0. CoM stays over wheels.
-        Robot spawn Z raised to 0.15 for settle clearance.
+  F34 - resetJointState before stepSimulation (non-zero tuck -> EXPLOSION)
+  F35 - resetJointState ALL joints to 0.0 ONLY.
+        Non-zero values (shoulder=-0.3, elbow=0.5) cause PyBullet
+        constraint solver to fire huge corrective impulses on step 1
+        -> robot launches to Z=5m. Arm at all-zeros is straight UP,
+        CoM directly above base -> perfectly stable on spawn.
+        Spawn Z back to 0.1. Settle loop holds lift=0 via POSITION_CONTROL.
 ======================================================================
 """
 
@@ -44,26 +43,10 @@ DT              = 1.0 / 240.0
 _CYL_Z   = TABLE_HEIGHT + (TARGET_HEIGHT / 2.0) + 0.01   # ~0.695 m
 _ABOVE_Z = _CYL_Z + 0.15                                  # ~0.845 m
 
-# Identity orientation: gripper faces +X (forward), fingers close in Y
-_GRASP_ORN_EULER = [0.0, 0.0, 0.0]
+_GRASP_ORN_EULER = [0.0, 0.0, 0.0]   # identity: gripper faces +X, fingers in Y
 
-# Link indices for logging
-_WRIST_ROLL_LINK    = 15   # IK end-effector (last movable arm joint)
-_GRIPPER_BASE_LINK  = 16   # FIXED joint child - palm, for logging only
-
-# [F34] Tuck joint config: arm folded over torso so CoM stays over wheels.
-# shoulder=-0.3 tilts arm backward, elbow=0.5 folds it in.
-# wrist_pitch has a 0.4 rad pre-bend in URDF origin - compensate with -0.4.
-_TUCK = {
-    'lift_joint':        0.0,
-    'arm_base_joint':    0.0,
-    'shoulder_joint':   -0.3,
-    'elbow_joint':       0.5,
-    'wrist_pitch_joint': -0.4,  # cancels URDF origin rpy="0 0.4 0" pre-bend
-    'wrist_roll_joint':  0.0,
-    'left_finger_joint': 0.0,
-    'right_finger_joint':0.0,
-}
+_WRIST_ROLL_LINK   = 15   # IK end-effector (last movable arm joint)
+_GRIPPER_BASE_LINK = 16   # fixed palm link - logging only
 # ---------------------------------------------------------------------------
 
 
@@ -82,7 +65,6 @@ def _set_lift(robot_id, lift_joint, pos):
 
 
 def _detect_joints(robot_id):
-    """Returns (arm_joints, gripper_joints, lift_joint, joint_name_to_idx)."""
     arm_joints, gripper_joints = [], []
     lift_joint = None
     name_to_idx = {}
@@ -102,17 +84,25 @@ def _detect_joints(robot_id):
     return arm_joints, gripper_joints, lift_joint, name_to_idx
 
 
-def _reset_joints_to_tuck(robot_id, name_to_idx):
+def _reset_all_joints_to_zero(robot_id, name_to_idx):
     """
-    [F34] Instantly set all arm/lift joints to tuck config using
-    p.resetJointState (no physics, immediate). Must be called BEFORE
-    any p.stepSimulation() after teleporting the robot.
-    This prevents CoM shift from flinging the robot over.
+    [F35] Reset every non-fixed joint to position=0, velocity=0.
+    Called ONCE right after resetBasePositionAndOrientation, BEFORE
+    any stepSimulation.
+
+    WHY all zeros only:
+      Non-zero values (e.g. shoulder=-0.3, elbow=0.5) cause the
+      PyBullet constraint solver to apply massive corrective impulses
+      on the very first simulation step, launching the robot to Z=5m.
+      All-zero config: arm points straight UP, CoM is directly above
+      the base footprint -> perfectly stable, no impulses needed.
     """
-    for jname, jpos in _TUCK.items():
-        if jname in name_to_idx:
-            idx = name_to_idx[jname]
-            p.resetJointState(robot_id, idx, jpos, targetVelocity=0.0)
+    for jname, idx in name_to_idx.items():
+        jtype = p.getJointInfo(robot_id, idx)[2]
+        if jtype != p.JOINT_FIXED:
+            p.resetJointState(robot_id, idx,
+                              targetValue=0.0,
+                              targetVelocity=0.0)
 
 
 def _link_pos(robot_id, link_idx):
@@ -124,7 +114,7 @@ def _link_pos(robot_id, link_idx):
 
 def main():
     print("=" * 60)
-    print("  TELEPORT GRASP TEST  [F34]")
+    print("  TELEPORT GRASP TEST  [F35]")
     print(f"  Cylinder Z = {_CYL_Z:.3f} m   Above Z = {_ABOVE_Z:.3f} m")
     print(f"  Lift = 0.0 during grasp")
     print(f"  IK EE = link 15 (wrist_roll_link, movable)")
@@ -138,57 +128,55 @@ def main():
     print(f"[Test] Arm joints:    {arm_joints}")
     print(f"[Test] Gripper joints:{gripper_joints}")
     print(f"[Test] Lift joint:    {lift_joint}")
-    print(f"[Test] All joints:    {name_to_idx}")
 
     grasp_orn = p.getQuaternionFromEuler(_GRASP_ORN_EULER)
-    print(f"[Test] Grasp quat:    {[f'{v:.3f}' for v in grasp_orn]}")
 
-    # Ground-truth target
+    # Ground-truth cylinder position
     tgt_pos_pb, _ = p.getBasePositionAndOrientation(target_id)
     tx, ty, tz = tgt_pos_pb
     print(f"[Test] Cylinder:      ({tx:.3f}, {ty:.3f}, {tz:.3f})")
 
-    # Teleport robot STANDOFF_M directly in front of cylinder
-    approach_angle = math.atan2(-ty, -tx)
-    robot_x = tx + STANDOFF_M * math.cos(approach_angle)
-    robot_y = ty + STANDOFF_M * math.sin(approach_angle)
+    # Place robot STANDOFF_M between origin and cylinder
+    # direction: cylinder -> origin
+    angle_cyl_to_origin = math.atan2(-ty, -tx)
+    robot_x = tx + STANDOFF_M * math.cos(angle_cyl_to_origin)
+    robot_y = ty + STANDOFF_M * math.sin(angle_cyl_to_origin)
     face_yaw = math.atan2(ty - robot_y, tx - robot_x)
     orn_q    = p.getQuaternionFromEuler([0, 0, face_yaw])
 
-    # [F34] Spawn at Z=0.15 for settle clearance
+    # [F35] Spawn at Z=0.1 (same as build_world default)
     p.resetBasePositionAndOrientation(robot_id,
-                                      [robot_x, robot_y, 0.15], orn_q)
+                                      [robot_x, robot_y, 0.1], orn_q)
     print(f"[Test] Robot:         ({robot_x:.3f}, {robot_y:.3f}) "
-          f"yaw={math.degrees(face_yaw):.1f} deg  Z=0.15")
+          f"yaw={math.degrees(face_yaw):.1f} deg")
     print(f"[Test] Dist to cyl:   {math.hypot(tx-robot_x, ty-robot_y):.3f} m")
 
-    # [F34] CRITICAL: reset ALL joints to tuck config BEFORE any stepSimulation.
-    # resetJointState is instantaneous - bypasses physics completely.
-    # This prevents the arm's default pose from shifting CoM and tipping robot.
-    _reset_joints_to_tuck(robot_id, name_to_idx)
-    print("[Test] Joints reset to tuck config (instantaneous, pre-physics)")
+    # [F35] Reset ALL joints to 0 instantly (bypasses physics).
+    # Arm straight up = CoM above base = stable. No constraint impulses.
+    _reset_all_joints_to_zero(robot_id, name_to_idx)
+    print("[Test] All joints reset to 0 (instantaneous)")
 
-    # Wheels stopped
     _set_wheels(robot_id, 0)
 
-    # Settle physics for 1 sim-second, holding lift=0
-    print("[Test] Settling physics (240 steps)...")
+    # Settle: 240 steps holding lift=0 and wheels stopped
+    print("[Test] Settling (240 steps)...")
     for _ in range(240):
         _set_lift(robot_id, lift_joint, 0.0)
         _set_wheels(robot_id, 0)
         p.stepSimulation()
         time.sleep(DT)
 
-    # Log actual positions after settle
+    # Verify positions after settle
     bp, _ = p.getBasePositionAndOrientation(robot_id)
-    print(f"[Test] After settle - robot base Z: {bp[2]:.3f} (should be ~0.1)")
     wr_pos = _link_pos(robot_id, _WRIST_ROLL_LINK)
     gb_pos = _link_pos(robot_id, _GRIPPER_BASE_LINK)
+    print(f"[Test] Robot base Z:  {bp[2]:.3f} (expected ~0.10)")
     if wr_pos:
-        print(f"[Test] wrist_roll link Z: {wr_pos[2]:.3f}")
+        print(f"[Test] wrist Z:       {wr_pos[2]:.3f}")
     if gb_pos:
-        print(f"[Test] palm (gripper_base) Z: {gb_pos[2]:.3f}")
-    print(f"[Test] Cylinder Z: {tz:.3f}")
+        print(f"[Test] palm Z:        {gb_pos[2]:.3f}")
+    print(f"[Test] Cylinder Z:    {tz:.3f}")
+    print(f"[Test] palm-cyl dZ:   {(gb_pos[2]-tz) if gb_pos else 'N/A':.3f}")
 
     kb.add_position('target', tx, ty, tz)
 
@@ -224,7 +212,6 @@ def main():
         tgt_p = [tx, ty, ik_z]
         close = (phase == 'close_gripper')
 
-        # [F33/F34] LIFT = 0.0 always during grasp
         _set_lift(robot_id, lift_joint, 0.0)
         _set_wheels(robot_id, 0)
 
@@ -240,19 +227,19 @@ def main():
         t_s = int(t_wall)
         if t_s != last_log_s:
             last_log_s = t_s
-            fps = [f"{p.getJointState(robot_id, gj)[0]:.3f}" for gj in gripper_joints]
-
+            fps = [f"{p.getJointState(robot_id, gj)[0]:.3f}"
+                   for gj in gripper_joints]
             wr_pos = _link_pos(robot_id, _WRIST_ROLL_LINK)
             gb_pos = _link_pos(robot_id, _GRIPPER_BASE_LINK)
             wr_str = (f"wrist=({wr_pos[0]:.3f},{wr_pos[1]:.3f},{wr_pos[2]:.3f})"
                       if wr_pos else "wrist=N/A")
             gb_str = (f"palm=({gb_pos[0]:.3f},{gb_pos[1]:.3f},{gb_pos[2]:.3f})"
                       if gb_pos else "palm=N/A")
-            cyl_str = f"cyl=({tx:.3f},{ty:.3f},{tz:.3f})"
 
             print(f"[t={t_s:2d}s|sim={t_sim:.1f}s] {phase:13s} "
                   f"ik_z={ik_z:.3f}  contact={'YES' if contact_detected else 'no '}  "
-                  f"fingers={fps}  {wr_str}  {gb_str}  {cyl_str}")
+                  f"fingers={fps}  {wr_str}  {gb_str}  "
+                  f"cyl=({tx:.3f},{ty:.3f},{tz:.3f})")
 
         p.stepSimulation()
         time.sleep(DT)
@@ -272,8 +259,8 @@ def main():
             else:
                 print("\n" + "=" * 60)
                 print("  RESULT: FAIL - no contact after 30s")
-                print("  Check: palm Z converging to ik_z?")
-                print("  Check: palm XY converging to cylinder XY?")
+                print("  Is palm XY converging to cylinder XY?")
+                print("  Is palm Z converging to ik_z?")
                 print("=" * 60)
             break
 

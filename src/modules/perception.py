@@ -31,23 +31,28 @@ def depth_to_pointcloud(depth, rgb, proj_matrix, view_matrix,
         pm = pm.reshape(4, 4).T  # transpose: PyBullet is column-major
 
     # Standard OpenGL projection entries
-    fx = pm[0, 0]   # pm[row, col]
+    fx = pm[0, 0]
     fy = pm[1, 1]
     cx, cy = img_w / 2.0, img_h / 2.0
 
     near, far = 0.1, 10.0
     # Convert PyBullet's normalized depth to metric distance
-    z = far * near / (far - (far - near) * depth)
+    z = far * near / (far - (far - near) * depth)   # shape (img_h, img_w)
 
     u_idx, v_idx = np.meshgrid(np.arange(img_w), np.arange(img_h))
     x = (u_idx - cx) * z / (fx * img_w * 0.5)
     y = (v_idx - cy) * z / (fy * img_h * 0.5)
 
-    points = np.stack([x.ravel(), y.ravel(), z.ravel()], axis=-1)
-    colors = rgb_arr.reshape(-1, 3)
+    # Flatten everything to 1-D before stacking / masking
+    x_flat = x.ravel()
+    y_flat = y.ravel()
+    z_flat = z.ravel()                               # shape (N,)
+    colors  = rgb_arr.reshape(-1, 3)                 # shape (N, 3)
 
-    # Remove points at max range (background)
-    valid = z.ravel() < (far * 0.99)
+    points = np.stack([x_flat, y_flat, z_flat], axis=-1)  # shape (N, 3)
+
+    # Remove points at max range (background) — all arrays are now 1-D
+    valid = z_flat < (far * 0.99)                    # shape (N,)
     return points[valid], colors[valid]
 
 
@@ -181,7 +186,7 @@ def pca_pose(points):
     eigenvalues = eigenvalues[order]
     eigenvectors = eigenvectors[:, order]
     extents = 2.0 * np.sqrt(np.maximum(eigenvalues, 0))
-    return center, eigenvectors, extents  # eigenvectors: columns are principal axes
+    return center, eigenvectors, extents
 
 
 def estimate_grasp_pose(target_points):
@@ -192,7 +197,6 @@ def estimate_grasp_pose(target_points):
     center, axes, extents = pca_pose(target_points)
     if center is None:
         return None, None
-    # Primary axis of cylinder = column with largest extent
     return center, axes
 
 

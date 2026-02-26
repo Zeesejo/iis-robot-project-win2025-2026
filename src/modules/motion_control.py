@@ -7,18 +7,32 @@ FIX HISTORY:
   [F31] Z passed as pure world frame, no double offset
   [F32] IK end-effector = joint 16 (gripper_base_joint) -- WRONG, reverted
   [F33] CRITICAL geometry fix:
-        - IK end-effector = link 15 (wrist_roll_joint child = wrist_roll_link).
-        - IK Z target = world_Z + PALM_Z_OFFSET (0.075 m)
-        - Lift MUST be 0.0 during grasp.
-  [F37] restPoses fix:
-        shoulder restPose: 0.30 -> 1.47 rad (nearly horizontal forward).
-        elbow restPose: 0.80 -> 0.0 (straight).
-        Shoulder Z at lift=0 is 0.696m, cylinder Z is 0.695m.
-        Arm must swing HORIZONTAL FORWARD to reach cylinder 0.55m away.
-        Old restPoses (shoulder=0.30) biased IK toward the arm-pointing-UP
-        local minimum -> wrist stuck at Z=1.11, palm at Z=1.16.
-        New restPoses push the solver toward the horizontal-forward solution
-        where wrist reaches Z=0.770, palm correctly lands at Z=0.695.
+        - IK end-effector = link 15 (wrist_roll_link, MOVABLE)
+        - Lift MUST be 0.0 during grasp (lift_joint is FIXED in URDF anyway)
+  [F37] restPoses shoulder=1.47 -- WRONG: arm cannot reach upward-forward
+        to cylinder that is at SAME Z as shoulder (0.695m)
+  [F39] CRITICAL geometry fix #2:
+        PALM_Z_OFFSET corrected to 0.05 m:
+          gripper_base_joint origin xyz='0 0 0.05' from wrist_roll_link
+          left/right finger joints: xyz='0.04 ±0.04 0' -- fingers extend in X!
+          Fingers add ZERO to Z. Only gripper_base adds 0.05.
+          Old value 0.075 was wrong (added phantom 0.025)
+
+        restPoses corrected for DOWNWARD-FORWARD reach:
+          shoulder = -0.90 rad  (arm angles downward, ~52 deg below horizontal)
+          elbow    =  0.40 rad  (slightly bent to compensate Z)
+          wrist_pitch = 0.50 rad  (tilts palm forward/downward to face cylinder)
+          arm_base = 0.00, wrist_roll = 0.00
+
+        GEOMETRY PROOF:
+          Shoulder joint Z = 0.695 m (same as cylinder Z)
+          At shoulder=-0.90: cos(-0.90)=0.622 -> elbow is 0.249m ABOVE shoulder
+          elbow Z = 0.695 + 0.249 = 0.944
+          At shoulder=-0.90: sin(-0.90)=0.783 -> elbow is 0.313m FORWARD
+          With elbow=+0.40 from shoulder frame: wrist_pitch reachable at Z=0.745
+          Total arm can place wrist at cyl_z+0.05 (= 0.745) with these angles.
+
+        lift_joint is FIXED in URDF -- cannot be controlled, no-op.
 """
 
 import pybullet as p
@@ -30,11 +44,16 @@ import math
 # Maximum horizontal reach of arm from robot centre (m)
 MAX_REACH = 0.55
 
-# [F33] IK end-effector = link 15 = wrist_roll_link (child of wrist_roll_joint).
+# IK end-effector = link 15 = wrist_roll_link (child of wrist_roll_joint).
+# This is the last MOVABLE joint in the arm chain.
 _IK_EE_LINK = 15
 
-# [F33] Z offset from wrist_roll_link to palm centre (0.050 + 0.025 = 0.075 m)
-_PALM_Z_OFFSET = 0.075
+# [F39] Z offset from wrist_roll_link origin to palm centre:
+#   gripper_base_joint: xyz='0 0 0.05' from wrist_roll_link  -> +0.050 m in Z
+#   left/right finger joints: xyz='0.04 ±0.04 0' -> fingers extend in X, NOT Z
+#   Finger midpoint adds 0 to Z.
+#   TOTAL: 0.050 m (NOT 0.075 -- old value had phantom +0.025)
+_PALM_Z_OFFSET = 0.050
 
 
 class PIDController:
@@ -123,19 +142,22 @@ def grasp_object(robot_id, target_pos, target_orient,
 
     target_pos : [x, y, z] WORLD frame.
         XY : converted to body frame, clamped to MAX_REACH, back to world.
-        Z  : world Z of the PALM (e.g. cylinder centre 0.695 m).
-             Internally offset by +PALM_Z_OFFSET so IK drives the WRIST
-             to the correct position (palm ends up at target Z).
+        Z  : world Z of the PALM (cylinder centre, e.g. 0.695 m).
+             Internally offset by +PALM_Z_OFFSET (0.050) so IK drives
+             the WRIST there and palm lands at target Z.
 
-    target_orient : quaternion [0,0,0,1] for identity.
+    target_orient : quaternion for identity [0,0,0,1].
 
     phase:
-        'stow'          - zero all arm joints, no IK, return immediately
+        'stow'          - zero all arm joints, no IK
         'reach_above'   - IK to (tx, ty, palm_z+0.15)
         'reach_target'  - IK to (tx, ty, palm_z)
         'close_gripper' - IK hold + close fingers
 
-    IMPORTANT: Caller must ensure lift_joint = 0.0 before/during grasp.
+    NOTE: lift_joint is FIXED in robot.urdf -- cannot be controlled.
+    The arm_base (shoulder) joint is at world Z = 0.695 m, same as the
+    cylinder. The arm must angle DOWNWARD-FORWARD to place the palm at
+    cylinder Z. restPoses are set accordingly.
     """
     num_joints_total = p.getNumJoints(robot_id)
 
@@ -203,15 +225,15 @@ def grasp_object(robot_id, target_pos, target_orient,
 
     # ------------------------------------------------------------------ #
     # 4. IK
-    # [F33] End-effector = _IK_EE_LINK = 15 (wrist_roll_link, MOVABLE).
-    # [F37] restPoses: shoulder=1.47 (horizontal forward) biases the solver
-    #       toward the correct solution. With shoulder=0.30 (old), IK found
-    #       the arm-up local minimum and wrist got stuck at Z=1.11.
+    # EE = _IK_EE_LINK = 15 (wrist_roll_link, MOVABLE)
+    # [F39] restPoses: shoulder=-0.90 (downward-forward), elbow=0.40,
+    #   wrist_pitch=0.50. Shoulder is at Z=0.695 = cylinder Z.
+    #   Arm must angle down-forward to place palm at cylinder Z.
     # ------------------------------------------------------------------ #
-    lower_limits = [-3.14, -1.00, -0.50, -1.57, -3.14]
-    upper_limits = [ 3.14,  1.57,  2.00,  1.57,  3.14]
-    rest_poses   = [ 0.00,  1.47,  0.00,  0.00,  0.00]   # [F37] shoulder forward
-    joint_ranges = [u - l for u, l in zip(upper_limits, lower_limits)]
+    lower_limits  = [-3.14, -1.00, -0.50, -1.57, -3.14]
+    upper_limits  = [ 3.14,  1.57,  2.00,  1.57,  3.14]
+    rest_poses    = [ 0.00, -0.90,  0.40,  0.50,  0.00]   # [F39] downward reach
+    joint_ranges  = [u - l for u, l in zip(upper_limits, lower_limits)]
 
     ik_solution = p.calculateInverseKinematics(
         robot_id,
@@ -222,8 +244,8 @@ def grasp_object(robot_id, target_pos, target_orient,
         upperLimits=upper_limits,
         jointRanges=joint_ranges,
         restPoses=rest_poses,
-        maxNumIterations=300,
-        residualThreshold=0.003
+        maxNumIterations=500,
+        residualThreshold=0.001
     )
 
     if not ik_solution:

@@ -24,9 +24,9 @@ class ExperienceBuffer:
     def add(self, params, outcome):
         """
         params: dict of parameter names -> values
-        outcome: float in [0, 1] (1=success, 0=failure, partial ok)
+        outcome: float in [0, 1] — logistic-squashed trial score.
         """
-        self.buffer.append({'params': params.copy(), 'outcome': outcome})
+        self.buffer.append({'params': params.copy(), 'outcome': float(outcome)})
         if len(self.buffer) > self.maxlen:
             self.buffer.pop(0)
 
@@ -69,7 +69,7 @@ class OnlinePIDTuner:
 
     def report_outcome(self, score):
         """
-        score: float, higher is better (e.g., -distance_to_goal at end)
+        score: float (raw, can be negative) — higher is better.
         Updates best gains if improved.
         """
         if self._trial_gains is None:
@@ -161,18 +161,28 @@ class LearningModule:
         success: bool
         distance_remaining: float (lower is better)
         collision_count: int
+
+        Raw score can be negative (penalised by distance + collisions).
+        We store a logistic-squashed version in [0, 1] for the ExperienceBuffer
+        so that best_params() comparisons remain well-defined.
         """
-        score = (1.0 if success else 0.0) - 0.1 * distance_remaining - 0.2 * collision_count
-        self.heading_tuner.report_outcome(score)
-        self.distance_tuner.report_outcome(score)
+        raw_score = (1.0 if success else 0.0) - 0.1 * distance_remaining - 0.2 * collision_count
+
+        # Report raw score to PID tuners (they track sign correctly)
+        self.heading_tuner.report_outcome(raw_score)
+        self.distance_tuner.report_outcome(raw_score)
+
+        # Normalise to [0, 1] for experience buffer (logistic squash)
+        outcome = 1.0 / (1.0 + np.exp(-raw_score))
 
         params = {
             'heading_pid': self.heading_tuner.get_best(),
             'distance_pid': self.distance_tuner.get_best(),
             'vision_tol': self.vision_tuner.get_tolerance()
         }
-        self.experience.add(params, score)
+        self.experience.add(params, outcome)
         self._save_params(params)
+        print(f"[Learning] Trial ended — raw_score={raw_score:.4f}, outcome={outcome:.4f}")
         return params
 
     def get_current_params(self):

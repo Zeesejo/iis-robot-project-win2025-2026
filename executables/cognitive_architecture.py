@@ -67,8 +67,8 @@ class OdometryEstimator:
         self.r = wheel_radius
         self.wb = wheel_base
         self.dt = dt
-        self._prev_left = 0.0
-        self._prev_right = 0.0
+        # Note: wheel positions (not velocities) could be used for
+        # more stable odometry — left as future improvement.
 
     def update(self, joints):
         """Returns (dx, dy, dtheta) in robot frame."""
@@ -87,6 +87,21 @@ class OdometryEstimator:
         return dx, dy, dtheta
 
 
+# ===================== PERCEPTION ERROR LOGGER =====================
+
+class _PerceptionLogger:
+    """Rate-limited logger so perception errors don't spam stdout."""
+    def __init__(self, interval=5.0):
+        self._last = 0.0
+        self._interval = interval
+
+    def log(self, exc):
+        now = time.monotonic()
+        if now - self._last >= self._interval:
+            print(f"[Perception] Error (suppressed at {self._interval}s rate): {exc}")
+            self._last = now
+
+
 # ===================== MAIN COGNITIVE LOOP =====================
 
 def main():
@@ -95,11 +110,16 @@ def main():
     # ---- M2: Build World ----
     world = build_world(gui=True)
     robot_id = world['robot_id']
-    scene_map = world['scene_map']
 
-    # ---- Load scene map ----
-    with open(os.path.join(ROOT, 'executables', 'scene_map.json')) as f:
-        scene_map = json.load(f)
+    # ---- Load scene map (safe fallback to build_world output) ----
+    scene_path = os.path.join(ROOT, 'executables', 'scene_map.json')
+    if os.path.exists(scene_path):
+        with open(scene_path) as f:
+            scene_map = json.load(f)
+        print("[CogArch] Loaded scene_map.json from disk.")
+    else:
+        scene_map = world['scene_map']
+        print("[CogArch] scene_map.json not found — using build_world() scene_map.")
 
     # ---- Discover joint/link indices ----
     left_joint = get_joint_index(robot_id, 'left_wheel_joint')
@@ -149,6 +169,9 @@ def main():
     # ---- Odometry ----
     odometry = OdometryEstimator()
 
+    # ---- Perception logger ----
+    perc_logger = _PerceptionLogger(interval=5.0)
+
     # ---- M3 Projection matrices (cached) ----
     proj_matrix = p.computeProjectionMatrixFOV(60, 1.0, 0.1, 10.0)
     view_matrix = None  # Updated each frame
@@ -197,7 +220,7 @@ def main():
             collision_count += 1
             mission_event = 'collision'
 
-        # Perception
+        # Perception (best-effort — errors are rate-limited logged, not silenced)
         try:
             # Rebuild point cloud from current camera pose
             cam_state = p.getLinkState(robot_id, camera_link)
@@ -208,10 +231,9 @@ def main():
             tgt = [cam_pos[0]+fwd[0], cam_pos[1]+fwd[1], cam_pos[2]+fwd[2]]
             view_matrix = p.computeViewMatrix(cam_pos, tgt, up)
 
-            # M4: Detect objects
+            # M4: Detect objects using vision_tol from M9 learning
             if depth is not None:
                 proj_list = list(p.computeProjectionMatrixFOV(60, 1.0, 0.1, 10.0))
-                import numpy as np
                 proj_np = np.array(proj_list).reshape(4, 4).T
 
                 points, colors = depth_to_pointcloud(
@@ -219,8 +241,9 @@ def main():
                 )
 
                 if len(points) > 10:
-                    target_pts = detect_target(points, colors)
-                    table_pts = detect_table(points, colors)
+                    # Pass vision_tol so M9 actively tunes detection
+                    target_pts = detect_target(points, colors, tol=vision_tol)
+                    table_pts = detect_table(points, colors, tol=vision_tol)
 
                     if len(target_pts) > 20 and fsm.state in (State.SEARCH, State.NAVIGATE):
                         grasp_pos, grasp_axes = estimate_grasp_pose(target_pts)
@@ -237,7 +260,9 @@ def main():
                             mission_data = {'target_pos': world_grasp[:2]}
 
                     elif len(table_pts) > 50 and fsm.state == State.SEARCH:
-                        table_plane, table_center = fit_table_plane(points, colors)
+                        table_plane, table_center = fit_table_plane(
+                            points, colors, tol=vision_tol
+                        )
                         if table_center is not None:
                             world_table = [
                                 est_x + table_center[2] * np.cos(est_theta),
@@ -246,8 +271,8 @@ def main():
                             kb.assert_table_position(*world_table)
                             mission_event = 'table_found'
                             mission_data = {'table_pos': world_table}
-        except Exception as e:
-            pass  # Perception is best-effort
+        except Exception as exc:
+            perc_logger.log(exc)  # Rate-limited — won't spam, won't silently swallow
 
         # State-specific event checks
         if fsm.state == State.NAVIGATE:
@@ -356,6 +381,8 @@ def main():
                 distance_remaining=dist_rem,
                 collision_count=collision_count
             )
+            # Update vision_tol for next run from newly learned params
+            vision_tol = learner.get_current_params()['vision_tol']
             print(f"[CogArch] Mission ended: {fsm.state}")
             break
 

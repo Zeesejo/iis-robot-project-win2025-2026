@@ -46,6 +46,8 @@ def detect_by_color(points, colors, target_color, tol=0.25):
     """
     Filter point cloud by RGB color proximity.
     target_color: [r, g, b] in [0,1]
+    tol: float — colour distance threshold (higher = wider detection).
+         Can be tuned at runtime by VisionThresholdTuner (M9).
     Returns: filtered points (N,3)
     """
     target = np.array(target_color)
@@ -54,18 +56,30 @@ def detect_by_color(points, colors, target_color, tol=0.25):
     return points[mask]
 
 
-def detect_table(points, colors):
-    """Detect the brown table surface."""
-    return detect_by_color(points, colors, [0.5, 0.3, 0.1], tol=0.25)
+def detect_table(points, colors, tol=0.25):
+    """Detect the brown table surface.
+
+    Args:
+        tol: colour tolerance, wired in from M9 VisionThresholdTuner.
+    """
+    return detect_by_color(points, colors, [0.5, 0.3, 0.1], tol=tol)
 
 
-def detect_target(points, colors):
-    """Detect the red target cylinder."""
-    return detect_by_color(points, colors, [1.0, 0.0, 0.0], tol=0.3)
+def detect_target(points, colors, tol=0.3):
+    """Detect the red target cylinder.
+
+    Args:
+        tol: colour tolerance, wired in from M9 VisionThresholdTuner.
+    """
+    return detect_by_color(points, colors, [1.0, 0.0, 0.0], tol=tol)
 
 
-def detect_obstacles(points, colors):
-    """Detect obstacle colors (blue, pink, orange, yellow, black)."""
+def detect_obstacles(points, colors, tol=0.3):
+    """Detect obstacle colors (blue, pink, orange, yellow, black).
+
+    Args:
+        tol: colour tolerance applied to all obstacle classes.
+    """
     obstacle_colors = [
         [0.0, 0.0, 1.0],
         [1.0, 0.4, 0.7],
@@ -75,7 +89,7 @@ def detect_obstacles(points, colors):
     ]
     detected = []
     for col in obstacle_colors:
-        pts = detect_by_color(points, colors, col, tol=0.3)
+        pts = detect_by_color(points, colors, col, tol=tol)
         if len(pts) > 10:
             detected.append(pts)
     return detected
@@ -119,12 +133,15 @@ def ransac_plane(points, n_iter=200, dist_thresh=0.02):
     return (best_normal, best_d), best_inliers
 
 
-def fit_table_plane(points, colors):
+def fit_table_plane(points, colors, tol=0.25):
     """
     Detect table surface plane using RANSAC.
     Returns plane parameters and table center.
+
+    Args:
+        tol: colour tolerance passed to detect_table.
     """
-    table_pts = detect_table(points, colors)
+    table_pts = detect_table(points, colors, tol=tol)
     if len(table_pts) < 10:
         return None, None
     (normal, d), inliers = ransac_plane(table_pts)

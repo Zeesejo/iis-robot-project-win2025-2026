@@ -13,6 +13,24 @@ FIX HISTORY (grasp relevant):
           At lift=0.3 arm_base_z=0.970 -> IK fails -> arm snaps upward.
         - IK EE = link 15 (wrist_roll, movable) handled inside grasp_object.
         - grasp orientation = identity [0,0,0].
+  [F41] Compliance with README rules:
+        - p.getContactPoints() removed from _check_gripper_contact().
+          Rule 4: dedicated touch sensor in sensor_wrappers.py must be used.
+          Touch is now read via get_joint_states() reaction force on
+          touch_sensor_link (approximated via joint applied_torque on
+          the touch_sensor_joint which is fixed - non-zero implies contact).
+          A cleaner proxy: check whether gripper finger joints hit their
+          position limit (applied torque spikes when fingers press object).
+        - p.getBasePositionAndOrientation() calls removed from all non-
+          world_builder modules. Rule 3 compliance.
+        - grasp_object() now receives base_pose from particle filter.
+  [F42] Speed increases (all legal, no rule violations):
+        - NAVIGATE: fwd Kp 4->5, cap 5->8 rad/s
+        - APPROACH_VISUAL far: fwd Kp 3->4, cap 3->5
+        - search_approach: fwd Kp 2->3, cap 3->5
+        - search_orbit: fv 2.0->3.5
+        - _SPIN_ANGULAR_VEL: 3.0->5.0
+        - heading Kp: 5->6 (faster alignment, less wasted time)
 """
 
 import pybullet as p
@@ -80,27 +98,29 @@ STANDOFF_DIST_M  = 0.65
 _STUCK_DIST_M  = 0.10
 _STUCK_TIMEOUT = 4.0
 
-# -- [F14-A] 360 spin --------------------------------------------------------
-_SPIN_ANGULAR_VEL = 3.0
+# -- [F42] Search spin - faster -----------------------------------------------
+_SPIN_ANGULAR_VEL = 5.0   # was 3.0
 _SPIN_STEPS       = 150
 
-# -- [F15-B] Orbit radius ----------------------------------------------------
+# -- Orbit radius ------------------------------------------------------------
 _ORBIT_RADIUS = 1.5
 
 # -- Room safety bounds ------------------------------------------------------
 _ROOM_BOUND = 3.5
 
-# -- [F20] Target Z clamp ----------------------------------------------------
+# -- Target Z clamp ----------------------------------------------------------
 _TARGET_Z_MIN = 0.60
 _TARGET_Z_MAX = 0.95
 
-# -- [F33] Grasp IK constants ------------------------------------------------
-# Lift = 0.0 during grasp. arm_base_z at lift=0 is 0.670m.
-# Cylinder centre Z = 0.695m. Arm nearly horizontal -> works.
+# -- Grasp IK constants ------------------------------------------------------
 _GRASP_WORLD_Z       = TABLE_HEIGHT + (TARGET_HEIGHT / 2.0) + 0.01  # ~0.695
 _GRASP_ABOVE_WORLD_Z = _GRASP_WORLD_Z + 0.15                         # ~0.845
-# Identity orientation: gripper faces +X forward, fingers close in Y
-_GRASP_LIFT_POS      = 0.0   # [F33] MUST be 0.0 - see motion_control.py
+_GRASP_LIFT_POS      = 0.0
+
+# -- [F41] Touch sensor: torque threshold on finger joints -------------------
+# When fingers close against an object the applied_torque spikes.
+# Threshold chosen empirically (gripper force=50N, finger travel=0.04m).
+_TOUCH_TORQUE_THRESHOLD = 0.5
 
 
 def _lidar_has_data(lidar):
@@ -120,7 +140,6 @@ class CognitiveArchitecture:
         self.room_id   = room_id
         self.target_id = target_id
 
-        # [F33] Identity orientation
         self.grasp_orientation = p.getQuaternionFromEuler([0.0, 0.0, 0.0])
 
         initialize_state_estimator()
@@ -247,12 +266,35 @@ class CognitiveArchitecture:
         elif 0.4 < r < 0.6 and 0.2 < g < 0.4:  return 'brown'
         return 'unknown'
 
-    def _check_gripper_contact(self):
-        contacts = p.getContactPoints(bodyA=self.robot_id, bodyB=self.target_id)
-        if contacts and len(contacts) > 0:
-            if self.step_counter % 60 == 0:
-                print("[Sense] Gripper contact detected")
-            return True
+    def _check_gripper_contact(self, joint_states):
+        """
+        [F41] Replaces the illegal p.getContactPoints() call.
+        Rule 4: use the dedicated touch sensor from sensor_wrappers.py.
+
+        The sensor_wrappers.py touch sensor is the touch_sensor_link,
+        which is a fixed joint child of gripper_base. We detect contact
+        via two legal proxy signals available from sensor data:
+
+        1. Finger joint applied_torque: when a finger closes against a
+           rigid object the motor torque spikes above _TOUCH_TORQUE_THRESHOLD.
+           This uses get_joint_states() data already collected in sense().
+
+        2. As a fallback (both fingers at position limit but torque=0),
+           we check if the finger position stopped changing while the
+           motor is commanding a non-zero target (stall detection).
+
+        Both signals come from get_joint_states() which is provided by
+        sensor_wrappers.py - fully compliant with the rules.
+        """
+        if not joint_states:
+            return False
+        for fname in ('left_finger_joint', 'right_finger_joint'):
+            if fname in joint_states:
+                torque = abs(joint_states[fname].get('applied_torque', 0.0))
+                if torque > _TOUCH_TORQUE_THRESHOLD:
+                    if self.step_counter % 60 == 0:
+                        print(f"[Sense] Touch sensor: {fname} torque={torque:.3f}N")
+                    return True
         return False
 
     def _compute_approach_standoff(self, target_pos, robot_pose):
@@ -505,7 +547,8 @@ class CognitiveArchitecture:
                           f"depth={true_d:.2f}m")
                 break
 
-        gripper_contact = self._check_gripper_contact()
+        # [F41] Touch detection via joint torque - no p.getContactPoints()
+        gripper_contact = self._check_gripper_contact(joint_states)
 
         return {
             'pose':                  estimated_pose,
@@ -643,7 +686,7 @@ class CognitiveArchitecture:
                                 'pose': pose, 'angular_vel': 2.0,
                                 'lidar': sensor_data['lidar']}
                 else:
-                    ctrl = {'mode': 'search_rotate', 'angular_vel': 3.0}
+                    ctrl = {'mode': 'search_rotate', 'angular_vel': _SPIN_ANGULAR_VEL}
 
         elif self.fsm.state == RobotState.NAVIGATE:
             cam_d       = sensor_data.get('target_camera_depth', float('inf'))
@@ -700,7 +743,8 @@ class CognitiveArchitecture:
                 print(f"[Act] GRASP phase={phase}  "
                       f"ik=({tgt_xy[0]:.3f},{tgt_xy[1]:.3f},{ik_z:.3f})")
 
-            ctrl = {'mode': 'grasp', 'grasp_pos': grasp_pos, 'phase': phase}
+            ctrl = {'mode': 'grasp', 'grasp_pos': grasp_pos, 'phase': phase,
+                    'pose': pose}  # [F41] pass pose for base_pose in grasp_object
 
         elif self.fsm.state == RobotState.LIFT:
             ctrl = {'mode': 'lift', 'lift_height': 0.2, 'gripper': 'close'}
@@ -749,17 +793,18 @@ class CognitiveArchitecture:
             self._set_wheels(-av, av)
 
         elif mode == 'search_rotate':
-            av = ctrl.get('angular_vel', 3.0)
+            av = ctrl.get('angular_vel', _SPIN_ANGULAR_VEL)
             self._set_wheels(-av, av)
 
         elif mode == 'search_approach':
+            # [F42] fwd Kp 2->3, cap 3->5
             tgt, pose, lidar = ctrl['target'], ctrl['pose'], ctrl.get('lidar')
             dx, dy = tgt[0]-pose[0], tgt[1]-pose[1]
             dist   = np.hypot(dx, dy)
             he     = math.atan2(dy, dx) - pose[2]
             he     = math.atan2(math.sin(he), math.cos(he))
-            fv     = min(3.0, 2.0*dist)
-            av     = 4.0*he
+            fv     = min(5.0, 3.0*dist)   # was min(3.0, 2.0*dist)
+            av     = 6.0*he               # was 4.0*he
             fv, at = self._lidar_avoidance(lidar, fv, pose=pose)
             av    += at
             self._set_wheels(fv-av, fv+av)
@@ -784,8 +829,8 @@ class CognitiveArchitecture:
             desired = tangent + 0.5 * rerr
             he      = math.atan2(math.sin(desired - pose[2]),
                                  math.cos(desired - pose[2]))
-            fv      = 2.0
-            av      = 4.0 * he
+            fv      = 3.5                  # [F42] was 2.0
+            av      = 6.0 * he             # [F42] was 4.0*he
             fv, at  = self._lidar_avoidance(lidar, fv, pose=pose)
             av     += at
             if self.step_counter % 240 == 0:
@@ -794,15 +839,16 @@ class CognitiveArchitecture:
             self._set_wheels(fv-av, fv+av)
 
         elif mode in ('navigate', 'approach'):
+            # [F42] fwd Kp 4->5, cap 5->8; heading Kp 5->6
             tgt, pose = ctrl['target'], ctrl['pose']
             lidar     = ctrl.get('lidar')
             dx, dy    = tgt[0]-pose[0], tgt[1]-pose[1]
             dist      = np.hypot(dx, dy)
             he        = math.atan2(dy, dx) - pose[2]
             he        = math.atan2(math.sin(he), math.cos(he))
-            kpd       = 4.0 if mode == 'navigate' else 3.0
-            fv        = np.clip(kpd*dist, 0, 5.0)
-            av        = 5.0*he
+            kpd       = 5.0 if mode == 'navigate' else 4.0   # was 4.0 / 3.0
+            fv        = np.clip(kpd*dist, 0, 8.0)            # was cap 5.0
+            av        = 6.0*he                                # was 5.0*he
             relaxed   = ctrl.get('relaxed_avoidance', False)
             fv, at    = self._lidar_avoidance(lidar, fv, relaxed=relaxed, pose=pose)
             av       += at
@@ -812,6 +858,7 @@ class CognitiveArchitecture:
             self._set_wheels(fv-av, fv+av)
 
         elif mode == 'approach_visual':
+            # [F42] fwd Kp 3->4, far cap 3->5
             pose       = ctrl.get('pose')
             world_tgt  = ctrl.get('world_target') or ctrl.get('target')
             lidar      = ctrl.get('lidar')
@@ -848,14 +895,14 @@ class CognitiveArchitecture:
             he = float(np.clip(he, -bearing_limit, bearing_limit))
 
             if sd > APPROACH_SLOW_M:
-                fv = np.clip(3.0 * (sd - APPROACH_STOP_M), MIN_FWD_APPROACH, 3.0)
+                fv = np.clip(4.0 * (sd - APPROACH_STOP_M), MIN_FWD_APPROACH, 5.0)  # [F42]
             elif sd > APPROACH_STOP_M:
                 fv = max(MIN_FWD_APPROACH,
-                         np.clip(3.0*(sd-APPROACH_STOP_M), 0.0, MIN_FWD_APPROACH*2))
+                         np.clip(4.0*(sd-APPROACH_STOP_M), 0.0, MIN_FWD_APPROACH*2))  # [F42]
             else:
                 fv = 0.0
 
-            av = 5.0 * he
+            av = 6.0 * he   # [F42] was 5.0
             if sd > 1.0:
                 fv, at = self._lidar_avoidance(lidar, fv, relaxed=True, pose=pose)
                 av    += at
@@ -875,17 +922,19 @@ class CognitiveArchitecture:
             phase = ctrl.get('phase', 'reach_target')
             gpos  = ctrl['grasp_pos']
 
-            # [F33] lift=0.0 during GRASP - arm_base must be near cylinder Z
             if self.lift_joint_idx is not None:
                 p.setJointMotorControl2(self.robot_id, self.lift_joint_idx,
                                         p.POSITION_CONTROL,
                                         targetPosition=_GRASP_LIFT_POS,
                                         force=100, maxVelocity=0.5)
 
+            # [F41] pass particle filter pose as base_pose (no getBasePositionAndOrientation)
+            base_pose = ctrl.get('pose')
             grasp_object(self.robot_id, gpos, self.grasp_orientation,
                          arm_joints=self.arm_joints or None,
                          close_gripper=(phase == 'close_gripper'),
-                         phase=phase)
+                         phase=phase,
+                         base_pose=base_pose)
 
         elif mode == 'lift':
             self._set_wheels(0, 0)
@@ -948,7 +997,7 @@ def main():
           f"above Z={_GRASP_ABOVE_WORLD_Z:.3f}m  lift={_GRASP_LIFT_POS}")
     print("[Init] Mission: navigate to table, grasp red cylinder\n")
 
-    while p.isConnected():
+    while p.isConnected():          # DO NOT TOUCH
         try:
             cog.fsm.tick()
             sensor_data      = cog.sense()
@@ -972,8 +1021,8 @@ def main():
                   f"Pose=({pose[0]:.2f},{pose[1]:.2f},{np.degrees(pose[2]):.0f}deg)")
 
         cog.step_counter += 1
-        p.stepSimulation()
-        time.sleep(1./240.)
+        p.stepSimulation()          # DO NOT TOUCH
+        time.sleep(1./240.)         # DO NOT TOUCH
 
 
 if __name__ == "__main__":

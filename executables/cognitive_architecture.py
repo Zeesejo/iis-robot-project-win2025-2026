@@ -25,6 +25,11 @@ FIXES in this revision
   [F15] A) Red HSV S>=100/V>=60 for long-range detection.
         B) Orbit direction picks the side that faces origin (robot start),
            radius reduced 2.0->1.5 m for better small-cylinder visibility.
+  [F16] APPROACH→GRASP: use cam_depth (not 2D world dist) for FSM trigger.
+  [F17] Removed creep nudge past APPROACH_STOP_M that prevented stopping.
+  [F18] Raised lidar emergency stop threshold 0.07→0.15 m (stop before table).
+  [F19] GRASP block uses approach_standoff as arm approach position.
+  [F20] Target world_z clamped to [0.60, 0.95] to prevent projection drift.
 """
 
 import pybullet as p
@@ -101,6 +106,10 @@ _ORBIT_RADIUS = 1.5   # was 2.0
 
 # -- Room safety bounds ------------------------------------------------------
 _ROOM_BOUND = 3.5
+
+# -- [F20] Target Z clamp (cylinder sits on table ~0.625 m) ------------------
+_TARGET_Z_MIN = 0.60
+_TARGET_Z_MAX = 0.95
 
 
 def _lidar_has_data(lidar):
@@ -506,6 +515,9 @@ class CognitiveArchitecture:
                 wp      = self._pixel_depth_to_world(cx_px, cy_px,
                                                      true_d, estimated_pose)
 
+                # [F20] Clamp world Z to plausible cylinder-on-table range
+                wp[2] = float(np.clip(wp[2], _TARGET_Z_MIN, _TARGET_Z_MAX))
+
                 if self.table_position is not None:
                     dist_to_table = np.hypot(wp[0] - self.table_position[0],
                                              wp[1] - self.table_position[1])
@@ -523,7 +535,8 @@ class CognitiveArchitecture:
                     rx, ry, rt = estimated_pose
                     pca_wx = rx + pca_body_x*math.cos(rt) - pca_body_y*math.sin(rt)
                     pca_wy = ry + pca_body_x*math.sin(rt) + pca_body_y*math.cos(rt)
-                    pca_wz = CAMERA_HEIGHT - pca_c[1]
+                    pca_wz = float(np.clip(
+                        CAMERA_HEIGHT - pca_c[1], _TARGET_Z_MIN, _TARGET_Z_MAX))
                     pca_world = [pca_wx, pca_wy, pca_wz]
                     if np.hypot(pca_world[0]-wp[0], pca_world[1]-wp[1]) < 0.5:
                         wp = pca_world
@@ -631,8 +644,15 @@ class CognitiveArchitecture:
                 print(f"[CogArch] Computed approach standoff: "
                       f"({self.approach_standoff[0]:.2f}, "
                       f"{self.approach_standoff[1]:.2f})")
+
+            # [F16] During APPROACH use camera depth to trigger FSM→GRASP
+            # (2D world distance stays > GRASP_RANGE_M because it measures
+            # robot-to-cylinder, not robot-to-near-edge of cylinder)
             if self.fsm.state == RobotState.APPROACH:
-                distance_for_fsm = distance_2d
+                cam_d = sensor_data.get('target_camera_depth', float('inf'))
+                distance_for_fsm = (cam_d
+                                    if MIN_TARGET_DEPTH < cam_d < MAX_TARGET_DEPTH
+                                    else distance_2d)
             elif (self.approach_standoff is not None
                   and self.fsm.state == RobotState.NAVIGATE):
                 sdx = self.approach_standoff[0]-pose[0]
@@ -725,6 +745,18 @@ class CognitiveArchitecture:
                 phase = ('reach_above'  if gt < 2.5 else
                          'reach_target' if gt < 5.5 else
                          'close_gripper')
+                # [F19] Override approach_pos with standoff geometry so the
+                # arm reaches from the correct side regardless of table depth
+                if self.approach_standoff is not None:
+                    gp['approach_pos'] = [
+                        self.approach_standoff[0],
+                        self.approach_standoff[1],
+                        target_pos[2] + 0.15
+                    ]
+                    print(f"[F19] GRASP approach_pos overridden to standoff "
+                          f"({gp['approach_pos'][0]:.2f}, "
+                          f"{gp['approach_pos'][1]:.2f}, "
+                          f"{gp['approach_pos'][2]:.2f})")
                 ctrl = {'mode': 'grasp',
                         'approach_pos': gp['approach_pos'],
                         'grasp_pos':    gp['grasp_pos'],
@@ -808,19 +840,12 @@ class CognitiveArchitecture:
             lidar     = ctrl.get('lidar')
             dx, dy    = pose[0]-tp[0], pose[1]-tp[1]
             cur_r     = np.hypot(dx, dy)
-            ang_ft    = math.atan2(dy, dx)   # angle from table to robot
+            ang_ft    = math.atan2(dy, dx)
 
-            # [F15-B] Choose orbit direction so the robot sweeps the face of
-            # the table that is visible from the origin (robot start point).
-            # The face toward origin has angle = atan2(-tp[1], -tp[0]).
-            # We pick the tangent direction (CW or CCW) that moves the robot
-            # toward that face rather than away from it.
-            origin_angle = math.atan2(-tp[1], -tp[0])  # dir from table to origin
-            # CCW tangent at robot's current angle:
-            ccw_tangent = ang_ft + math.pi / 2
-            # CW tangent:
-            cw_tangent  = ang_ft - math.pi / 2
-            # Pick whichever tangent direction is closer to origin_angle
+            origin_angle = math.atan2(-tp[1], -tp[0])
+            ccw_tangent  = ang_ft + math.pi / 2
+            cw_tangent   = ang_ft - math.pi / 2
+
             def _ang_diff(a, b):
                 return math.atan2(math.sin(a - b), math.cos(a - b))
             use_ccw = abs(_ang_diff(ccw_tangent, origin_angle)) < \
@@ -884,9 +909,8 @@ class CognitiveArchitecture:
                          np.clip(3.0*(sd-APPROACH_STOP_M), 0.0, MIN_FWD_APPROACH*2))
             else:
                 fv = 0.0
-
-            if sd < GRASP_RANGE_M and fv == 0.0:
-                fv = MIN_FWD_APPROACH * 0.5
+            # [F17] Removed creep nudge: do NOT re-enable fwd when
+            # sd < GRASP_RANGE_M. The robot must stop and let GRASP take over.
 
             av = 5.0 * he
 
@@ -894,11 +918,13 @@ class CognitiveArchitecture:
                 fv, at = self._lidar_avoidance(lidar, fv, relaxed=True, pose=pose)
                 av    += at
             else:
+                # [F18] Raised emergency stop threshold 0.07 → 0.15 m so the
+                # robot halts before touching the table edge.
                 if _lidar_has_data(lidar):
                     mf = min(lidar[i % len(lidar)] for i in range(-2, 3))
-                    if mf < 0.07:
+                    if mf < 0.15:
                         fv = 0.0
-                        print(f"[F12] Lidar emergency stop mf={mf:.3f}m")
+                        print(f"[F18] Lidar emergency stop mf={mf:.3f}m")
 
             if self.step_counter % 240 == 0:
                 print(f"[Act] APPROACH_VISUAL: world_dist={sd:.2f}m, "

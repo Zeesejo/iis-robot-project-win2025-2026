@@ -13,8 +13,8 @@ FIXES in this revision
   [F3]  approach_standoff reset on every NAVIGATE re-entry.
   [F4]  APPROACH_VISUAL rewritten: world-frame bearing, stops at depth<0.55m.
   [F5]  Raised dist-to-table rejection gate to 3.5 m.
-  [F6]  distance_for_fsm during APPROACH uses 2D world-frame distance.
-  [F7]  approach_visual speed uses np.hypot(world_tgt - pose).
+  [F6]  distance_for_fsm during APPROACH uses cam_depth (not world 2D dist).
+  [F7]  approach_visual speed uses world_dist / cam_depth.
   [F8]  _in_approach + _approach_depth_smooth reset when FSM leaves APPROACH.
   [F9]  Fixed bare `if lidar:` numpy-safe check.
   [F10] Stuck detection in think(): replan after 4 s without 0.1 m progress.
@@ -25,11 +25,19 @@ FIXES in this revision
   [F15] A) Red HSV S>=100/V>=60 for long-range detection.
         B) Orbit direction picks the side that faces origin (robot start),
            radius reduced 2.0->1.5 m for better small-cylinder visibility.
-  [F16] APPROACH→GRASP: use cam_depth (not 2D world dist) for FSM trigger.
+  [F16] APPROACH->GRASP: use cam_depth (not 2D world dist) for FSM trigger.
   [F17] Removed creep nudge past APPROACH_STOP_M that prevented stopping.
-  [F18] Raised lidar emergency stop threshold 0.07→0.15 m (stop before table).
+  [F18] Raised lidar emergency stop threshold 0.07->0.15 m.
   [F19] GRASP block uses approach_standoff as arm approach position.
-  [F20] Target world_z clamped to [0.60, 0.95] to prevent projection drift.
+  [F20] Target world_z clamped to [0.60, 0.95].
+  [F21] world_builder: force red via changeVisualShape; widen HSV; no fallback PCA.
+  [F22] Hard-reset target smoother on NAVIGATE->APPROACH transition so
+        accumulated orbit detections don't poison the close-range estimate.
+  [F23] FSM: lower NAVIGATE->APPROACH threshold 2.0->1.2 m.
+  [F24] approach_visual: clamp |bearing| <= 25 deg during close approach
+        to prevent hard turns from stale wide-angle target estimates.
+  [F25] approach_visual: prefer cam_depth over world_dist when world_dist
+        is unreliable (> 2.5 m while cam_depth < 2.5 m).
 """
 
 import pybullet as p
@@ -587,6 +595,17 @@ class CognitiveArchitecture:
             self._spin_complete   = False
             print("[F14-A] Entered SEARCH: starting 360 spin-in-place")
 
+        # [F22] Hard-reset target smoother on NAVIGATE->APPROACH so that
+        # accumulated orbit/wide-angle detections don't poison close-range
+        # steering.  Fresh detections at short range converge in ~5 steps.
+        if (current_state == RobotState.APPROACH
+                and self._last_fsm_state == RobotState.NAVIGATE):
+            print("[F22] APPROACH entry: resetting target position smoother")
+            self.target_position_smoothed = None
+            self.target_detection_count   = 0
+            self.pca_target_pose          = None
+            # Keep self.target_position as a fallback until a fresh detection arrives
+
         if (self._last_fsm_state == RobotState.APPROACH
                 and current_state != RobotState.APPROACH):
             self._in_approach           = False
@@ -645,9 +664,7 @@ class CognitiveArchitecture:
                       f"({self.approach_standoff[0]:.2f}, "
                       f"{self.approach_standoff[1]:.2f})")
 
-            # [F16] During APPROACH use camera depth to trigger FSM→GRASP
-            # (2D world distance stays > GRASP_RANGE_M because it measures
-            # robot-to-cylinder, not robot-to-near-edge of cylinder)
+            # [F16] During APPROACH use camera depth to trigger FSM->GRASP
             if self.fsm.state == RobotState.APPROACH:
                 cam_d = sensor_data.get('target_camera_depth', float('inf'))
                 distance_for_fsm = (cam_d
@@ -745,18 +762,13 @@ class CognitiveArchitecture:
                 phase = ('reach_above'  if gt < 2.5 else
                          'reach_target' if gt < 5.5 else
                          'close_gripper')
-                # [F19] Override approach_pos with standoff geometry so the
-                # arm reaches from the correct side regardless of table depth
+                # [F19] Override approach_pos with standoff geometry
                 if self.approach_standoff is not None:
                     gp['approach_pos'] = [
                         self.approach_standoff[0],
                         self.approach_standoff[1],
                         target_pos[2] + 0.15
                     ]
-                    print(f"[F19] GRASP approach_pos overridden to standoff "
-                          f"({gp['approach_pos'][0]:.2f}, "
-                          f"{gp['approach_pos'][1]:.2f}, "
-                          f"{gp['approach_pos'][2]:.2f})")
                 ctrl = {'mode': 'grasp',
                         'approach_pos': gp['approach_pos'],
                         'grasp_pos':    gp['grasp_pos'],
@@ -891,7 +903,23 @@ class CognitiveArchitecture:
             lidar      = ctrl.get('lidar')
             cam_depth  = ctrl.get('camera_depth', float('inf'))
             world_dist = ctrl.get('world_dist_2d', float('inf'))
-            sd = world_dist if world_dist < float('inf') else cam_depth
+
+            # [F25] Prefer cam_depth when world position estimate is stale
+            # (world_dist >> cam_depth means smoother hasn't converged yet)
+            if (cam_depth < MAX_TARGET_DEPTH and
+                    (world_dist > cam_depth * 1.5 or world_dist > 2.5)):
+                sd = cam_depth
+            elif world_dist < float('inf'):
+                sd = world_dist
+            else:
+                sd = cam_depth
+
+            # [F24] Bearing: use world-frame heading when reliable,
+            # but clamp to ±25 deg to avoid hard turns from stale estimates.
+            # At close range (<1 m) trust bearing fully.
+            _MAX_BEARING_FAR  = math.radians(25.0)  # clamp when sd > 1 m
+            _MAX_BEARING_NEAR = math.radians(60.0)  # relax clamp when sd < 1 m
+            bearing_limit = _MAX_BEARING_NEAR if sd < 1.0 else _MAX_BEARING_FAR
 
             if world_tgt is not None and pose is not None:
                 dx_w = world_tgt[0] - pose[0]
@@ -902,6 +930,8 @@ class CognitiveArchitecture:
             else:
                 he = ctrl.get('camera_bearing', 0.0)
 
+            he = float(np.clip(he, -bearing_limit, bearing_limit))
+
             if sd > APPROACH_SLOW_M:
                 fv = np.clip(3.0 * (sd - APPROACH_STOP_M), MIN_FWD_APPROACH, 3.0)
             elif sd > APPROACH_STOP_M:
@@ -909,8 +939,6 @@ class CognitiveArchitecture:
                          np.clip(3.0*(sd-APPROACH_STOP_M), 0.0, MIN_FWD_APPROACH*2))
             else:
                 fv = 0.0
-            # [F17] Removed creep nudge: do NOT re-enable fwd when
-            # sd < GRASP_RANGE_M. The robot must stop and let GRASP take over.
 
             av = 5.0 * he
 
@@ -918,8 +946,6 @@ class CognitiveArchitecture:
                 fv, at = self._lidar_avoidance(lidar, fv, relaxed=True, pose=pose)
                 av    += at
             else:
-                # [F18] Raised emergency stop threshold 0.07 → 0.15 m so the
-                # robot halts before touching the table edge.
                 if _lidar_has_data(lidar):
                     mf = min(lidar[i % len(lidar)] for i in range(-2, 3))
                     if mf < 0.15:
@@ -927,9 +953,10 @@ class CognitiveArchitecture:
                         print(f"[F18] Lidar emergency stop mf={mf:.3f}m")
 
             if self.step_counter % 240 == 0:
-                print(f"[Act] APPROACH_VISUAL: world_dist={sd:.2f}m, "
-                      f"cam_depth={cam_depth:.2f}m, "
-                      f"bearing={np.degrees(he):.0f} deg, "
+                print(f"[Act] APPROACH_VISUAL: sd={sd:.2f}m, "
+                      f"cam_depth={cam_depth:.2f}m, world_dist={world_dist:.2f}m, "
+                      f"bearing={np.degrees(he):.0f} deg (clamped to "
+                      f"±{np.degrees(bearing_limit):.0f}), "
                       f"fwd={fv:.2f}, turn={av:.1f}")
             self._set_wheels(fv-av, fv+av)
 

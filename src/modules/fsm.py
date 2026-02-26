@@ -172,7 +172,10 @@ class RobotFSM:
         elif self.state == RobotState.NAVIGATE:
             self.distance_to_target = sensor_data.get('distance_to_target',
                                                        float('inf'))
-            if self.distance_to_target < 2.0:
+            # [F23] Lowered from 2.0 m to 1.2 m: the standoff is 0.65 m so
+            # 1.2 m means the robot is ~0.55 m from the standoff point and
+            # close enough to start fine visual approach.
+            if self.distance_to_target < 1.2:
                 print(f"[FSM] Reached navigation waypoint "
                       f"(dist={self.distance_to_target:.2f}m)")
                 self.transition_to(RobotState.APPROACH)

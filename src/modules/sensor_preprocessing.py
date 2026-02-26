@@ -71,11 +71,22 @@ def get_preprocessed_camera(robot_id, sensor_link_id=-1):
     return rgb, depth_clipped, mask
 
 
-def preprocess_all(robot_id, lidar_link_id=-1, camera_link_id=-1):
-    """Preprocess all sensors and return a unified sensor bundle."""
-    return {
-        'lidar': get_averaged_lidar(robot_id, lidar_link_id),
-        'imu': get_averaged_imu(robot_id),
+def preprocess_all(robot_id, lidar_link_id=-1, camera_link_id=-1,
+                   include_camera=False):
+    """
+    Preprocess all sensors and return a unified sensor bundle.
+
+    include_camera: set True only when a camera frame is actually needed
+                    (e.g. every N steps). Keeping it False avoids calling
+                    getCameraImage every physics step, which causes GUI
+                    flickering in the PyBullet viewer.
+    """
+    bundle = {
+        'lidar':  get_averaged_lidar(robot_id, lidar_link_id),
+        'imu':    get_averaged_imu(robot_id),
         'joints': get_averaged_joints(robot_id),
-        'camera': get_preprocessed_camera(robot_id, camera_link_id)
+        'camera': (None, None, None),   # default: no camera this step
     }
+    if include_camera:
+        bundle['camera'] = get_preprocessed_camera(robot_id, camera_link_id)
+    return bundle

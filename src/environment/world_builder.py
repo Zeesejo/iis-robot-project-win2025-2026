@@ -119,6 +119,11 @@ def build_world(gui=True):
     target_z   = TABLE_HEIGHT + (TARGET_HEIGHT / 2.0) + 0.01
     target_pos = [t_pos_xy[0] + world_dx, t_pos_xy[1] + world_dy, target_z]
     target_id  = p.loadURDF(os.path.join(URDF_PATH, "target.urdf"), target_pos, useFixedBase=False)
+    # [F21] Explicitly force pure red so PyBullet camera RGB is reliable.
+    # URDF <material> color is often ignored by the renderer; changeVisualShape
+    # writes directly to the OpenGL visual, guaranteeing H~0, S~255, V~255 in HSV.
+    p.changeVisualShape(target_id, -1, rgbaColor=[1, 0, 0, 1])
+    print(f"[WorldBuilder] Target placed at ({target_pos[0]:.2f}, {target_pos[1]:.2f}, {target_pos[2]:.2f}) - color forced red")
 
     # 5. Obstacles
     for i in range(OBSTACLE_COUNT):

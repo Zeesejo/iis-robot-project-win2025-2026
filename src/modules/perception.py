@@ -12,21 +12,23 @@ SCENE_OBJECTS = {
 }
 
 # [F13] Red HSV tightened to exclude orange (H=0-8 + H=165-180).
-# [F15-A] Lower saturation/value thresholds relaxed to S>=100, V>=60 so the
-#         small cylinder (~8-12 px wide at 2m) is still detected at long range
-#         where PyBullet lighting slightly desaturates colours.
-#         Orange safety: orange lower bound is S>=150 and H>=9, so there is
-#         zero overlap with red (H=0-8 or H=165-180, S>=100).
+# [F15-A] Lower saturation/value thresholds relaxed to S>=100, V>=60.
+# [F21] Widened to H=0-15 / H=160-180 and lowered to S>=80, V>=50 as safety
+#       net for any residual PyBullet lighting desaturation on the cylinder.
 COLOR_RANGES_HSV = {
-    'red':    [(np.array([0,   100,  60]),  np.array([8,   255, 255])),
-               (np.array([165, 100,  60]),  np.array([180, 255, 255]))],
+    'red':    [(np.array([0,    80,  50]),  np.array([15,  255, 255])),
+               (np.array([160,  80,  50]),  np.array([180, 255, 255]))],
     'brown':  [(np.array([10,  80,  30]),   np.array([25,  180, 180]))],
     'blue':   [(np.array([100, 120,  70]),  np.array([130, 255, 255]))],
     'pink':   [(np.array([140,  40, 100]),  np.array([160, 255, 255]))],
-    'orange': [(np.array([9,   150, 150]),  np.array([25,  255, 255]))],
+    'orange': [(np.array([16,  150, 150]),  np.array([25,  255, 255]))],
     'yellow': [(np.array([25,  120, 120]),  np.array([35,  255, 255]))],
     'black':  [(np.array([0,     0,   0]),  np.array([180,  80,  50]))],
 }
+
+# Set to True to dump a per-frame HSV histogram of the image centre
+# to the console (disable before submission).
+_DEBUG_HSV = False
 
 
 class SiftFeatureExtractor:
@@ -91,6 +93,15 @@ def edge_contour_segmentation(rgb_image, min_contour_area=500, ratio_threshold=5
 
 def detect_objects_by_color(bgr_image, min_area=200):
     hsv = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2HSV)
+
+    if _DEBUG_HSV:
+        # Sample a 20x20 patch from the image centre
+        h, w = bgr_image.shape[:2]
+        patch = hsv[h//2-10:h//2+10, w//2-10:w//2+10]
+        if patch.size > 0:
+            print(f"[HSV-DEBUG] centre patch mean H={patch[:,:,0].mean():.1f} "
+                  f"S={patch[:,:,1].mean():.1f} V={patch[:,:,2].mean():.1f}")
+
     detections = []
 
     for color_name, ranges in COLOR_RANGES_HSV.items():
@@ -254,6 +265,7 @@ class PerceptionModule:
     def __init__(self):
         self.sift_extractor = SiftFeatureExtractor()
         self.knowledge_base = {}
+        self._red_debug_counter = 0
 
     def build_knowledge_base(self, category_images):
         for cat, img_list in category_images.items():
@@ -280,6 +292,27 @@ class PerceptionModule:
 
         results = {'detections': detections, 'table_plane': None,
                    'target_pose': None, 'obstacle_poses': []}
+
+        # [F21-DEBUG] Log how many red pixels are seen every 240 frames
+        self._red_debug_counter += 1
+        if self._red_debug_counter % 24 == 0:  # every ~1s at 10fps perception
+            hsv_dbg = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+            red_dbg = np.zeros((height, width), dtype=np.uint8)
+            for (lo, hi) in COLOR_RANGES_HSV['red']:
+                red_dbg |= cv2.inRange(hsv_dbg, lo, hi)
+            n_red = int(np.sum(red_dbg > 0))
+            if n_red > 0 or self._red_debug_counter % 240 == 0:
+                print(f"[RedDebug] red_pixels={n_red} "
+                      f"(H range 0-15 + 160-180, S>=80, V>=50)")
+            if n_red == 0 and self._red_debug_counter % 240 == 0:
+                # Sample the H channel at the image centre to help diagnose
+                cy_c, cx_c = height // 2, width // 2
+                sample = hsv_dbg[cy_c-5:cy_c+5, cx_c-5:cx_c+5]
+                if sample.size > 0:
+                    print(f"[RedDebug] centre HSV sample "
+                          f"H={sample[:,:,0].mean():.1f} "
+                          f"S={sample[:,:,1].mean():.1f} "
+                          f"V={sample[:,:,2].mean():.1f}")
 
         if len(points_3d) < 10:
             return results
@@ -324,19 +357,10 @@ class PerceptionModule:
                 }
             except ValueError:
                 pass
-        else:
-            try:
-                center, vectors, dims = compute_pca(object_points)
-                refined = refine_object_points(object_points, center, vectors, dims)
-                if len(refined) > 10:
-                    center, vectors, dims = compute_pca(refined)
-                results['target_pose'] = {
-                    'center': center.tolist(),
-                    'axes':   vectors.tolist(),
-                    'dimensions': dims.tolist()
-                }
-            except ValueError:
-                pass
+        # [F21] Do NOT fall back to whole-scene PCA when no red pixels found.
+        # The fallback was producing giant dims=[10, 8, 4] from the full scene
+        # cloud, which confused the cognitive architecture into thinking a
+        # target had been found far away.
 
         for det in detections:
             if det['color'] in ['blue', 'pink', 'orange', 'yellow', 'black']:

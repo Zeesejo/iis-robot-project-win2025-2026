@@ -96,13 +96,11 @@ def get_nav_camera_image(robot_id):
     """
     Render a forward-looking camera from the robot base.
     Returns (rgb, depth_2d, mask, cam_pos_world, forward_vec, view_matrix).
-    cam_pos_world and forward_vec are needed for correct world-frame projection.
     """
     base_pos, base_orn = p.getBasePositionAndOrientation(robot_id)
     rot     = p.getMatrixFromQuaternion(base_orn)
     forward = [rot[0], rot[3], rot[6]]
     up      = [rot[2], rot[5], rot[8]]
-
     cam_pos = [
         base_pos[0] + 0.2 * forward[0],
         base_pos[1] + 0.2 * forward[1],
@@ -127,23 +125,15 @@ def get_nav_camera_image(robot_id):
 # ===================== CAMERA -> WORLD TRANSFORM =====================
 
 def cam_point_to_world(cam_point, cam_pos_world, forward_vec):
-    """
-    Convert a point in the nav camera frame to world coordinates.
-    cam_point: (x_cam, y_cam, z_cam) where z_cam = depth along forward axis.
-    Returns world [x, y, z].
-    """
-    # Build right vector from forward and global up
     global_up = np.array([0.0, 0.0, 1.0])
-    right = np.cross(forward_vec, global_up)
+    right  = np.cross(forward_vec, global_up)
     r_norm = np.linalg.norm(right)
-    right = right / r_norm if r_norm > 1e-6 else np.array([1.0, 0.0, 0.0])
+    right  = right / r_norm if r_norm > 1e-6 else np.array([1.0, 0.0, 0.0])
     cam_up = np.cross(right, forward_vec)
-
-    # cam_point: (lateral, vertical, depth)
-    world = (cam_pos_world
-             + cam_point[2] * np.array(forward_vec)   # depth -> forward
-             + cam_point[0] * right                    # x -> lateral
-             + cam_point[1] * cam_up)                  # y -> up
+    world  = (cam_pos_world
+              + cam_point[2] * np.array(forward_vec)
+              + cam_point[0] * right
+              + cam_point[1] * cam_up)
     return world.tolist()
 
 
@@ -152,11 +142,9 @@ def cam_point_to_world(cam_point, cam_pos_world, forward_vec):
 def main():
     print("[CogArch] Starting IIS Robot Cognitive Architecture...")
 
-    # ---- M2: Build World ----
     world    = build_world(gui=True)
     robot_id = world['robot_id']
 
-    # ---- Load scene map ----
     scene_path = os.path.join(ROOT, 'executables', 'scene_map.json')
     if os.path.exists(scene_path):
         with open(scene_path) as f:
@@ -166,7 +154,6 @@ def main():
         scene_map = world['scene_map']
         print("[CogArch] scene_map.json not found — using build_world() scene_map.")
 
-    # ---- Discover joint indices ----
     left_joint  = get_joint_index(robot_id, 'left_wheel_joint')
     right_joint = get_joint_index(robot_id, 'right_wheel_joint')
     arm_joints  = [
@@ -177,23 +164,20 @@ def main():
     ]
     ee_index    = get_joint_index(robot_id, 'end_effector_joint')
     lidar_link  = get_joint_index(robot_id, 'lidar_joint')
-    camera_link = get_joint_index(robot_id, 'camera_joint')   # wrist cam
+    camera_link = get_joint_index(robot_id, 'camera_joint')
 
     print(f"[CogArch] Joint indices: left={left_joint} right={right_joint} "
           f"lidar={lidar_link} cam={camera_link} ee={ee_index}")
 
-    # ---- M8: Knowledge Base ----
     kb = KnowledgeBase()
     kb.populate_from_scene_map(scene_map)
 
-    # ---- M9: Learning ----
     learner      = LearningModule()
     trial_params = learner.start_trial()
     h_gains      = trial_params['heading_pid']
     d_gains      = trial_params['distance_pid']
     vision_tol   = learner.get_current_params()['vision_tol']
 
-    # ---- M5: Particle Filter ----
     robot_init = scene_map['robot']
     pf         = ParticleFilter(n_particles=300)
     init_pos   = robot_init['position']
@@ -201,29 +185,22 @@ def main():
     init_theta = p.getEulerFromQuaternion(init_orn)[2]
     pf.initialize_at(init_pos[0], init_pos[1], init_theta)
 
-    # ---- M6: Controllers ----
     nav_ctrl = DifferentialDriveController(robot_id, left_joint, right_joint)
     nav_ctrl.heading_pid.update_gains(**h_gains)
     nav_ctrl.distance_pid.update_gains(**d_gains)
     arm_ctrl = ArmController(robot_id, ee_index, arm_joints)
 
-    # ---- M7: FSM ----
     fsm = MissionFSM()
     fsm.table_position = scene_map['table']['position'][:2]
 
-    # ---- Odometry ----
-    odometry = OdometryEstimator()
-
-    # ---- Perception logger ----
+    odometry    = OdometryEstimator()
     perc_logger = _PerceptionLogger(interval=5.0)
 
-    # ---- Cached projection matrix (constant) ----
     proj_np = np.array(
         p.computeProjectionMatrixFOV(60, 1.0, 0.1, 10.0),
         dtype=np.float64
     ).reshape(4, 4).T
 
-    # ---- State variables ----
     state_est           = (init_pos[0], init_pos[1], init_theta)
     obstacle_map_for_pf = [(o['position'][0], o['position'][1])
                            for o in scene_map['obstacles']]
@@ -237,39 +214,42 @@ def main():
     mission_data      = {}
     step_count        = 0
 
-    # Camera throttle: render nav camera every N physics steps
-    CAM_EVERY_N_STEPS    = 10   # ~24 Hz visual update, physics stays at 240 Hz
-    # Search timeout: fall back to KB table pos after this many steps
-    SEARCH_TIMEOUT_STEPS = 480  # 2 s at 240 Hz
+    # Only call getCameraImage every N steps (24 Hz) to prevent GUI flicker
+    CAM_EVERY_N_STEPS    = 10
+    SEARCH_TIMEOUT_STEPS = 480
     search_step_count    = 0
 
-    # Cached nav camera data (reused between renders)
-    _nav_rgb    = None
-    _nav_depth  = None
-    _nav_cam_pos   = None
-    _nav_forward   = None
-    _nav_view      = None
+    # Cached nav camera data
+    _nav_rgb     = None
+    _nav_depth   = None
+    _nav_cam_pos = None
+    _nav_forward = None
+    _nav_view    = None
+    # Cached wrist camera data
+    _wrist_rgb   = None
+    _wrist_depth = None
 
-    # Initial FSM tick
     fsm_state, cmd = fsm.transition('tick')
-
     print("[CogArch] Entering Sense-Think-Act loop...")
 
     # ===================== MAIN LOOP =====================
     while p.isConnected():  # DO NOT TOUCH
 
-        step_count += 1
+        step_count  += 1
+        cam_tick     = (step_count % CAM_EVERY_N_STEPS == 0)
 
         # ======= SENSE =======
-        sensors = preprocess_all(robot_id, lidar_link, camera_link)
+        # Only request wrist camera frame on the throttled tick
+        sensors = preprocess_all(robot_id, lidar_link, camera_link,
+                                 include_camera=cam_tick)
         lidar  = sensors['lidar']
         imu    = sensors['imu']
         joints = sensors['joints']
-        rgb, depth, mask = sensors['camera']   # wrist cam
+
+        if cam_tick:
+            _wrist_rgb, _wrist_depth, _ = sensors['camera']
 
         dx, dy, dtheta = odometry.update(joints)
-
-        # M5: Update particle filter
         state_est = pf.step(dx, dy, dtheta, lidar, obstacle_map_for_pf)
         est_x, est_y, est_theta = state_est
 
@@ -277,13 +257,12 @@ def main():
         mission_event = 'tick'
         mission_data  = {}
 
-        # Collision detection via LIDAR
         if min(lidar) < 0.25:
             collision_count += 1
             mission_event = 'collision'
 
-        # --- Nav camera: render only every CAM_EVERY_N_STEPS ---
-        if step_count % CAM_EVERY_N_STEPS == 0:
+        # --- Nav camera: render only on throttled tick ---
+        if cam_tick:
             try:
                 (_nav_rgb, _nav_depth, _,
                  _nav_cam_pos, _nav_forward, _nav_view) = get_nav_camera_image(robot_id)
@@ -291,24 +270,22 @@ def main():
                 perc_logger.log(exc)
 
         # --- Perception on cached nav camera frame ---
-        if _nav_depth is not None:
+        if _nav_depth is not None and mission_event == 'tick':
             try:
                 points, colors = depth_to_pointcloud(
                     _nav_depth, _nav_rgb, proj_np, _nav_view
                 )
-
                 if len(points) > 10:
                     target_pts = detect_target(points, colors, tol=vision_tol)
                     table_pts  = detect_table(points, colors, tol=vision_tol)
 
                     if (len(target_pts) > 20
-                            and fsm.state in (State.SEARCH, State.NAVIGATE)
-                            and mission_event == 'tick'):
+                            and fsm.state in (State.SEARCH, State.NAVIGATE)):
                         grasp_pos, _ = estimate_grasp_pose(target_pts)
                         if grasp_pos is not None:
-                            # Use proper camera->world transform
-                            w = cam_point_to_world(grasp_pos, _nav_cam_pos, _nav_forward)
-                            w[2] = 0.685   # table surface + half cylinder height
+                            w = cam_point_to_world(
+                                grasp_pos, _nav_cam_pos, _nav_forward)
+                            w[2] = 0.685
                             kb.assert_target_estimate(*w)
                             grasp_target_pos = w
                             mission_event = 'target_found'
@@ -316,11 +293,12 @@ def main():
                             print(f"[CogArch] Target spotted at {w[:2]}")
 
                     elif (len(table_pts) > 50
-                          and fsm.state == State.SEARCH
-                          and mission_event == 'tick'):
-                        _, table_center = fit_table_plane(points, colors, tol=vision_tol)
+                          and fsm.state == State.SEARCH):
+                        _, table_center = fit_table_plane(
+                            points, colors, tol=vision_tol)
                         if table_center is not None:
-                            wt = cam_point_to_world(table_center, _nav_cam_pos, _nav_forward)
+                            wt = cam_point_to_world(
+                                table_center, _nav_cam_pos, _nav_forward)
                             kb.assert_table_position(wt[0], wt[1])
                             mission_event = 'table_found'
                             mission_data  = {'table_pos': wt[:2]}
@@ -329,10 +307,11 @@ def main():
             except Exception as exc:
                 perc_logger.log(exc)
 
-        # --- Wrist camera: only during ALIGN/GRASP, every CAM_EVERY_N_STEPS ---
+        # --- Wrist camera: only during ALIGN/GRASP on throttled tick ---
         if (fsm.state in (State.ALIGN, State.GRASP)
-                and depth is not None
-                and step_count % CAM_EVERY_N_STEPS == 0):
+                and cam_tick
+                and _wrist_depth is not None
+                and mission_event == 'tick'):
             try:
                 cam_state = p.getLinkState(robot_id, camera_link)
                 cam_pos, cam_orn = cam_state[0], cam_state[1]
@@ -342,31 +321,32 @@ def main():
                 tgt = [cam_pos[0]+fwd[0], cam_pos[1]+fwd[1], cam_pos[2]+fwd[2]]
                 wrist_view = p.computeViewMatrix(cam_pos, tgt, up)
 
-                w_pts, w_cols = depth_to_pointcloud(depth, rgb, proj_np, wrist_view)
+                w_pts, w_cols = depth_to_pointcloud(
+                    _wrist_depth, _wrist_rgb, proj_np, wrist_view)
                 if len(w_pts) > 10:
                     close_target = detect_target(w_pts, w_cols, tol=vision_tol)
                     if len(close_target) > 10:
-                        grasp_pos, _ = estimate_grasp_pose(close_target)
-                        if grasp_pos is not None:
+                        gp, _ = estimate_grasp_pose(close_target)
+                        if gp is not None:
                             wg = cam_point_to_world(
-                                grasp_pos, np.array(cam_pos),
-                                np.array(fwd)
-                            )
+                                gp, np.array(cam_pos), np.array(fwd))
                             wg[2] = 0.685
                             grasp_target_pos = wg
                             kb.assert_target_estimate(*wg)
             except Exception as exc:
                 perc_logger.log(exc)
 
-        # --- Search timeout: fall back to KB table position ---
+        # --- Search timeout ---
         if fsm.state == State.SEARCH:
             search_step_count += 1
-            if search_step_count >= SEARCH_TIMEOUT_STEPS and mission_event == 'tick':
+            if (search_step_count >= SEARCH_TIMEOUT_STEPS
+                    and mission_event == 'tick'):
                 table_pos = kb.get_table_position()
                 if table_pos:
                     mission_event = 'table_found'
                     mission_data  = {'table_pos': list(table_pos)}
-                    print(f"[CogArch] Search timeout — navigating to KB table pos {table_pos}")
+                    print(f"[CogArch] Search timeout — navigating to "
+                          f"KB table pos {table_pos}")
                     search_step_count = 0
 
         # --- State-specific event checks ---
@@ -382,15 +362,15 @@ def main():
         elif fsm.state == State.ALIGN:
             if grasp_target_pos:
                 table_pos = kb.get_table_position()
-                if table_pos and np.hypot(est_x - table_pos[0],
-                                          est_y - table_pos[1]) < 0.8:
+                if (table_pos and np.hypot(est_x - table_pos[0],
+                                           est_y - table_pos[1]) < 0.8):
                     mission_event = 'arm_aligned'
 
         elif fsm.state == State.GRASP:
             if grasp_target_pos:
                 ee_pos = p.getLinkState(robot_id, ee_index)[0]
-                if np.linalg.norm(
-                        np.array(ee_pos) - np.array(grasp_target_pos)) < 0.08:
+                if (np.linalg.norm(
+                        np.array(ee_pos) - np.array(grasp_target_pos)) < 0.08):
                     mission_event = 'grasp_success'
 
         elif fsm.state == State.LIFT:
@@ -426,9 +406,11 @@ def main():
 
         elif action == 'backup':
             p.setJointMotorControl2(robot_id, left_joint,
-                                     p.VELOCITY_CONTROL, targetVelocity=-2.0, force=10.0)
+                                     p.VELOCITY_CONTROL,
+                                     targetVelocity=-2.0, force=10.0)
             p.setJointMotorControl2(robot_id, right_joint,
-                                     p.VELOCITY_CONTROL, targetVelocity=-2.0, force=10.0)
+                                     p.VELOCITY_CONTROL,
+                                     targetVelocity=-2.0, force=10.0)
 
         elif action == 'align_arm':
             if grasp_target_pos:
@@ -452,11 +434,12 @@ def main():
 
         elif action in ('stop', 'idle', 'hold'):
             p.setJointMotorControl2(robot_id, left_joint,
-                                     p.VELOCITY_CONTROL, targetVelocity=0, force=10.0)
+                                     p.VELOCITY_CONTROL,
+                                     targetVelocity=0, force=10.0)
             p.setJointMotorControl2(robot_id, right_joint,
-                                     p.VELOCITY_CONTROL, targetVelocity=0, force=10.0)
+                                     p.VELOCITY_CONTROL,
+                                     targetVelocity=0, force=10.0)
 
-        # M9: Report at termination
         if fsm.is_terminal():
             table_pos = kb.get_table_position() or [0, 0]
             dist_rem  = np.hypot(est_x - table_pos[0], est_y - table_pos[1])

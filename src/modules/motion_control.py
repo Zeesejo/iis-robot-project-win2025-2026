@@ -8,23 +8,17 @@ FIX HISTORY:
   [F32] IK end-effector = joint 16 (gripper_base_joint) -- WRONG, reverted
   [F33] CRITICAL geometry fix:
         - IK end-effector = link 15 (wrist_roll_joint child = wrist_roll_link).
-          This is the LAST MOVABLE joint. PyBullet calculateInverseKinematics
-          requires a movable (non-fixed) link index. Using a fixed-joint link
-          (16 = gripper_base_joint) silently fails and produces garbage.
-        - IK Z target = world_Z + PALM_Z_OFFSET (0.075 m) to compensate for
-          the palm chain beyond the wrist:
-            gripper_base_joint origin z=0.05
-            finger midpoint z~=0.025
-            total = 0.075 m
-          So IK drives wrist to (world_Z + 0.075), placing palm at world_Z.
-        - Lift MUST be 0.0 during grasp. At lift=0 the arm_base is at 0.670m
-          world Z, only 2.5 cm below cylinder Z (0.695). The arm goes nearly
-          horizontal (angle=-1.7 deg), horizontal reach = 0.82m > MAX_REACH=0.55
-          so the XY clamp kicks in correctly.
-          At lift=0.3 (previous bug) arm_base=0.970, arm must angle 27.5cm
-          downward, consuming all horizontal reach -> IK fails -> arm snaps up.
-        - DO NOT call setJointMotorControl2 on lift_joint inside this function.
-          Caller is responsible for setting lift to 0.0 before grasp.
+        - IK Z target = world_Z + PALM_Z_OFFSET (0.075 m)
+        - Lift MUST be 0.0 during grasp.
+  [F37] restPoses fix:
+        shoulder restPose: 0.30 -> 1.47 rad (nearly horizontal forward).
+        elbow restPose: 0.80 -> 0.0 (straight).
+        Shoulder Z at lift=0 is 0.696m, cylinder Z is 0.695m.
+        Arm must swing HORIZONTAL FORWARD to reach cylinder 0.55m away.
+        Old restPoses (shoulder=0.30) biased IK toward the arm-pointing-UP
+        local minimum -> wrist stuck at Z=1.11, palm at Z=1.16.
+        New restPoses push the solver toward the horizontal-forward solution
+        where wrist reaches Z=0.770, palm correctly lands at Z=0.695.
 """
 
 import pybullet as p
@@ -37,15 +31,9 @@ import math
 MAX_REACH = 0.55
 
 # [F33] IK end-effector = link 15 = wrist_roll_link (child of wrist_roll_joint).
-# This is the last MOVABLE joint in the arm chain.
-# PyBullet IK silently breaks when given a fixed-joint link index.
 _IK_EE_LINK = 15
 
-# [F33] Z offset from wrist_roll_link origin to palm centre:
-#   gripper_base_joint origin z=0.050
-#   left/right finger origin z=0.000, x=0.04 (fingers extend in X)
-#   palm centre approx midpoint = 0.025 beyond gripper_base
-#   total = 0.050 + 0.025 = 0.075 m
+# [F33] Z offset from wrist_roll_link to palm centre (0.050 + 0.025 = 0.075 m)
 _PALM_Z_OFFSET = 0.075
 
 
@@ -140,7 +128,6 @@ def grasp_object(robot_id, target_pos, target_orient,
              to the correct position (palm ends up at target Z).
 
     target_orient : quaternion [0,0,0,1] for identity.
-        Gripper faces +X (forward). Fingers close in Y.
 
     phase:
         'stow'          - zero all arm joints, no IK, return immediately
@@ -149,8 +136,6 @@ def grasp_object(robot_id, target_pos, target_orient,
         'close_gripper' - IK hold + close fingers
 
     IMPORTANT: Caller must ensure lift_joint = 0.0 before/during grasp.
-    At lift=0: arm_base_z=0.670, nearly level with cylinder (0.695).
-    At lift=0.3: arm_base_z=0.970, IK cannot reach down to 0.695 -> FAIL.
     """
     num_joints_total = p.getNumJoints(robot_id)
 
@@ -197,11 +182,9 @@ def grasp_object(robot_id, target_pos, target_orient,
     dx_w = target_pos[0] - base_pos[0]
     dy_w = target_pos[1] - base_pos[1]
 
-    # [F33] IK Z: drive WRIST to (palm_world_Z + offset) so palm lands at palm_world_Z
     palm_z  = float(np.clip(target_pos[2], 0.50, 1.20))
     ik_wz   = palm_z + _PALM_Z_OFFSET
 
-    # rotate XY to body frame
     cy =  math.cos(-base_yaw)
     sy =  math.sin(-base_yaw)
     bx = dx_w * cy - dy_w * sy
@@ -213,7 +196,6 @@ def grasp_object(robot_id, target_pos, target_orient,
         bx *= s
         by *= s
 
-    # back to world frame
     cy2  = math.cos(base_yaw)
     sy2  = math.sin(base_yaw)
     ik_x = base_pos[0] + bx * cy2 - by * sy2
@@ -222,12 +204,13 @@ def grasp_object(robot_id, target_pos, target_orient,
     # ------------------------------------------------------------------ #
     # 4. IK
     # [F33] End-effector = _IK_EE_LINK = 15 (wrist_roll_link, MOVABLE).
-    # Using a FIXED link index with calculateInverseKinematics causes
-    # PyBullet to produce garbage solutions silently.
+    # [F37] restPoses: shoulder=1.47 (horizontal forward) biases the solver
+    #       toward the correct solution. With shoulder=0.30 (old), IK found
+    #       the arm-up local minimum and wrist got stuck at Z=1.11.
     # ------------------------------------------------------------------ #
     lower_limits = [-3.14, -1.00, -0.50, -1.57, -3.14]
     upper_limits = [ 3.14,  1.57,  2.00,  1.57,  3.14]
-    rest_poses   = [ 0.00,  0.30,  0.80,  0.00,  0.00]
+    rest_poses   = [ 0.00,  1.47,  0.00,  0.00,  0.00]   # [F37] shoulder forward
     joint_ranges = [u - l for u, l in zip(upper_limits, lower_limits)]
 
     ik_solution = p.calculateInverseKinematics(
@@ -249,8 +232,6 @@ def grasp_object(robot_id, target_pos, target_orient,
 
     # ------------------------------------------------------------------ #
     # 5. Map IK solution -> arm joints
-    # IK returns one value per non-fixed joint in the chain up to
-    # _IK_EE_LINK (inclusive). Build the non-fixed list up to that link.
     # ------------------------------------------------------------------ #
     non_fixed_upto_ee = [
         j for j in range(_IK_EE_LINK + 1)

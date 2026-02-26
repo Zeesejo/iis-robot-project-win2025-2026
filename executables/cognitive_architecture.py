@@ -57,6 +57,22 @@ FIX HISTORY (grasp relevant):
           MAX_JUMP_M=1.0 guard correctly fires on the first real camera hit.
         - perception.py: RANSAC max_iterations 500->100 (early-exit already
           in place); eliminates the CPU spike that caused user Ctrl+C.
+  [F46] Fix APPROACH->GRASP deadlock (three compounding bugs):
+        BUG 1 - Table in obstacle list: _initialize_world_knowledge was appending
+          the table XY to self.obstacles. The cylinder sits on the table (~0.3-0.4m
+          away), so the F45 obstacle proximity gate rejected every close-range
+          camera detection. No live detections -> target_detection_count stayed 0.
+          Fix: table XY stored in self.table_xy separately; obstacle proximity gate
+          skips the table entry by checking against self.table_xy.
+        BUG 2 - Stale cam_depth in think(): APPROACH distance_for_fsm used
+          target_camera_depth (2.69m, the stale F44 synthetic value) when
+          target_detection_count==0. FSM never saw distance < 0.55m so
+          APPROACH->GRASP transition never fired.
+          Fix: fall back to distance_2d when no live camera detections accepted.
+        BUG 3 - Hard stop magic number: act() hard stop used 0.45m instead of
+          APPROACH_STOP_M (0.40m), creating a dead zone where the robot stopped
+          but the FSM never triggered GRASP.
+          Fix: hard stop now uses APPROACH_STOP_M for consistency.
 """
 
 import pybullet as p
@@ -120,6 +136,7 @@ _TARGET_Z_MAX    = 0.95
 
 # -- [F45] Obstacle proximity rejection radius (m).
 #    If detected world XY is within this distance of a known obstacle, reject.
+#    [F46] The table is NOT in the obstacle rejection list (see _initialize_world_knowledge).
 _OBS_REJECT_RADIUS = 0.45
 
 # -- Approach tuning ---------------------------------------------------------
@@ -207,7 +224,13 @@ class CognitiveArchitecture:
         self.table_position            = None
         self.table_orientation         = None
         self.table_size                = None
-        self.obstacles                 = []
+        # [F46] Separate lists: obstacles (for nav avoidance + rejection gate)
+        #       vs table_xy (for nav avoidance only, NOT for rejection gate).
+        #       The cylinder sits ON the table so it would always be within
+        #       _OBS_REJECT_RADIUS of the table, silently blocking all close
+        #       detections.  The table is kept out of the rejection list.
+        self.obstacles                 = []   # non-table obstacles only (rejection + nav)
+        self.table_xy                  = None # table XY for nav avoidance only
         self.current_waypoint          = None
         self.approach_standoff         = None
         self._last_fsm_state           = None
@@ -275,7 +298,15 @@ class CognitiveArchitecture:
             self.table_position    = pos
             self.table_orientation = td.get('orientation')
             self.table_size        = td.get('size')
-            self.obstacles.append(pos[:2])
+            # [F46] Store table XY separately - do NOT add to self.obstacles.
+            # The F45 obstacle proximity rejection gate uses self.obstacles to
+            # filter out false detections caused by obstacle faces.  The target
+            # cylinder sits on the table (~0.3 m from table centre), which is
+            # well within _OBS_REJECT_RADIUS (0.45 m).  Adding the table here
+            # caused every close-range camera detection to be silently rejected,
+            # leaving target_detection_count==0 forever and breaking the
+            # APPROACH->GRASP transition.
+            self.table_xy = pos[:2]
         if 'obstacles' in world_map:
             for i, obs in enumerate(world_map['obstacles']):
                 pos   = obs['position']
@@ -335,6 +366,12 @@ class CognitiveArchitecture:
     def _compute_approach_standoff(self, target_pos, robot_pose):
         sd = STANDOFF_DIST_M
 
+        # [F46] Build combined obstacle list for standoff validity check
+        # (includes table so standoff point isn't placed inside the table).
+        all_obs = list(self.obstacles)
+        if self.table_xy is not None:
+            all_obs.append(self.table_xy)
+
         def _candidate(normal_2d):
             nx, ny = normal_2d
             return [target_pos[0] + sd * nx, target_pos[1] + sd * ny]
@@ -343,7 +380,7 @@ class CognitiveArchitecture:
             cx, cy = cand
             if abs(cx) > _ROOM_BOUND or abs(cy) > _ROOM_BOUND:
                 return False
-            for obs in self.obstacles:
+            for obs in all_obs:
                 if np.hypot(cx - obs[0], cy - obs[1]) < 0.35:
                     return False
             return True
@@ -467,6 +504,13 @@ class CognitiveArchitecture:
              _OBS_REJECT_RADIUS (0.45 m) of any known obstacle, the detection
              is likely picking up an obstacle face or its reflection, not the
              cylinder behind it.  Reject and wait for a better line-of-sight.
+
+        [F46] Gate 2 now checks self.obstacles only (non-table obstacles).
+          The table is stored separately in self.table_xy and is intentionally
+          excluded from the rejection list because the target cylinder sits on
+          the table (~0.3 m from table centre), which is inside the 0.45 m
+          radius.  Including the table caused all close-range detections to be
+          silently rejected, permanently blocking APPROACH->GRASP.
         """
         # [F45] Gate 1: Z-height filter
         if new_pos[2] < _TARGET_Z_MIN:
@@ -475,7 +519,7 @@ class CognitiveArchitecture:
                       f"_TARGET_Z_MIN={_TARGET_Z_MIN} (floor/obstacle level)")
             return False
 
-        # [F45] Gate 2: Obstacle proximity filter
+        # [F45/F46] Gate 2: Obstacle proximity filter (non-table obstacles only)
         for obs_xy in self.obstacles:
             dist_to_obs = np.hypot(new_pos[0] - obs_xy[0],
                                    new_pos[1] - obs_xy[1])
@@ -608,7 +652,8 @@ class CognitiveArchitecture:
                     if np.hypot(pca_world[0]-wp[0], pca_world[1]-wp[1]) < 0.5:
                         wp = pca_world
 
-                # [F45] _update_target_from_detection now also checks Z and obstacle proximity
+                # [F45/F46] _update_target_from_detection checks Z and
+                # non-table obstacle proximity
                 accepted = self._update_target_from_detection(wp, true_d, bearing)
                 if accepted and self.step_counter % 10 == 0:
                     print(f"[CogArch] TARGET at "
@@ -733,9 +778,19 @@ class CognitiveArchitecture:
 
             if self.fsm.state == RobotState.APPROACH:
                 cam_d = sensor_data.get('target_camera_depth', float('inf'))
-                distance_for_fsm = (cam_d
-                                    if MIN_TARGET_DEPTH < cam_d < MAX_TARGET_DEPTH
-                                    else distance_2d)
+                # [F46] BUG 2 FIX: use world distance (distance_2d) when no live
+                # camera detection has been accepted (target_detection_count==0).
+                # Previously, cam_d stayed at the stale F44 synthetic value of
+                # ~2.69m, so distance_for_fsm never dropped below the 0.55m
+                # GRASP threshold even when the robot was physically within reach.
+                if MIN_TARGET_DEPTH < cam_d < MAX_TARGET_DEPTH and self.target_detection_count > 0:
+                    distance_for_fsm = cam_d
+                else:
+                    distance_for_fsm = distance_2d
+                if self.step_counter % 60 == 0:
+                    print(f"[F46] APPROACH dist: world={distance_2d:.2f}m "
+                          f"cam={cam_d:.2f}m det={self.target_detection_count} "
+                          f"-> fsm_dist={distance_for_fsm:.2f}m")
             elif (self.approach_standoff is not None
                   and self.fsm.state == RobotState.NAVIGATE):
                 sdx = self.approach_standoff[0]-pose[0]
@@ -957,7 +1012,12 @@ class CognitiveArchitecture:
             cam_depth  = ctrl.get('camera_depth', float('inf'))
             world_dist = ctrl.get('world_dist_2d', float('inf'))
 
-            if world_dist < 0.45:
+            # [F46] BUG 3 FIX: use APPROACH_STOP_M constant (0.40m) instead of
+            # the previous magic number 0.45m.  The old value created a dead
+            # zone: robot halted at 0.45m but the FSM GRASP threshold is 0.55m
+            # (and F46 now uses world_dist_2d as fallback), so the robot would
+            # stop moving before the FSM could ever transition to GRASP.
+            if world_dist < APPROACH_STOP_M:
                 self._set_wheels(0, 0)
                 if self.step_counter % 60 == 0:
                     print(f"[F29] Hard stop: world_dist={world_dist:.2f}m")

@@ -2,26 +2,24 @@
 Module 6: Motion Control & Planning
 Provides PID controllers, navigation, manipulation, and path planning
 
-FIXES:
-  [F26] grasp_object: target_pos is in WORLD frame.
-        Converts to robot-body frame, clamps reach to MAX_REACH,
-        converts back to world frame for IK.
-        Joint force reduced 500 -> 50 N to prevent joint separation.
-  [F27] Pre-IK stow phase resets arm config.
-  [F31] CRITICAL: Remove double Z-offset bug.
-        Previously body_z was computed as (world_z - base_z) and then
-        IK target was reconstructed as base_z + body_z = world_z -- OK
-        in theory, but the clamping clip(body_z, 0.40, 0.85) was
-        preventing the arm from reaching table height when base_z=0.1,
-        because body_z = 0.695 - 0.1 = 0.595, clipped OK, but ik_wz
-        was base_z(0.1) + body_z(0.595) = 0.695 -- actually correct.
-        THE REAL BUG was in teleport_grasp_test.py passing
-        base_pos[2] + ARM_GRASP_Z_BODY as the world-Z input, which
-        then got further offset here.  Fix: accept pure world-Z in
-        target_pos[2] and pass it directly to IK without re-offsetting.
-        The body-frame conversion now only applies to XY (horizontal
-        reach clamping). Z is passed through as-is (world frame).
-        Z clamp updated to world-frame range [0.50, 1.20] m.
+FIX HISTORY:
+  [F26] grasp_object: world-frame target, body-frame XY clamp, force 50N
+  [F27] stow phase: drive all arm joints to 0 before IK
+  [F31] remove double-Z offset bug; Z passed as pure world frame
+  [F32] CRITICAL audit fixes:
+        - IK end-effector link = 16 (gripper_base_joint, FIXED joint whose
+          child is gripper_base). Using arm_joints[-1]=15 (wrist_roll_joint)
+          placed IK target at the wrist, 5-8 cm short of the fingers.
+        - Grasp orientation = [0,0,0] (identity). The URDF finger joints are
+          prismatic along Y with origin xyz="0.04 ±0.04 0", meaning fingers
+          close laterally (Y-axis) and the gripper opening faces +X (forward).
+          [0,pi/2,0] rotated the gripper to point down, which is wrong.
+          With [0,0,0] the gripper faces forward and wraps around the cylinder.
+        - IK joint mapping: calculateInverseKinematics returns one angle per
+          non-fixed DOF in the entire chain (lift + arm). We now slice the
+          solution by counting non-fixed joints UP TO gripper_base_joint(16),
+          then pick only the slots corresponding to arm_joints [8,9,11,12,15].
+        - Stow returns immediately after zeroing joints - no IK called.
 """
 
 import pybullet as p
@@ -32,6 +30,11 @@ import math
 
 # Maximum horizontal reach of arm from robot centre (m)
 MAX_REACH = 0.55
+
+# IK end-effector: gripper_base_joint (index 16, FIXED) -
+# PyBullet uses the child link of this joint as the IK target frame.
+# This places the IK target at the gripper palm, not the wrist.
+_GRIPPER_BASE_JOINT_IDX = 16
 
 
 class PIDController:
@@ -118,103 +121,97 @@ def grasp_object(robot_id, target_pos, target_orient,
     """
     Move the robot arm to grasp an object.
 
-    target_pos: [x, y, z] in WORLD frame.
-      - XY is converted to robot-body frame, clamped to MAX_REACH,
-        then converted back to world frame for IK.
-      - Z is used AS-IS (world frame). Pass the actual world Z of
-        the grasp point (e.g. cylinder centre height). Do NOT add
-        robot base height - this function does not offset Z.
+    target_pos : [x, y, z] in WORLD frame.
+        XY  - converted to body frame, clamped to MAX_REACH, back to world.
+        Z   - passed AS-IS (world frame, e.g. cylinder centre ~0.695 m).
+
+    target_orient : quaternion.  Use [0,0,0,1] (identity / [0,0,0] euler).
+        The URDF gripper opens along +X (finger prismatic joints in Y with
+        origin offset in X).  Identity orientation keeps gripper facing
+        forward, which is correct for a horizontal approach grasp.
 
     phase:
-      'stow'          - drive all arm joints to 0 (reset config)
-      'reach_above'   - IK to target_pos (caller adds +0.15 to Z before calling)
-      'reach_target'  - IK to target_pos
-      'close_gripper' - IK hold + close fingers
+        'stow'          - zero all arm joints, return immediately (no IK)
+        'reach_above'   - IK to target_pos (caller sets Z = cyl_z + 0.15)
+        'reach_target'  - IK to target_pos (caller sets Z = cyl_z)
+        'close_gripper' - IK hold + close fingers
     """
+    num_joints_total = p.getNumJoints(robot_id)
+
     # ------------------------------------------------------------------ #
     # 1. Discover joints
     # ------------------------------------------------------------------ #
-    num_joints_total = p.getNumJoints(robot_id)
     if arm_joints is None:
-        arm_joints    = []
-        finger_joints = []
-        gripper_link_idx = -1
+        arm_joints = []
         for i in range(num_joints_total):
             info  = p.getJointInfo(robot_id, i)
             jname = info[1].decode('utf-8')
-            lname = info[12].decode('utf-8')
             jtype = info[2]
             if jname in ('arm_base_joint', 'shoulder_joint', 'elbow_joint',
                          'wrist_pitch_joint', 'wrist_roll_joint'):
                 if jtype != p.JOINT_FIXED:
                     arm_joints.append(i)
-            if 'left_finger_joint' in jname or 'right_finger_joint' in jname:
-                finger_joints.append(i)
-            if 'gripper_base' in lname:
-                gripper_link_idx = i
-        if gripper_link_idx == -1 and arm_joints:
-            gripper_link_idx = arm_joints[-1]
-    else:
-        gripper_link_idx = arm_joints[-1]
-        finger_joints    = []
-        for i in range(num_joints_total):
-            info  = p.getJointInfo(robot_id, i)
-            jname = info[1].decode('utf-8')
-            if 'finger' in jname:
-                finger_joints.append(i)
+
+    finger_joints = []
+    for i in range(num_joints_total):
+        info  = p.getJointInfo(robot_id, i)
+        jname = info[1].decode('utf-8')
+        if 'left_finger_joint' in jname or 'right_finger_joint' in jname:
+            finger_joints.append(i)
+
+    # [F32] IK end-effector = gripper_base_joint (idx 16, FIXED).
+    # PyBullet IK targets the child link of the given joint index.
+    gripper_link_idx = _GRIPPER_BASE_JOINT_IDX
 
     # ------------------------------------------------------------------ #
-    # [F27] Stow phase
+    # [F27] Stow: zero all arm joints, NO IK
     # ------------------------------------------------------------------ #
     if phase == 'stow':
         for j in arm_joints:
             p.setJointMotorControl2(robot_id, j, p.POSITION_CONTROL,
                                     targetPosition=0.0, force=50,
-                                    maxVelocity=2.0)
+                                    maxVelocity=1.0)
         return True
 
     # ------------------------------------------------------------------ #
-    # 2. Get robot base pose
+    # 2. Robot base pose
     # ------------------------------------------------------------------ #
     base_pos, base_orn = p.getBasePositionAndOrientation(robot_id)
     base_yaw = p.getEulerFromQuaternion(base_orn)[2]
 
     # ------------------------------------------------------------------ #
-    # 3. [F31] XY-only body-frame conversion + reach clamp
-    #    Z is world-frame and passed through unchanged.
+    # 3. XY clamp to reachable range; Z straight through (world frame)
     # ------------------------------------------------------------------ #
-    dx_w = target_pos[0] - base_pos[0]
-    dy_w = target_pos[1] - base_pos[1]
-    world_z = float(target_pos[2])   # pure world Z - no offset added
+    dx_w  = target_pos[0] - base_pos[0]
+    dy_w  = target_pos[1] - base_pos[1]
+    world_z = float(np.clip(target_pos[2], 0.50, 1.20))
 
-    # Rotate XY into body frame
-    cos_y =  math.cos(-base_yaw)
-    sin_y =  math.sin(-base_yaw)
-    body_x = dx_w * cos_y - dy_w * sin_y   # forward
-    body_y = dx_w * sin_y + dy_w * cos_y   # lateral
+    # rotate to body frame
+    cy =  math.cos(-base_yaw)
+    sy =  math.sin(-base_yaw)
+    bx = dx_w * cy - dy_w * sy   # forward
+    by = dx_w * sy + dy_w * cy   # lateral
 
-    # Clamp horizontal reach
-    horiz = math.hypot(body_x, body_y)
+    horiz = math.hypot(bx, by)
     if horiz > MAX_REACH:
-        scale  = MAX_REACH / horiz
-        body_x *= scale
-        body_y *= scale
+        s   = MAX_REACH / horiz
+        bx *= s
+        by *= s
 
-    # [F31] Clamp Z to world-frame plausible range
-    # Table top = 0.625, cylinder centre ~0.695, above = ~0.845
-    world_z = float(np.clip(world_z, 0.50, 1.20))
-
-    # Convert clamped XY back to world frame
-    cos_y2 = math.cos(base_yaw)
-    sin_y2 = math.sin(base_yaw)
-    ik_wx  = base_pos[0] + body_x * cos_y2 - body_y * sin_y2
-    ik_wy  = base_pos[1] + body_x * sin_y2 + body_y * cos_y2
-    ik_wz  = world_z     # [F31] world Z passed straight through
-
-    ik_target = [ik_wx, ik_wy, ik_wz]
+    # back to world frame
+    cy2  = math.cos(base_yaw)
+    sy2  = math.sin(base_yaw)
+    ik_x = base_pos[0] + bx * cy2 - by * sy2
+    ik_y = base_pos[1] + bx * sy2 + by * cy2
+    ik_z = world_z
 
     # ------------------------------------------------------------------ #
-    # 4. IK with joint limits
+    # 4. IK
+    # [F32] Joint limits cover the 5 revolute arm DOFs only.
+    #       The IK solution vector covers ALL non-fixed joints up to
+    #       gripper_link_idx. We build a mapping: for each joint in
+    #       arm_joints, find its position in the non-fixed list that
+    #       IK returns.
     # ------------------------------------------------------------------ #
     lower_limits = [-3.14, -1.00, -0.50, -1.57, -3.14]
     upper_limits = [ 3.14,  1.57,  2.00,  1.57,  3.14]
@@ -224,43 +221,48 @@ def grasp_object(robot_id, target_pos, target_orient,
     ik_solution = p.calculateInverseKinematics(
         robot_id,
         gripper_link_idx,
-        ik_target,
+        [ik_x, ik_y, ik_z],
         targetOrientation=target_orient,
         lowerLimits=lower_limits,
         upperLimits=upper_limits,
         jointRanges=joint_ranges,
         restPoses=rest_poses,
-        maxNumIterations=200,
-        residualThreshold=0.005
+        maxNumIterations=300,
+        residualThreshold=0.003
     )
 
-    if ik_solution is None or len(ik_solution) == 0:
-        print("[Motion Control] IK solution failed")
+    if not ik_solution:
         return False
 
     # ------------------------------------------------------------------ #
-    # 5. Apply with index mapping + joint-limit clamp
+    # 5. Map IK solution slots -> arm joints
+    # [F32] calculateInverseKinematics returns one value per non-fixed
+    #       joint in the ENTIRE chain up to gripper_link_idx.
+    #       Build the non-fixed list up to (not including) gripper_base_joint
+    #       to get the correct slot index for each arm joint.
     # ------------------------------------------------------------------ #
-    non_fixed = [j for j in range(num_joints_total)
-                 if p.getJointInfo(robot_id, j)[2] != p.JOINT_FIXED]
+    non_fixed_upto_gripper = [
+        j for j in range(gripper_link_idx)
+        if p.getJointInfo(robot_id, j)[2] != p.JOINT_FIXED
+    ]
 
     for joint_idx in arm_joints:
-        if joint_idx in non_fixed:
-            ik_idx = non_fixed.index(joint_idx)
-            if ik_idx < len(ik_solution):
+        if joint_idx in non_fixed_upto_gripper:
+            slot = non_fixed_upto_gripper.index(joint_idx)
+            if slot < len(ik_solution):
                 info   = p.getJointInfo(robot_id, joint_idx)
                 lo, hi = info[8], info[9]
-                target = float(np.clip(ik_solution[ik_idx], lo, hi))
+                tgt    = float(np.clip(ik_solution[slot], lo, hi))
                 p.setJointMotorControl2(
                     robot_id, joint_idx,
                     controlMode=p.POSITION_CONTROL,
-                    targetPosition=target,
+                    targetPosition=tgt,
                     force=50,
                     maxVelocity=1.0
                 )
 
     # ------------------------------------------------------------------ #
-    # 6. Gripper
+    # 6. Fingers
     # ------------------------------------------------------------------ #
     for fi in finger_joints:
         jname = p.getJointInfo(robot_id, fi)[1].decode('utf-8')
@@ -278,14 +280,12 @@ def grasp_object(robot_id, target_pos, target_orient,
 # Standalone Test Mode
 # --------------------------
 if __name__ == "__main__":
-    import pybullet_data
     print("[Motion Control] Running in test mode...")
     physicsClient = p.connect(p.GUI)
     p.setGravity(0, 0, -9.81)
     p.setAdditionalSearchPath(pybullet_data.getDataPath())
     p.loadURDF("plane.urdf")
     robot_id = p.loadURDF("../robot/robot.urdf", basePosition=[0, 0, 0.2])
-    print(f"[Motion Control] Robot loaded. ID: {robot_id}")
     goal      = [2.0, 2.0]
     test_pose = [0.0, 0.0, 0.0]
     for _ in range(2400):

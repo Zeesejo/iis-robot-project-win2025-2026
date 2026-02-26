@@ -1,17 +1,20 @@
 """
 Module 10: Cognitive Architecture - SENSE-THINK-ACT Loop
-Integrates all 10 modules for autonomous navigate-to-grasp mission.
+Integrates all modules for autonomous navigate-to-grasp mission.
 
-FIXES in this revision
-  [F1-F25]  (see previous commits)
-  [F26] motion_control: world->body XY conversion; force 50N; reach clamp 0.55m
-  [F27] motion_control: pre-IK stow phase
-  [F28] GRASP block: body-frame grasp target (forward from robot)
-  [F29] approach_visual: hard stop at world_dist < 0.45m
+FIX HISTORY (relevant grasp fixes):
+  [F28] body-frame grasp target (forward from robot)
+  [F29] approach_visual hard stop at world_dist < 0.45m
   [F30] NAVIGATE: stop before table edge
-  [F31] CRITICAL Z fix: grasp IK target uses REAL WORLD Z of cylinder,
-        not body-frame offset. Gripper orientation set to [0, pi/2, 0]
-        (downward-pointing) for top-down grasp.
+  [F31] real world Z for IK; no body-frame Z offset
+  [F32] CRITICAL audit:
+        - IK end-effector = gripper_base_joint (idx 16)
+        - Grasp orientation = [0,0,0] (identity, gripper faces forward)
+        - GRASP block IK XY uses actual KB target position (tx,ty)
+          not robot-forward estimate. Clamped to MAX_REACH inside
+          grasp_object() as before.
+        - _GRASP_WORLD_Z / _GRASP_ABOVE_WORLD_Z from world_builder
+          constants (unchanged from F31).
 """
 
 import pybullet as p
@@ -93,14 +96,12 @@ _ROOM_BOUND = 3.5
 _TARGET_Z_MIN = 0.60
 _TARGET_Z_MAX = 0.95
 
-# -- [F31] Grasp IK constants ------------------------------------------------
-# Forward offset from robot base to IK XY target
-_ARM_FORWARD_OFFSET = 0.45   # m
-# Real world Z values from world_builder constants
+# -- [F31/F32] Grasp IK constants --------------------------------------------
 _GRASP_WORLD_Z       = TABLE_HEIGHT + (TARGET_HEIGHT / 2.0) + 0.01  # ~0.695 m
 _GRASP_ABOVE_WORLD_Z = _GRASP_WORLD_Z + 0.15                         # ~0.845 m
-# Gripper orientation: [0, pi/2, 0] = pointing downward for top-down grasp
-_GRASP_ORIENTATION   = None   # computed after p.connect in __init__
+# [F32] Identity orientation: gripper faces +X (forward), fingers close in Y
+# This matches URDF prismatic finger geometry.
+_GRASP_ORIENTATION   = None   # computed after p.connect (in __init__)
 
 
 def _lidar_has_data(lidar):
@@ -120,8 +121,8 @@ class CognitiveArchitecture:
         self.room_id   = room_id
         self.target_id = target_id
 
-        # [F31] Compute downward gripper orientation after p.connect
-        self.grasp_orientation = p.getQuaternionFromEuler([0, math.pi / 2, 0])
+        # [F32] Identity orientation: gripper faces forward, fingers close in Y
+        self.grasp_orientation = p.getQuaternionFromEuler([0.0, 0.0, 0.0])
 
         initialize_state_estimator()
         self.sensor_camera_id, self.sensor_lidar_id = get_sensor_id(self.robot_id)
@@ -681,37 +682,38 @@ class CognitiveArchitecture:
                         'world_dist_2d':     distance_2d}
 
         elif self.fsm.state == RobotState.GRASP:
-            # [F31] Use real world Z from world_builder constants.
-            # XY: ARM_FORWARD_OFFSET metres in front of robot base (robot is
-            # already facing cylinder after APPROACH).
-            base_pos_pb, base_orn_pb = p.getBasePositionAndOrientation(self.robot_id)
-            base_yaw = p.getEulerFromQuaternion(base_orn_pb)[2]
-
-            grasp_wx = base_pos_pb[0] + _ARM_FORWARD_OFFSET * math.cos(base_yaw)
-            grasp_wy = base_pos_pb[1] + _ARM_FORWARD_OFFSET * math.sin(base_yaw)
-
-            # [F31] World Z direct from world_builder - no body-frame offset
-            grasp_wz = _GRASP_WORLD_Z        # ~0.695 m  (cylinder centre)
-            above_wz = _GRASP_ABOVE_WORLD_Z  # ~0.845 m  (15 cm above)
-
-            gt = self.fsm.get_time_in_state()
+            # [F32] IK XY uses ACTUAL target position from KB/perception
+            # (not robot-forward offset). grasp_object() clamps to MAX_REACH.
+            # Z uses real world constants from world_builder.
+            gt    = self.fsm.get_time_in_state()
             phase = ('stow'          if gt < 1.0  else
                      'reach_above'   if gt < 3.0  else
                      'reach_target'  if gt < 6.0  else
                      'close_gripper')
 
-            approach_pos = [grasp_wx, grasp_wy, above_wz]
-            grasp_pos    = [grasp_wx, grasp_wy, grasp_wz]
+            # Get best available target XY
+            kb_pos = self.kb.query_position('target')
+            if target_pos is not None:
+                tgt_xy = target_pos[:2]
+            elif kb_pos is not None:
+                tgt_xy = kb_pos[:2]
+            else:
+                # fallback: use table position (should not happen)
+                tgt_xy = self.table_position[:2] if self.table_position else [0, 0]
+
+            grasp_z  = _GRASP_WORLD_Z        # ~0.695 m cylinder centre
+            above_z  = _GRASP_ABOVE_WORLD_Z  # ~0.845 m above cylinder
+            ik_z     = above_z if phase in ('stow', 'reach_above') else grasp_z
+
+            grasp_pos = [tgt_xy[0], tgt_xy[1], ik_z]
 
             if self.step_counter % 120 == 0:
-                print(f"[Act] GRASP phase={phase}, "
-                      f"XY=({grasp_wx:.2f},{grasp_wy:.2f}), "
-                      f"Z={grasp_wz:.3f}m (world), above_Z={above_wz:.3f}m")
+                print(f"[Act] GRASP phase={phase}  "
+                      f"ik=({tgt_xy[0]:.3f},{tgt_xy[1]:.3f},{ik_z:.3f})")
 
             ctrl = {'mode': 'grasp',
-                    'approach_pos': approach_pos,
-                    'grasp_pos':    grasp_pos,
-                    'phase':        phase}
+                    'grasp_pos': grasp_pos,
+                    'phase':     phase}
 
         elif self.fsm.state == RobotState.LIFT:
             ctrl = {'mode': 'lift', 'lift_height': 0.2, 'gripper': 'close'}
@@ -883,9 +885,8 @@ class CognitiveArchitecture:
 
         elif mode == 'grasp':
             self._set_wheels(0, 0)
-            phase = ctrl.get('phase', 'reach_target')
-            ap    = ctrl['approach_pos']
-            gpos  = ctrl['grasp_pos']
+            phase    = ctrl.get('phase', 'reach_target')
+            gpos     = ctrl['grasp_pos']
 
             if self.lift_joint_idx is not None:
                 p.setJointMotorControl2(self.robot_id, self.lift_joint_idx,
@@ -893,13 +894,10 @@ class CognitiveArchitecture:
                                         targetPosition=0.3, force=100,
                                         maxVelocity=0.5)
 
-            tgt_p = ap if phase in ('reach_above', 'stow') else gpos
-            close = (phase == 'close_gripper')
-
-            # [F31] Use downward gripper orientation
-            grasp_object(self.robot_id, tgt_p, self.grasp_orientation,
+            # [F32] identity orientation: gripper faces forward
+            grasp_object(self.robot_id, gpos, self.grasp_orientation,
                          arm_joints=self.arm_joints or None,
-                         close_gripper=close,
+                         close_gripper=(phase == 'close_gripper'),
                          phase=phase)
 
         elif mode == 'lift':
@@ -961,6 +959,7 @@ def main():
     print(f"[Init] M9 DISABLED")
     print(f"[Init] Grasp world Z = {_GRASP_WORLD_Z:.3f} m, "
           f"above Z = {_GRASP_ABOVE_WORLD_Z:.3f} m")
+    print(f"[Init] Grasp orientation = identity [0,0,0] (gripper faces forward)")
     print("[Init] Mission: navigate to table, grasp red cylinder\n")
 
     while p.isConnected():

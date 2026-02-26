@@ -15,13 +15,20 @@ def depth_to_pointcloud(depth, rgb, proj_matrix, view_matrix,
     Convert a PyBullet depth buffer + RGB image to a 3D point cloud
     with colour annotations.
 
+    depth may be a flat (img_h*img_w,) tuple/array from PyBullet
+    or already a (img_h, img_w) array — both are handled.
+
     proj_matrix may be passed as:
       - a flat 16-element tuple/list (raw PyBullet output) -> reshaped here
       - a (4,4) numpy array                                -> used directly
 
     Returns: points (N,3), colors (N,3)
     """
-    depth = np.array(depth)
+    # --- depth: always reshape to 2D (img_h, img_w) ---
+    depth = np.array(depth, dtype=np.float32)
+    if depth.ndim == 1:
+        depth = depth.reshape(img_h, img_w)
+
     rgb_arr = np.array(rgb).reshape(img_h, img_w, 4)[:, :, :3] / 255.0
 
     # Normalise proj_matrix to a (4,4) array regardless of input format
@@ -51,7 +58,7 @@ def depth_to_pointcloud(depth, rgb, proj_matrix, view_matrix,
 
     points = np.stack([x_flat, y_flat, z_flat], axis=-1)  # shape (N, 3)
 
-    # Remove points at max range (background) — all arrays are now 1-D
+    # Remove points at max range (background)
     valid = z_flat < (far * 0.99)                    # shape (N,)
     return points[valid], colors[valid]
 

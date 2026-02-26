@@ -38,6 +38,15 @@ FIXES in this revision
         to prevent hard turns from stale wide-angle target estimates.
   [F25] approach_visual: prefer cam_depth over world_dist when world_dist
         is unreliable (> 2.5 m while cam_depth < 2.5 m).
+  [F26] motion_control: convert world-frame grasp target to robot-body
+        frame before IK; clamp reach to 0.55 m; force 500->50 N.
+  [F27] motion_control: pre-IK stow (phase='stow') resets arm config.
+  [F28] cognitive_architecture GRASP: compute grasp target as a forward
+        offset from robot base in robot-frame, not raw world coords.
+        Pre-IK stow inserted as phase 0 (t < 1 s).
+  [F29] approach_visual: hard stop if world_dist < 0.45 m (under-table).
+  [F30] NAVIGATE: stop if robot is within 0.4 m of table edge to prevent
+        driving under table.
 """
 
 import pybullet as p
@@ -118,6 +127,13 @@ _ROOM_BOUND = 3.5
 # -- [F20] Target Z clamp (cylinder sits on table ~0.625 m) ------------------
 _TARGET_Z_MIN = 0.60
 _TARGET_Z_MAX = 0.95
+
+# -- [F26] Arm reach constants -----------------------------------------------
+# Forward offset from robot centre to arm base ~0.25 m; max arm reach ~0.55 m
+# So max useful forward reach from robot centre = 0.25 + 0.55 = 0.80 m
+# We target 0.45 m forward from base (conservative but reachable)
+_ARM_FORWARD_OFFSET = 0.45   # m forward from robot base centre
+_ARM_GRASP_Z_BODY   = 0.65   # m above robot base (table top ~0.72 m world -> ~0.62 m body)
 
 
 def _lidar_has_data(lidar):
@@ -595,16 +611,13 @@ class CognitiveArchitecture:
             self._spin_complete   = False
             print("[F14-A] Entered SEARCH: starting 360 spin-in-place")
 
-        # [F22] Hard-reset target smoother on NAVIGATE->APPROACH so that
-        # accumulated orbit/wide-angle detections don't poison close-range
-        # steering.  Fresh detections at short range converge in ~5 steps.
+        # [F22] Hard-reset target smoother on NAVIGATE->APPROACH
         if (current_state == RobotState.APPROACH
                 and self._last_fsm_state == RobotState.NAVIGATE):
             print("[F22] APPROACH entry: resetting target position smoother")
             self.target_position_smoothed = None
             self.target_detection_count   = 0
             self.pca_target_pose          = None
-            # Keep self.target_position as a fallback until a fresh detection arrives
 
         if (self._last_fsm_state == RobotState.APPROACH
                 and current_state != RobotState.APPROACH):
@@ -756,24 +769,46 @@ class CognitiveArchitecture:
 
         # -- GRASP -----------------------------------------------------------
         elif self.fsm.state == RobotState.GRASP:
-            if target_pos:
-                gp    = self.grasp_planner.plan_grasp(target_pos)
-                gt    = self.fsm.get_time_in_state()
-                phase = ('reach_above'  if gt < 2.5 else
-                         'reach_target' if gt < 5.5 else
-                         'close_gripper')
-                # [F19] Override approach_pos with standoff geometry
-                if self.approach_standoff is not None:
-                    gp['approach_pos'] = [
-                        self.approach_standoff[0],
-                        self.approach_standoff[1],
-                        target_pos[2] + 0.15
-                    ]
-                ctrl = {'mode': 'grasp',
-                        'approach_pos': gp['approach_pos'],
-                        'grasp_pos':    gp['grasp_pos'],
-                        'orientation':  gp['orientation'],
-                        'phase':        phase}
+            # [F28] Compute grasp target in body-relative world coords.
+            # Instead of using the raw (potentially noisy) world target position,
+            # we compute a point that is exactly _ARM_FORWARD_OFFSET metres in
+            # front of the robot base and _ARM_GRASP_Z_BODY above the base.
+            # This is always within the arm's reach envelope.
+            base_pos_pb, base_orn_pb = p.getBasePositionAndOrientation(self.robot_id)
+            base_yaw = p.getEulerFromQuaternion(base_orn_pb)[2]
+
+            # World-frame grasp position: forward from robot, at table height
+            grasp_wx = base_pos_pb[0] + _ARM_FORWARD_OFFSET * math.cos(base_yaw)
+            grasp_wy = base_pos_pb[1] + _ARM_FORWARD_OFFSET * math.sin(base_yaw)
+            grasp_wz = base_pos_pb[2] + _ARM_GRASP_Z_BODY
+
+            # Above-grasp position (for reach_above phase)
+            above_wx = base_pos_pb[0] + _ARM_FORWARD_OFFSET * math.cos(base_yaw)
+            above_wy = base_pos_pb[1] + _ARM_FORWARD_OFFSET * math.sin(base_yaw)
+            above_wz = grasp_wz + 0.15
+
+            gt = self.fsm.get_time_in_state()
+            # Phase 0 (t < 1 s): stow arm to reset config before IK
+            # Phase 1 (1-3 s):   reach above
+            # Phase 2 (3-6 s):   reach target
+            # Phase 3 (>6 s):    close gripper
+            phase = ('stow'          if gt < 1.0  else
+                     'reach_above'   if gt < 3.0  else
+                     'reach_target'  if gt < 6.0  else
+                     'close_gripper')
+
+            approach_pos = [above_wx, above_wy, above_wz]
+            grasp_pos    = [grasp_wx, grasp_wy, grasp_wz]
+
+            if self.step_counter % 120 == 0:
+                print(f"[Act] GRASP phase={phase}, "
+                      f"target=({grasp_wx:.2f},{grasp_wy:.2f},{grasp_wz:.2f})")
+
+            ctrl = {'mode': 'grasp',
+                    'approach_pos': approach_pos,
+                    'grasp_pos':    grasp_pos,
+                    'orientation':  [0, 0, 0],
+                    'phase':        phase}
 
         # -- LIFT ------------------------------------------------------------
         elif self.fsm.state == RobotState.LIFT:
@@ -805,7 +840,7 @@ class CognitiveArchitecture:
     def _stow_arm(self):
         for j in self.arm_joints:
             p.setJointMotorControl2(self.robot_id, j, p.POSITION_CONTROL,
-                                    targetPosition=0.0, force=500, maxVelocity=2.0)
+                                    targetPosition=0.0, force=50, maxVelocity=2.0)
 
     def _set_wheels(self, left, right):
         for i in [0, 2]:
@@ -904,8 +939,14 @@ class CognitiveArchitecture:
             cam_depth  = ctrl.get('camera_depth', float('inf'))
             world_dist = ctrl.get('world_dist_2d', float('inf'))
 
+            # [F29] Hard stop if robot is too close - likely under/against table
+            if world_dist < 0.45:
+                self._set_wheels(0, 0)
+                if self.step_counter % 60 == 0:
+                    print(f"[F29] Hard stop: world_dist={world_dist:.2f}m < 0.45m")
+                return
+
             # [F25] Prefer cam_depth when world position estimate is stale
-            # (world_dist >> cam_depth means smoother hasn't converged yet)
             if (cam_depth < MAX_TARGET_DEPTH and
                     (world_dist > cam_depth * 1.5 or world_dist > 2.5)):
                 sd = cam_depth
@@ -914,11 +955,9 @@ class CognitiveArchitecture:
             else:
                 sd = cam_depth
 
-            # [F24] Bearing: use world-frame heading when reliable,
-            # but clamp to ±25 deg to avoid hard turns from stale estimates.
-            # At close range (<1 m) trust bearing fully.
-            _MAX_BEARING_FAR  = math.radians(25.0)  # clamp when sd > 1 m
-            _MAX_BEARING_NEAR = math.radians(60.0)  # relax clamp when sd < 1 m
+            # [F24] Clamp bearing to avoid hard turns from stale estimates
+            _MAX_BEARING_FAR  = math.radians(25.0)
+            _MAX_BEARING_NEAR = math.radians(60.0)
             bearing_limit = _MAX_BEARING_NEAR if sd < 1.0 else _MAX_BEARING_FAR
 
             if world_tgt is not None and pose is not None:
@@ -962,22 +1001,24 @@ class CognitiveArchitecture:
 
         elif mode == 'grasp':
             self._set_wheels(0, 0)
-            phase = ctrl.get('phase', 'close_gripper')
+            phase = ctrl.get('phase', 'reach_target')
             ap    = ctrl['approach_pos']
             gpos  = ctrl['grasp_pos']
             orn   = p.getQuaternionFromEuler(ctrl['orientation'])
+
             if self.lift_joint_idx is not None:
                 p.setJointMotorControl2(self.robot_id, self.lift_joint_idx,
                                         p.POSITION_CONTROL,
                                         targetPosition=0.3, force=100,
                                         maxVelocity=0.5)
+
+            tgt_p = ap if phase in ('reach_above', 'stow') else gpos
             close = (phase == 'close_gripper')
-            tgt_p = ap if phase == 'reach_above' else gpos
-            if self.step_counter % 120 == 0:
-                print(f"[Act] GRASP phase={phase}")
+
             grasp_object(self.robot_id, tgt_p, orn,
                          arm_joints=self.arm_joints or None,
-                         close_gripper=close)
+                         close_gripper=close,
+                         phase=phase)
 
         elif mode == 'lift':
             self._set_wheels(0, 0)
@@ -1004,7 +1045,7 @@ class CognitiveArchitecture:
                 self._set_wheels(rv-at, rv+at)
                 for j in self.arm_joints:
                     p.setJointMotorControl2(self.robot_id, j, p.POSITION_CONTROL,
-                                            targetPosition=0.0, force=200,
+                                            targetPosition=0.0, force=50,
                                             maxVelocity=1.0)
                 if self.lift_joint_idx is not None:
                     p.setJointMotorControl2(self.robot_id, self.lift_joint_idx,

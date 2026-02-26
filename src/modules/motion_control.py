@@ -1,12 +1,30 @@
 """
 Module 6: Motion Control & Planning
 Provides PID controllers, navigation, manipulation, and path planning
+
+FIXES:
+  [F26] grasp_object: target_pos is now expected in WORLD frame.
+        The function reads the robot base pose from PyBullet and converts
+        the target to robot-body frame before calling IK, so the arm is
+        never asked to reach beyond its physical envelope.
+        Reach is clamped to MAX_REACH=0.55 m.
+        Joint force reduced 500->50 N to prevent joint separation on
+        infeasible IK solutions.
+  [F27] Pre-IK stow: if called with phase='stow', drives all arm joints
+        to 0 and returns immediately (caller does this for one step before
+        the real IK call to reset configuration).
 """
 
 import pybullet as p
 import pybullet_data
+import numpy as np
 import time
 import math
+
+# Maximum forward reach of arm from robot centre (m)
+# Shoulder offset(0.025) + shoulder_link(0.40) + elbow_link(0.29) + wrist(0.10) = 0.815
+# but horizontal projection at typical pose is ~0.55 m
+MAX_REACH = 0.55
 
 # --------------------------
 # PID Controller Class
@@ -59,7 +77,6 @@ def plan_path(start, goal):
                 return sol["Path"]
         except:
             pass
-    # Fallback: simple straight-line path
     return [goal]
 
 # --------------------------
@@ -69,247 +86,235 @@ def move_to_goal(robot_id, goal_pos, current_pose, wheel_joints=[0, 1, 2, 3], dt
     """
     Move robot base using PID controller to goal position (x, y)
     Uses differential drive: Left wheels [0,2], Right wheels [1,3]
-    
-    Args:
-        robot_id: PyBullet robot body ID
-        goal_pos: Target position [x, y]
-        current_pose: Current estimated pose [x, y, theta] from state estimation
-        wheel_joints: List of wheel joint indices [FL=0, FR=1, BL=2, BR=3]
-        dt: Time step
-    
-    Returns:
-        Current distance to goal
     """
     x, y = current_pose[0], current_pose[1]
     theta = current_pose[2] if len(current_pose) > 2 else 0.0
-    
+
     distance = math.hypot(goal_pos[0] - x, goal_pos[1] - y)
-    
+
     if distance > 0.05:
-        # Calculate heading to target
         angle_to_target = math.atan2(goal_pos[1] - y, goal_pos[0] - x)
         heading_error = angle_to_target - theta
-        # Normalize to [-pi, pi]
         heading_error = math.atan2(math.sin(heading_error), math.cos(heading_error))
-        
-        # PID-style differential drive control
+
         Kp_lin = 3.0
         Kp_ang = 4.0
         forward_vel = min(Kp_lin * distance, 5.0)
         angular_vel = Kp_ang * heading_error
-        
-        left_vel = forward_vel - angular_vel
+
+        left_vel  = forward_vel - angular_vel
         right_vel = forward_vel + angular_vel
-        
-        # Apply to left wheels (FL=0, BL=2) and right wheels (FR=1, BR=3)
-        for i in [0, 2]:  # Left wheels
+
+        for i in [0, 2]:
             p.setJointMotorControl2(robot_id, i, p.VELOCITY_CONTROL,
-                                   targetVelocity=left_vel, force=5000.)
-        for i in [1, 3]:  # Right wheels
+                                    targetVelocity=left_vel, force=5000.)
+        for i in [1, 3]:
             p.setJointMotorControl2(robot_id, i, p.VELOCITY_CONTROL,
-                                   targetVelocity=right_vel, force=5000.)
+                                    targetVelocity=right_vel, force=5000.)
     else:
-        # Stop at goal
         for i in wheel_joints:
             p.setJointMotorControl2(robot_id, i, p.VELOCITY_CONTROL,
-                                   targetVelocity=0.0, force=5000.)
-    
+                                    targetVelocity=0.0, force=5000.)
+
     return distance
 
-def grasp_object(robot_id, target_pos, target_orient, arm_joints=None, close_gripper=True):
+
+def grasp_object(robot_id, target_pos, target_orient,
+                 arm_joints=None, close_gripper=True, phase='reach_target'):
     """
-    Move the robot arm to grasp an object using Inverse Kinematics
-    
-    Args:
-        robot_id: PyBullet robot body ID
-        target_pos: Target position [x, y, z]
-        target_orient: Target orientation (quaternion)
-        arm_joints: List of arm joint indices (auto-detect if None)
-        close_gripper: Whether to close gripper after reaching target
-    
-    Returns:
-        True if IK solution found, False otherwise
+    [F26] Move the robot arm to grasp an object.
+
+    target_pos is in WORLD frame.  This function:
+      1. Reads the robot base pose from PyBullet.
+      2. Converts target_pos into the robot-body frame.
+      3. Clamps the reach to MAX_REACH so IK never gets an impossible target.
+      4. Runs IK with the clamped body-frame target.
+      5. Applies joint positions with low force (50 N) to prevent
+         joint separation on infeasible solutions.
+
+    phase:
+      'stow'         - drive all arm joints to 0 (reset config, no IK)
+      'reach_above'  - aim for target_pos + 0.15 m above
+      'reach_target' - aim for target_pos directly
+      'close_gripper'- same as reach_target but closes gripper
     """
-    # Auto-detect arm joints from robot URDF structure
+    # ------------------------------------------------------------------ #
+    # 1. Discover joints
+    # ------------------------------------------------------------------ #
+    num_joints_total = p.getNumJoints(robot_id)
     if arm_joints is None:
-        # Based on robot.urdf analysis:
-        # - arm_base_joint, shoulder_joint, elbow_joint, wrist_pitch_joint, wrist_roll_joint
-        # These are the 5 revolute joints for the arm
-        num_joints = p.getNumJoints(robot_id)
-        arm_joints = []
-        gripper_link_idx = -1
+        arm_joints   = []
         finger_joints = []
-        
-        for i in range(num_joints):
-            joint_info = p.getJointInfo(robot_id, i)
-            joint_name = joint_info[1].decode('utf-8')
-            joint_type = joint_info[2]
-            
-            # Collect arm joints in order (only movable joints, skip fixed cosmetic joints)
-            if joint_type == p.JOINT_FIXED:
-                pass  # Skip fixed joints like elbow_joint_start, wrist_joint_start, etc.
-            elif joint_name == 'arm_base_joint':
-                arm_joints.append(i)
-            elif joint_name == 'shoulder_joint':
-                arm_joints.append(i)
-            elif joint_name == 'elbow_joint':
-                arm_joints.append(i)
-            elif joint_name == 'wrist_pitch_joint':
-                arm_joints.append(i)
-            elif joint_name == 'wrist_roll_joint':
-                arm_joints.append(i)
-            
-            # Find gripper base link (end effector for IK)
-            link_name = joint_info[12].decode('utf-8')
-            if 'gripper_base' in link_name:
-                gripper_link_idx = i
-            
-            # Find finger joints for grasping
-            if 'left_finger_joint' in joint_name or 'right_finger_joint' in joint_name:
+        gripper_link_idx = -1
+        for i in range(num_joints_total):
+            info  = p.getJointInfo(robot_id, i)
+            jname = info[1].decode('utf-8')
+            lname = info[12].decode('utf-8')
+            jtype = info[2]
+            if jname in ('arm_base_joint', 'shoulder_joint', 'elbow_joint',
+                         'wrist_pitch_joint', 'wrist_roll_joint'):
+                if jtype != p.JOINT_FIXED:
+                    arm_joints.append(i)
+            if 'left_finger_joint' in jname or 'right_finger_joint' in jname:
                 finger_joints.append(i)
-        
-        if len(arm_joints) < 5:
-            print(f"[Motion Control] Warning: Only found {len(arm_joints)} arm joints, expected 5")
-            return False
-        
-        if gripper_link_idx == -1:
-            print("[Motion Control] Warning: Could not find gripper_base link")
-            # Use last arm joint as fallback
+            if 'gripper_base' in lname:
+                gripper_link_idx = i
+        if gripper_link_idx == -1 and arm_joints:
             gripper_link_idx = arm_joints[-1]
     else:
-        # If arm_joints provided, assume gripper is the link after last joint
         gripper_link_idx = arm_joints[-1]
-        # Try to find finger joints
-        num_joints = p.getNumJoints(robot_id)
         finger_joints = []
-        for i in range(num_joints):
-            joint_info = p.getJointInfo(robot_id, i)
-            joint_name = joint_info[1].decode('utf-8')
-            if 'finger' in joint_name:
+        for i in range(num_joints_total):
+            info  = p.getJointInfo(robot_id, i)
+            jname = info[1].decode('utf-8')
+            if 'finger' in jname:
                 finger_joints.append(i)
-    
-    # Calculate IK solution
+
+    # ------------------------------------------------------------------ #
+    # [F27] Stow phase: reset all arm joints to zero and return
+    # ------------------------------------------------------------------ #
+    if phase == 'stow':
+        for j in arm_joints:
+            p.setJointMotorControl2(robot_id, j, p.POSITION_CONTROL,
+                                    targetPosition=0.0, force=50,
+                                    maxVelocity=2.0)
+        return True
+
+    # ------------------------------------------------------------------ #
+    # 2. Get robot base pose from PyBullet (ground truth, world frame)
+    # ------------------------------------------------------------------ #
+    base_pos, base_orn = p.getBasePositionAndOrientation(robot_id)
+    base_yaw = p.getEulerFromQuaternion(base_orn)[2]
+
+    # ------------------------------------------------------------------ #
+    # 3. Convert world-frame target to robot-body frame
+    # ------------------------------------------------------------------ #
+    wp = list(target_pos)
+    if phase == 'reach_above':
+        wp[2] = wp[2] + 0.15   # aim 15 cm above target
+
+    dx_w = wp[0] - base_pos[0]
+    dy_w = wp[1] - base_pos[1]
+    dz_w = wp[2] - base_pos[2]
+
+    # Rotate into body frame (yaw only)
+    cos_y = math.cos(-base_yaw)
+    sin_y = math.sin(-base_yaw)
+    body_x =  dx_w * cos_y - dy_w * sin_y   # forward
+    body_y =  dx_w * sin_y + dy_w * cos_y   # lateral
+    body_z = dz_w
+
+    # ------------------------------------------------------------------ #
+    # 4. Clamp reach to MAX_REACH
+    # ------------------------------------------------------------------ #
+    horiz = math.hypot(body_x, body_y)
+    if horiz > MAX_REACH:
+        scale  = MAX_REACH / horiz
+        body_x *= scale
+        body_y *= scale
+
+    # Clamp z: arm can reach from ~0.5 m (stowed) to ~1.5 m above ground.
+    # In body frame z is relative to base (which is ~0.1 m above ground).
+    # Table top ~0.72 m -> body_z ~ 0.62. Cylinder top ~0.82 m -> body_z ~ 0.72.
+    body_z = float(np.clip(body_z, 0.40, 0.85))
+
+    # Convert back to world frame for IK (PyBullet IK works in world frame)
+    cos_y2 = math.cos(base_yaw)
+    sin_y2 = math.sin(base_yaw)
+    ik_wx = base_pos[0] + body_x * cos_y2 - body_y * sin_y2
+    ik_wy = base_pos[1] + body_x * sin_y2 + body_y * cos_y2
+    ik_wz = base_pos[2] + body_z
+
+    ik_target = [ik_wx, ik_wy, ik_wz]
+
+    # ------------------------------------------------------------------ #
+    # 5. IK
+    # ------------------------------------------------------------------ #
+    # Joint lower/upper limits from URDF for damped IK
+    lower_limits = [-3.14, -1.00, -0.50, -1.57, -3.14]
+    upper_limits = [ 3.14,  1.57,  2.00,  1.57,  3.14]
+    rest_poses   = [0.0,    0.5,   1.0,   0.0,   0.0  ]
+    joint_ranges = [u - l for u, l in zip(upper_limits, lower_limits)]
+
     ik_solution = p.calculateInverseKinematics(
-        robot_id, 
-        gripper_link_idx,  # End effector link
-        target_pos, 
+        robot_id,
+        gripper_link_idx,
+        ik_target,
         targetOrientation=target_orient,
-        maxNumIterations=100,
-        residualThreshold=0.001
+        lowerLimits=lower_limits,
+        upperLimits=upper_limits,
+        jointRanges=joint_ranges,
+        restPoses=rest_poses,
+        maxNumIterations=200,
+        residualThreshold=0.005
     )
-    
+
     if ik_solution is None or len(ik_solution) == 0:
         print("[Motion Control] IK solution failed")
         return False
-    
-    # Build mapping from joint index to IK solution index.
-    # IK returns one value per non-fixed joint, in joint-index order.
-    num_joints_total = p.getNumJoints(robot_id)
-    non_fixed_joints = []
-    for j in range(num_joints_total):
-        if p.getJointInfo(robot_id, j)[2] != p.JOINT_FIXED:
-            non_fixed_joints.append(j)
-    
-    # Apply IK solution to arm joints using correct index mapping
+
+    # ------------------------------------------------------------------ #
+    # 6. Apply - map IK indices to arm joints
+    # ------------------------------------------------------------------ #
+    non_fixed_joints = [j for j in range(num_joints_total)
+                        if p.getJointInfo(robot_id, j)[2] != p.JOINT_FIXED]
+
     for joint_idx in arm_joints:
         if joint_idx in non_fixed_joints:
             ik_idx = non_fixed_joints.index(joint_idx)
             if ik_idx < len(ik_solution):
+                info   = p.getJointInfo(robot_id, joint_idx)
+                lo, hi = info[8], info[9]
+                target = float(np.clip(ik_solution[ik_idx], lo, hi))
                 p.setJointMotorControl2(
-                    robot_id,
-                    joint_idx,
+                    robot_id, joint_idx,
                     controlMode=p.POSITION_CONTROL,
-                    targetPosition=ik_solution[ik_idx],
-                    force=500,
+                    targetPosition=target,
+                    force=50,          # [F26] was 500 - low force prevents separation
                     maxVelocity=1.0
                 )
-    
-    # Control gripper
-    if close_gripper and len(finger_joints) > 0:
-        # Close gripper: move fingers toward center
-        for finger_joint in finger_joints:
-            joint_info = p.getJointInfo(robot_id, finger_joint)
-            joint_name = joint_info[1].decode('utf-8')
-            # Left finger: limits [-0.04, 0], close at -0.04 (moves toward center)
-            # Right finger: limits [0, 0.04], close at 0.04 (moves toward center)
-            if 'left' in joint_name:
-                target = -0.04
+
+    # ------------------------------------------------------------------ #
+    # 7. Gripper control
+    # ------------------------------------------------------------------ #
+    if len(finger_joints) > 0:
+        for fi in finger_joints:
+            jname = p.getJointInfo(robot_id, fi)[1].decode('utf-8')
+            if close_gripper:
+                tp = -0.04 if 'left' in jname else 0.04
             else:
-                target = 0.04
-            p.setJointMotorControl2(
-                robot_id,
-                finger_joint,
-                controlMode=p.POSITION_CONTROL,
-                targetPosition=target,
-                force=50
-            )
-    elif len(finger_joints) > 0:
-        # Open gripper: move fingers away from center
-        for finger_joint in finger_joints:
-            joint_info = p.getJointInfo(robot_id, finger_joint)
-            joint_name = joint_info[1].decode('utf-8')
-            # Left finger: open at 0, Right finger: open at 0
-            p.setJointMotorControl2(
-                robot_id,
-                finger_joint,
-                controlMode=p.POSITION_CONTROL,
-                targetPosition=0.0,
-                force=50
-            )
-    
+                tp = 0.0
+            p.setJointMotorControl2(robot_id, fi, p.POSITION_CONTROL,
+                                    targetPosition=tp, force=50)
+
     return True
+
 
 # --------------------------
 # Standalone Test Mode
 # --------------------------
 if __name__ == "__main__":
-    """
-    Test mode: Run this file directly to test motion control functions
-    Usage: python src/modules/motion_control.py
-    """
     print("[Motion Control] Running in test mode...")
-    
-    # Initialize simulation
     physicsClient = p.connect(p.GUI)
     p.setGravity(0, 0, -9.81)
     p.setAdditionalSearchPath(pybullet_data.getDataPath())
-    
-    # Load floor
     p.loadURDF("plane.urdf")
-    
-    # Load robot URDF
     robot_id = p.loadURDF("../robot/robot.urdf", basePosition=[0, 0, 0.2])
-    
     print(f"[Motion Control] Robot loaded. ID: {robot_id}")
-    print("[Motion Control] Testing navigation...")
-    
-    # Test navigation
     goal = [2.0, 2.0]
-    print(f"[Motion Control] Moving to goal: {goal}")
-    
-    # Note: In real usage, current_pose should come from particle filter
-    # For this test, we'll use a dummy pose that gets updated
     test_pose = [0.0, 0.0, 0.0]
-    
-    for _ in range(2400):  # 10 seconds at 240 Hz
+    for _ in range(2400):
         dist = move_to_goal(robot_id, goal, test_pose)
-        if _ % 240 == 0:  # Print every second
+        if _ % 240 == 0:
             print(f"[Motion Control] Distance to goal: {dist:.2f}m")
         p.stepSimulation()
         time.sleep(1./240.)
-        
         if dist < 0.1:
             print("[Motion Control] Goal reached!")
             break
-    
-    print("[Motion Control] Test complete. Press Ctrl+C to exit.")
-    
-    # Keep simulation running
     try:
         while True:
             p.stepSimulation()
             time.sleep(1./240.)
     except KeyboardInterrupt:
-        print("[Motion Control] Shutting down...")
         p.disconnect()
-

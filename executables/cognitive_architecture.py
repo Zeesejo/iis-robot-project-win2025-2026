@@ -41,17 +41,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from src.environment.world_builder import build_world
 from src.modules.sensor_preprocessing import get_sensor_data, get_sensor_id
-from src.modules.perception import (
-    PerceptionModule,
-    detect_objects_by_color,
-    RANSAC_Segmentation,
-    depth_to_point_cloud,
-    edge_contour_segmentation,
-    compute_pca,
-    refine_object_points,
-    SCENE_OBJECTS,
-    COLOR_RANGES_HSV,
-)
+from src.modules.perception import (PerceptionModule, detect_objects_by_color, RANSAC_Segmentation,)
 from src.modules.state_estimation import state_estimate, initialize_state_estimator
 from src.modules.motion_control import PIDController, move_to_goal, grasp_object
 from src.modules.fsm import RobotFSM, RobotState
@@ -122,7 +112,9 @@ class CognitiveArchitecture:
 
         initialize_state_estimator()
         self.sensor_camera_id, self.sensor_lidar_id = get_sensor_id(self.robot_id)
+        #M4 — PerceptionModule (RANSAC + PCA + colour detection)
         self.perception = PerceptionModule()
+        self._perception_interval = 10 # run full pipeline every 10 sim steps
 
         self.fsm            = RobotFSM()
         self.action_planner = get_action_planner()
@@ -411,148 +403,162 @@ class CognitiveArchitecture:
         self.kb.add_position('target', *self.target_position)
         return True
 
-    # ========================== SENSE =====================================
-
+   # ==================== SENSE ====================
     def sense(self):
-        pre          = get_sensor_data(self.robot_id,
-                                       self.sensor_camera_id,
-                                       self.sensor_lidar_id)
-        rgb          = pre['camera_rgb']
-        depth        = pre['camera_depth']
-        lidar        = pre['lidar']
-        imu          = pre['imu']
-        joint_states = pre['joint_states']
-
-        wheel_vels = [joint_states[n]['velocity'] if n in joint_states else 0.0
-                      for n in self.wheel_names]
-        estimated_pose = state_estimate(
-            {'imu': imu, 'lidar': lidar, 'joint_states': joint_states},
-            {'wheel_left':  (wheel_vels[0]+wheel_vels[2])/2.0,
-             'wheel_right': (wheel_vels[1]+wheel_vels[3])/2.0}
-        )
-
+        """
+        SENSE phase: Acquire sensor data and update state estimate.
+        Returns sensor_data dict for use in THINK phase.
+        M4 integration:
+          - Every _perception_interval steps, run PerceptionModule.process_frame()
+            which executes: colour detection → RANSAC (table plane) → PCA (poses)
+          - Target 3-D position is taken from the PCA centre of the red ROI
+            (not a single-pixel depth sample)
+          - Obstacle poses from PCA are pushed back into KB and self.obstacles
+          - Static scene map (obstacles) locked after first detection per task spec
+        """
+        # M3: Get preprocessed sensor data via sensor_preprocessing module
+        preprocessed = get_sensor_data(self.robot_id, self.sensor_camera_id, self.sensor_lidar_id)
+        rgb = preprocessed['camera_rgb']
+        depth = preprocessed['camera_depth']
+        lidar = preprocessed['lidar']
+        imu = preprocessed['imu']
+        joint_states = preprocessed['joint_states']
+        
+        # M5: Get wheel velocities from joint states using correct URDF joint names
+        wheel_vels = []
+        for name in self.wheel_names:
+            if name in joint_states:
+                wheel_vels.append(joint_states[name]['velocity'])
+            else:
+                wheel_vels.append(0.0)
+        
+        # M5: State estimation via state_estimate() function
+        sensors_for_pf = {
+            'imu': imu,
+            'lidar': lidar,
+            'joint_states': joint_states
+        }
+        control_inputs = {
+            'wheel_left': (wheel_vels[0] + wheel_vels[2]) / 2.0,   # avg of FL + BL
+            'wheel_right': (wheel_vels[1] + wheel_vels[3]) / 2.0,  # avg of FR + BR
+        }
+        estimated_pose = state_estimate(sensors_for_pf, control_inputs)
+        
+        # M8: Update robot position in Knowledge Base (Prolog)
         if self.step_counter % 50 == 0:
-            self.kb.add_position('robot',
-                                 float(estimated_pose[0]),
-                                 float(estimated_pose[1]), 0.0)
+            self.kb.add_position('robot', 
+                                float(estimated_pose[0]), 
+                                float(estimated_pose[1]), 0.0)
+        
+        # M4: Full perception pipeline — colour detection + RANSAC + PCA
+        if rgb is not None and depth is not None \
+                and self.step_counter % self._perception_interval == 0:
 
-        if rgb is not None and depth is not None and self.step_counter % 10 == 0:
-            perc = self.perception.process_frame(rgb, depth, width=320, height=240)
-            self.last_perception_result = perc
+            perc = self.perception.process_frame(rgb, depth)
 
-            if perc['table_plane'] is not None:
-                model   = perc['table_plane']['model']
-                inliers = perc['table_plane']['num_inliers']
-                if abs(model[2]) > 0.7 and inliers > 200:
-                    self.table_plane_model = model
-                    if self.step_counter % 240 == 0:
-                        print(f"[M4-RANSAC] Table plane confirmed: "
-                              f"A={model[0]:.3f} B={model[1]:.3f} "
-                              f"C={model[2]:.3f} D={model[3]:.3f} "
-                              f"({inliers} inliers)")
+            # --- 1. Log colour detections ---
+            if self.step_counter % 60 == 0 and perc['detections']:
+                colors_found = [d['color'] for d in perc['detections']]
+                print(f"[M4-Color] Detected colours: {colors_found}")
 
+            # --- 2. Log RANSAC table plane ---
+            if perc['table_plane'] is not None and self.step_counter % 240 == 0:
+                print(f"[M4-RANSAC] Table plane confirmed, "
+                    f"inliers={perc['table_plane']['num_inliers']}")
+
+            # --- 3. Target 3-D pose from PCA of red point cloud ---
             if perc['target_pose'] is not None:
-                self.pca_target_pose = perc['target_pose']
-                if self.step_counter % 240 == 0:
-                    pca = self.pca_target_pose
-                    print(f"[M4-PCA] Object cloud centre (cam-frame): "
-                          f"{[f'{v:.3f}' for v in pca['center']]}, "
-                          f"dims={[f'{v:.3f}' for v in pca['dimensions']]}")
+                cam_x, cam_y, cam_z = perc['target_pose']['center']
 
-            if perc['obstacle_poses'] and self.step_counter % 240 == 0:
-                for op in perc['obstacle_poses']:
-                    print(f"[M4-PCA] Obstacle '{op['color']}' centre: "
-                          f"{[f'{v:.3f}' for v in op['center']]}")
+                if DEPTH_NEAR < cam_z < DEPTH_FAR:
+                    robot_x, robot_y, robot_theta = estimated_pose
+                    cos_t, sin_t = math.cos(robot_theta), math.sin(robot_theta)
+                    rb_x = cam_z + CAMERA_FORWARD
+                    rb_y = -cam_x
+                    world_x = robot_x + rb_x * cos_t - rb_y * sin_t
+                    world_y = robot_y + rb_x * sin_t + rb_y * cos_t
+                    world_z = CAMERA_HEIGHT - cam_y
 
-            rgb_array  = np.reshape(rgb, (240, 320, 4)).astype(np.uint8)
-            bgr        = cv2.cvtColor(rgb_array, cv2.COLOR_RGBA2BGR)
-            detections = perc['detections']
+                    new_target = [world_x, world_y, world_z]
 
-            if self.step_counter % 240 == 0 and detections:
-                print(f"[M4-Color] {len(detections)} detections: "
-                      f"{[d['color'] for d in detections]}")
+                    # Outlier rejection XY
+                    accept = True
+                    if self.target_position_smoothed is not None:
+                        jump = np.hypot(new_target[0] - self.target_position_smoothed[0],
+                                        new_target[1] - self.target_position_smoothed[1])
+                        if jump > 2.0 and self.target_detection_count > 5:
+                            accept = False
+                    # Outlier rejection Z (cylinder sits on table at ~0.625m)
+                    if not (0.55 < world_z < 1.0):
+                        accept = False
 
-            if self.step_counter % 240 == 0:
-                depth_arr_log = np.array(depth).reshape(240, 320)
-                seg_mask, edge_map = edge_contour_segmentation(bgr, min_contour_area=300)
-                print(f"[M4-Edge] seg_pixels={int(np.sum(seg_mask > 0))}, "
-                      f"edge_pixels={int(np.sum(edge_map > 0))}")
+                    if accept:
+                        self.target_detection_count += 1
+                        # FIX: correct bearing sign (positive = target is to the right)
+                        fy = (240 / 2.0) / np.tan(np.deg2rad(60 / 2.0))
+                        fx = fy * (320 / 240)
+                        px = cam_x * fx / cam_z + 160.0
+                        self.target_camera_bearing = math.atan2(px - 160.0, fx)
+                        self.target_camera_depth   = cam_z
 
-            depth_arr = np.array(depth).reshape(240, 320)
-            red_dets  = sorted(
-                [d for d in detections if d['color'] == TARGET_COLOR],
-                key=lambda d: d['area'], reverse=True
-            )
+                        alpha = 0.4 if self.target_detection_count > 3 else 0.8
+                        if self.target_position_smoothed is None:
+                            self.target_position_smoothed = list(new_target)
+                        else:
+                            for k in range(3):
+                                self.target_position_smoothed[k] = (
+                                    alpha * new_target[k]
+                                    + (1 - alpha) * self.target_position_smoothed[k])
+                        self.target_position = list(self.target_position_smoothed)
+                        self.kb.add_position('target', *self.target_position)
+                        print(f"[M4-PCA] TARGET world=({world_x:.2f},{world_y:.2f},{world_z:.2f}) "
+                            f"depth={cam_z:.2f}m bearing={math.degrees(self.target_camera_bearing):.1f}°")
+            # Fallback: PCA failed but colour visible — update bearing from bbox only
+            elif perc['detections']:
+                red_dets = [d for d in perc['detections'] if d['color'] == 'red']
+                if red_dets:
+                    best = max(red_dets, key=lambda d: d['area'])
+                    bx, by, bw, bh = best['bbox']
+                    px = bx + bw / 2.0
+                    fy = (240 / 2.0) / np.tan(np.deg2rad(60 / 2.0))
+                    fx = fy * (320 / 240)
+                    self.target_camera_bearing = math.atan2(px - 160.0, fx)
 
-            for det in red_dets[:1]:
-                x, y, w, h = det['bbox']
-                cx_px = int(x + w / 2)
-                cy_px = int(y + h / 2)
-                if not (0 <= cy_px < 240 and 0 <= cx_px < 320):
+            # --- 4. Obstacle poses from PCA → KB + obstacle map update ---
+            for obs in perc['obstacle_poses']:
+                cam_x, cam_y, cam_z = obs['center']
+                if cam_z < DEPTH_NEAR or cam_z > DEPTH_FAR:
                     continue
-                raw_d = depth_arr[cy_px, cx_px]
-                if raw_d <= 0 or raw_d >= 1.0:
-                    continue
-                true_d = DEPTH_FAR * DEPTH_NEAR / (
-                    DEPTH_FAR - (DEPTH_FAR - DEPTH_NEAR) * raw_d)
-                if not (MIN_TARGET_DEPTH < true_d < MAX_TARGET_DEPTH):
-                    continue
-                if np.isnan(true_d) or np.isinf(true_d):
-                    continue
-                if self.target_position_smoothed is None and true_d > 3.0:
-                    continue
-
-                bearing = math.atan2(-(cx_px - CAM_CX), CAM_FX)
-                wp      = self._pixel_depth_to_world(cx_px, cy_px,
-                                                     true_d, estimated_pose)
-
-                if self.table_position is not None:
-                    dist_to_table = np.hypot(wp[0] - self.table_position[0],
-                                             wp[1] - self.table_position[1])
-                    if dist_to_table > MAX_TARGET_DEPTH:
-                        if self.step_counter % 60 == 0:
-                            print(f"[M4] Rejected detection at "
-                                  f"({wp[0]:.2f},{wp[1]:.2f}) - "
-                                  f"{dist_to_table:.2f}m from table")
-                        continue
-
-                if self.pca_target_pose is not None:
-                    pca_c      = self.pca_target_pose['center']
-                    pca_body_x = pca_c[2]
-                    pca_body_y = -pca_c[0]
-                    rx, ry, rt = estimated_pose
-                    pca_wx = rx + pca_body_x*math.cos(rt) - pca_body_y*math.sin(rt)
-                    pca_wy = ry + pca_body_x*math.sin(rt) + pca_body_y*math.cos(rt)
-                    pca_wz = CAMERA_HEIGHT - pca_c[1]
-                    pca_world = [pca_wx, pca_wy, pca_wz]
-                    if np.hypot(pca_world[0]-wp[0], pca_world[1]-wp[1]) < 0.5:
-                        wp = pca_world
-                        if self.step_counter % 60 == 0:
-                            print(f"[M4-PCA] Using PCA target centre: "
-                                  f"({wp[0]:.2f}, {wp[1]:.2f}, {wp[2]:.2f})")
-
-                accepted = self._update_target_from_detection(wp, true_d, bearing)
-                if accepted and self.step_counter % 10 == 0:
-                    print(f"[CogArch] TARGET DETECTED at "
-                          f"({wp[0]:.2f}, {wp[1]:.2f}, {wp[2]:.2f}), "
-                          f"depth={true_d:.2f}m")
-                break
-
+                robot_x, robot_y, robot_theta = estimated_pose
+                cos_t, sin_t = math.cos(robot_theta), math.sin(robot_theta)
+                rb_x = cam_z + CAMERA_FORWARD
+                rb_y  = -cam_x
+                wx = robot_x + rb_x * cos_t - rb_y * sin_t
+                wy = robot_y + rb_x * sin_t  + rb_y * cos_t
+                if not self.perception._scene_map_locked:
+                    self.kb.add_position(f"obs_{obs['color']}", wx, wy, 0.0)
+                    already = any(abs(o[0]-wx) < 0.3 and abs(o[1]-wy) < 0.3
+                                for o in self.obstacles)
+                    if not already:
+                        self.obstacles.append([wx, wy])
+                        print(f"[M4-PCA] Obstacle ({obs['color']}) "
+                            f"added to map world=({wx:.2f},{wy:.2f})")
+        
+        # M3: Check gripper contact using joint state feedback (legal)
         gripper_contact = self._check_gripper_contact()
-
+        
         return {
-            'pose':                  estimated_pose,
-            'rgb':                   rgb,
-            'depth':                 depth,
-            'lidar':                 lidar,
-            'imu':                   imu,
-            'joint_states':          joint_states,
-            'target_detected':       self.target_position is not None,
-            'target_position':       self.target_position,
+            'pose': estimated_pose,
+            'rgb': rgb,
+            'depth': depth,
+            'lidar': lidar,
+            'imu': imu,
+            'joint_states': joint_states,
+            'target_detected': self.target_position is not None,
+            'target_position': self.target_position,
             'target_camera_bearing': self.target_camera_bearing,
-            'target_camera_depth':   self.target_camera_depth,
-            'gripper_contact':       gripper_contact,
-            'perception':            self.last_perception_result,
+            'target_camera_depth': self.target_camera_depth,
+            'gripper_contact': gripper_contact
         }
 
     # ========================== THINK =====================================

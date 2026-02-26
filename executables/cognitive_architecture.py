@@ -9,27 +9,21 @@ SENSE-THINK-ACT Cycle:
 
 FIXES in this revision
   [F1]  fsm.tick() now called once per STA step – step-based timeouts work.
-  [F2]  CAMERA_HEIGHT updated to 0.67 m (robot-1.urdf: base_spawn(0.1)
-        + torso_joint_z(0.3) + cam_z_offset(0.27) = 0.67 m).
-  [F3]  approach_standoff reset on every NAVIGATE re-entry, not only on
-        FAILURE, so stale standoffs from previous runs are discarded.
-  [F4]  APPROACH_VISUAL rewritten: uses world-frame bearing to tracked
-        target (not raw camera bearing which is 0 when no fresh detection),
-        stops cleanly when depth < 0.55 m, and clamps fwd speed tightly.
-  [F5]  Raised dist-to-table rejection gate to 3.5 m (was 3.0).
-  [F6]  distance_for_fsm during APPROACH uses 2D world-frame distance to
-        target (not frozen camera depth) so GRASP transition fires at <0.55m.
-  [F7]  approach_visual speed in act() uses np.hypot(world_tgt - pose)
-        so the robot slows down proportionally and does not ram the table.
-  [F8]  _in_approach + _approach_depth_smooth reset when FSM leaves APPROACH
-        so stale state never carries over to the next attempt.
-  [F9]  Fixed bare `if lidar:` which raises ValueError when lidar is a
-        numpy array; replaced with numpy-safe check.
-  [F10] Stuck detection in think(): if robot X/Y hasn't moved 0.1 m in
-        4 s while NAVIGATE, clear standoff + replan from current pose so
-        the robot never oscillates against a wall indefinitely.
-  [F11] action_planning.py: smarter bypass (both perpendicular directions
-        tested, room-bounds clamped, table uses 2.0 m clearance).
+  [F2]  CAMERA_HEIGHT updated to 0.67 m.
+  [F3]  approach_standoff reset on every NAVIGATE re-entry.
+  [F4]  APPROACH_VISUAL rewritten: world-frame bearing, stops at depth<0.55m.
+  [F5]  Raised dist-to-table rejection gate to 3.5 m.
+  [F6]  distance_for_fsm during APPROACH uses 2D world-frame distance.
+  [F7]  approach_visual speed uses np.hypot(world_tgt - pose).
+  [F8]  _in_approach + _approach_depth_smooth reset when FSM leaves APPROACH.
+  [F9]  Fixed bare `if lidar:` numpy-safe check.
+  [F10] Stuck detection in think(): replan after 4 s without 0.1 m progress.
+  [F11] action_planning.py: smarter bypass, room-bounds clamped.
+  [F12] approach_visual stall fix:
+        - APPROACH_STOP_M lowered to 0.40 m (was 0.55)
+        - MIN_FWD_APPROACH=0.5 enforced so friction never wins
+        - Lidar emergency threshold lowered to 0.07 m (was 0.12)
+        - Final-push guard: if world_dist<0.55 drive at MIN_FWD regardless
 """
 
 import pybullet as p
@@ -75,8 +69,6 @@ LEARNING_DEFAULTS = {'nav_kp': 1.0, 'nav_ki': 0.0, 'nav_kd': 0.1, 'angle_kp': 1.
 # ── Robot physical constants ─────────────────────────────────────────────
 WHEEL_RADIUS    = 0.1
 WHEEL_BASELINE  = 0.45
-# [F2] robot-1.urdf camera is on torso_link at xyz="0.12 0 0.27":
-#   base_spawn(0.1) + torso_joint_z(0.3) + cam_z(0.27) = 0.67 m
 CAMERA_HEIGHT   = 0.67
 CAMERA_FORWARD  = 0.12
 DEPTH_NEAR      = 0.1
@@ -95,19 +87,21 @@ MAX_TARGET_DEPTH = 3.5
 MIN_TARGET_DEPTH = 0.2
 MAX_JUMP_M       = 1.0
 
-# Camera tilt compensation (rpy="0 0.2 0" in robot-1.urdf)
+# Camera tilt compensation
 _CAM_TILT = 0.2   # radians downward
 
 # ── Approach tuning ──────────────────────────────────────────────────────
-GRASP_RANGE_M   = 0.55
-APPROACH_SLOW_M = 1.0
-APPROACH_STOP_M = 0.55
+GRASP_RANGE_M      = 0.55   # FSM triggers GRASP when world_dist < this
+# [F12] Stop wheels only once the robot is this close.
+#       0.40 m is reachable without ramming the table.
+APPROACH_STOP_M    = 0.40
+APPROACH_SLOW_M    = 1.0    # start slowing below this distance
+# [F12] Minimum wheel speed during APPROACH so static friction never wins.
+MIN_FWD_APPROACH   = 0.50
 
 # ── Stuck detection ──────────────────────────────────────────────────────
-# [F10] If the robot hasn't moved this far in STUCK_TIMEOUT seconds,
-# we declare it stuck and force a replan.
-_STUCK_DIST_M   = 0.10   # metres
-_STUCK_TIMEOUT  = 4.0    # seconds (= 4 * 240 steps)
+_STUCK_DIST_M   = 0.10
+_STUCK_TIMEOUT  = 4.0
 
 
 def _lidar_has_data(lidar):
@@ -129,32 +123,20 @@ class CognitiveArchitecture:
         self.room_id   = room_id
         self.target_id = target_id
 
-        # M5
         initialize_state_estimator()
-
-        # M3
         self.sensor_camera_id, self.sensor_lidar_id = get_sensor_id(self.robot_id)
-
-        # M4
         self.perception = PerceptionModule()
 
-        # M7
         self.fsm            = RobotFSM()
         self.action_planner = get_action_planner()
         self.grasp_planner  = get_grasp_planner()
+        self.kb             = get_knowledge_base()
 
-        # M8
-        self.kb = get_knowledge_base()
-
-        # M9 [DISABLED]
         nav_kp = LEARNING_DEFAULTS['nav_kp']
         nav_ki = LEARNING_DEFAULTS['nav_ki']
         nav_kd = LEARNING_DEFAULTS['nav_kd']
-
-        # M6
         self.nav_pid = PIDController(Kp=nav_kp, Ki=nav_ki, Kd=nav_kd)
 
-        # Robot joints
         self.wheel_joints = [0, 1, 2, 3]
         self.wheel_names  = ['fl_wheel_joint', 'fr_wheel_joint',
                              'bl_wheel_joint', 'br_wheel_joint']
@@ -164,7 +146,6 @@ class CognitiveArchitecture:
         self.camera_link_idx = None
         self._detect_robot_joints()
 
-        # Task state
         self.target_position           = None
         self.target_position_smoothed  = None
         self.target_detection_count    = 0
@@ -178,22 +159,17 @@ class CognitiveArchitecture:
         self.approach_standoff         = None
         self._last_fsm_state           = None
 
-        # M4 perception results
         self.last_perception_result = None
         self.table_plane_model      = None
         self.pca_target_pose        = None
+        self._failure_reset_done    = False
 
-        self._failure_reset_done = False
-
-        # [F8] APPROACH-specific state
         self._in_approach           = False
         self._approach_depth_smooth = float('inf')
 
-        # [F10] Stuck detection state
-        self._stuck_pose      = None   # (x, y) snapshot
-        self._stuck_timer     = 0      # steps since last movement
+        self._stuck_pose  = None
+        self._stuck_timer = 0
 
-        # Timing
         self.step_counter = 0
         self.dt           = 1.0 / 240.0
 
@@ -531,17 +507,14 @@ class CognitiveArchitecture:
     def think(self, sensor_data):
         pose = sensor_data['pose']
 
-        # [F3] Reset standoff whenever we re-enter NAVIGATE from another state
         current_state = self.fsm.state
         if (current_state == RobotState.NAVIGATE
                 and self._last_fsm_state != RobotState.NAVIGATE):
             self.approach_standoff = None
             self.current_waypoint  = None
-            # [F10] Also reset stuck tracker on every fresh NAVIGATE entry
             self._stuck_pose  = (pose[0], pose[1])
             self._stuck_timer = 0
 
-        # [F8] Reset approach state whenever we LEAVE APPROACH
         if (self._last_fsm_state == RobotState.APPROACH
                 and current_state != RobotState.APPROACH):
             self._in_approach           = False
@@ -561,7 +534,6 @@ class CognitiveArchitecture:
                 moved = np.hypot(pose[0] - self._stuck_pose[0],
                                  pose[1] - self._stuck_pose[1])
                 if moved > _STUCK_DIST_M:
-                    # Made meaningful progress – reset the tracker
                     self._stuck_pose  = (pose[0], pose[1])
                     self._stuck_timer = 0
                 else:
@@ -571,13 +543,10 @@ class CognitiveArchitecture:
                         print(f"[F10] STUCK detected at "
                               f"({pose[0]:.2f}, {pose[1]:.2f}) – "
                               f"replanning from current pose")
-                        # Force a full replan from the current position
                         self.approach_standoff = None
                         self.current_waypoint  = None
                         self._stuck_pose       = (pose[0], pose[1])
                         self._stuck_timer      = 0
-                        # Recompute standoff from current pose so it
-                        # doesn't land behind the wall again
                         if self.target_position is not None:
                             self.approach_standoff = \
                                 self._compute_approach_standoff(
@@ -586,7 +555,6 @@ class CognitiveArchitecture:
                                   f"({self.approach_standoff[0]:.2f}, "
                                   f"{self.approach_standoff[1]:.2f})")
         else:
-            # Not in NAVIGATE – keep tracker dormant
             self._stuck_pose  = None
             self._stuck_timer = 0
 
@@ -813,16 +781,10 @@ class CognitiveArchitecture:
             cam_depth  = ctrl.get('camera_depth', float('inf'))
             world_dist = ctrl.get('world_dist_2d', float('inf'))
 
-            if world_dist < float('inf'):
-                sd = world_dist
-            else:
-                if cam_depth < self._approach_depth_smooth:
-                    self._approach_depth_smooth = cam_depth
-                else:
-                    self._approach_depth_smooth = (0.7 * self._approach_depth_smooth
-                                                   + 0.3 * cam_depth)
-                sd = self._approach_depth_smooth
+            # ── distance signal: always prefer world_dist_2d ─────────────
+            sd = world_dist if world_dist < float('inf') else cam_depth
 
+            # ── heading toward world-frame target ────────────────────────
             if world_tgt is not None and pose is not None:
                 dx_w = world_tgt[0] - pose[0]
                 dy_w = world_tgt[1] - pose[1]
@@ -832,29 +794,50 @@ class CognitiveArchitecture:
             else:
                 he = ctrl.get('camera_bearing', 0.0)
 
+            # ── [F12] speed profile ───────────────────────────────────────
+            # The old formula gave fwd ≈ 0.19 at 0.68 m, too weak for
+            # wheel friction.  New formula:
+            #   - above APPROACH_SLOW_M (1.0): fast cruise
+            #   - between APPROACH_SLOW_M and APPROACH_STOP_M (0.40):
+            #     linear ramp but NEVER below MIN_FWD_APPROACH (0.50)
+            #   - below APPROACH_STOP_M: wheels stop (we are close enough)
             if sd > APPROACH_SLOW_M:
-                fv = np.clip(2.0 * (sd - APPROACH_STOP_M), 0.3, 3.0)
+                fv = np.clip(3.0 * (sd - APPROACH_STOP_M), MIN_FWD_APPROACH, 3.0)
             elif sd > APPROACH_STOP_M:
-                fv = np.clip(1.5 * (sd - APPROACH_STOP_M), 0.05, 1.0)
+                # Linear in [APPROACH_STOP_M, APPROACH_SLOW_M] but floor at MIN_FWD
+                fv = max(MIN_FWD_APPROACH,
+                         np.clip(3.0 * (sd - APPROACH_STOP_M), 0.0, MIN_FWD_APPROACH * 2))
             else:
                 fv = 0.0
 
+            # [F12] Final-push guard: if world_dist says we are inside the
+            # GRASP range but the FSM hasn't fired yet (race condition),
+            # keep nudging forward so the FSM distance threshold is met.
+            if sd < GRASP_RANGE_M and fv == 0.0:
+                fv = MIN_FWD_APPROACH * 0.5   # gentle nudge
+
             av = 5.0 * he
 
+            # ── lidar collision guard ─────────────────────────────────────
             if sd > 1.0:
+                # Far: full avoidance
                 fv, at = self._lidar_avoidance(lidar, fv, relaxed=True, pose=pose)
                 av    += at
             else:
+                # Close: only emergency stop for true obstacles.
+                # [F12] Threshold lowered to 0.07 m so table legs (>0.10 m
+                # away) do NOT trigger a hard stop.
                 if _lidar_has_data(lidar):
                     mf = min(lidar[i % len(lidar)] for i in range(-2, 3))
-                    if mf < 0.12:
+                    if mf < 0.07:
                         fv = 0.0
+                        print(f"[F12] Lidar emergency stop mf={mf:.3f}m")
 
             if self.step_counter % 240 == 0:
                 print(f"[Act] APPROACH_VISUAL: world_dist={sd:.2f}m, "
                       f"cam_depth={cam_depth:.2f}m, "
                       f"bearing={np.degrees(he):.0f} deg, "
-                      f"fwd={fv:.1f}, turn={av:.1f}")
+                      f"fwd={fv:.2f}, turn={av:.1f}")
             self._set_wheels(fv-av, fv+av)
 
         elif mode == 'grasp':

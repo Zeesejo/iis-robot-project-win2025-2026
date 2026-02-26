@@ -1,5 +1,6 @@
 import numpy as np
 import cv2
+
 SCENE_OBJECTS = {
     'table':      {'rgb': [0.5, 0.3, 0.1], 'type': 'plane',   'dims': [1.5, 0.8, 0.625]},
     'target':     {'rgb': [1.0, 0.0, 0.0], 'type': 'cylinder', 'dims': [0.04, 0.04, 0.12]},
@@ -9,16 +10,22 @@ SCENE_OBJECTS = {
     'yellow_obs': {'rgb': [1.0, 1.0, 0.0], 'type': 'cube',    'dims': [0.4, 0.4, 0.4]},
     'black_obs':  {'rgb': [0.0, 0.0, 0.0], 'type': 'cube',    'dims': [0.4, 0.4, 0.4]},
 }
+
+# [F13] Red HSV tightened: H=0-8 and H=165-180, S>=140, V>=80.
+#       This excludes orange (H=10-25) which was bleeding into the old H=0-20 range.
+#       Orange lower saturation raised to 150 so it cannot reach into red territory.
 COLOR_RANGES_HSV = {
-    'red':    [(np.array([0,  30, 30]),  np.array([20, 255, 255])),
-               (np.array([160, 30, 30]), np.array([180, 255, 255]))],
-    'brown':  [(np.array([10,  80, 30]),  np.array([25, 180, 180]))],
-    'blue':   [(np.array([100, 120, 70]), np.array([130, 255, 255]))],
-    'pink':   [(np.array([140, 40, 100]), np.array([180, 255, 255]))],
-    'orange': [(np.array([5,  180, 180]), np.array([25, 255, 255]))],
-    'yellow': [(np.array([25, 120, 120]), np.array([35, 255, 255]))],
-    'black':  [(np.array([0,   0,   0]),  np.array([180, 80,  50]))],
+    'red':    [(np.array([0,   140,  80]),  np.array([8,   255, 255])),
+               (np.array([165, 140,  80]),  np.array([180, 255, 255]))],
+    'brown':  [(np.array([10,  80,  30]),   np.array([25,  180, 180]))],
+    'blue':   [(np.array([100, 120,  70]),  np.array([130, 255, 255]))],
+    'pink':   [(np.array([140,  40, 100]),  np.array([160, 255, 255]))],
+    'orange': [(np.array([9,   150, 150]),  np.array([25,  255, 255]))],
+    'yellow': [(np.array([25,  120, 120]),  np.array([35,  255, 255]))],
+    'black':  [(np.array([0,     0,   0]),  np.array([180,  80,  50]))],
 }
+
+
 class SiftFeatureExtractor:
 
     def __init__(self):
@@ -53,7 +60,8 @@ class SiftFeatureExtractor:
                 best_category = category
 
         return best_category, best_match_count
-    
+
+
 def edge_contour_segmentation(rgb_image, min_contour_area=500, ratio_threshold=5.0):
     if len(rgb_image.shape) > 2:
         gray = cv2.cvtColor(rgb_image, cv2.COLOR_BGR2GRAY)
@@ -76,6 +84,7 @@ def edge_contour_segmentation(rgb_image, min_contour_area=500, ratio_threshold=5
         cv2.drawContours(mask, [contour], -1, 255, thickness=cv2.FILLED)
 
     return mask, edge_map
+
 
 def detect_objects_by_color(bgr_image, min_area=200):
     hsv = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2HSV)
@@ -102,6 +111,7 @@ def detect_objects_by_color(bgr_image, min_area=200):
                 'area': area, 'contour': cnt, 'mask': combined_mask,
             })
     return detections
+
 
 class RANSAC_Segmentation:
     def __init__(self, points, max_iterations=1000, distance_threshold=0.01, min_inliers_ratio=0.3):
@@ -151,6 +161,8 @@ class RANSAC_Segmentation:
                 if best_count >= self.min_inliers:
                     break
         return best_mask, best_model
+
+
 def compute_pca(points):
     if len(points) < 3:
         raise ValueError("Not enough points for PCA.")
@@ -170,7 +182,7 @@ def compute_pca(points):
 
 
 def refine_object_points(points, obb_center, obb_vectors, obb_dims, tolerance=1.1):
-    """Geometric refinement — removes outlier points (same as provided code)."""
+    """Geometric refinement — removes outlier points."""
     if len(points) == 0:
         return points
     v1 = obb_vectors[:, 0]
@@ -183,6 +195,7 @@ def refine_object_points(points, obb_center, obb_vectors, obb_dims, tolerance=1.
     radial_ok = radial_dist < (est_radius * tolerance)
     axial_ok = (proj_v1 >= -half_len * tolerance) & (proj_v1 <= half_len * tolerance)
     return points[radial_ok & axial_ok]
+
 
 def depth_to_point_cloud(depth_buffer, width=320, height=240, fov=60, near=0.1, far=10.0):
     """Convert PyBullet depth buffer to 3D point cloud."""
@@ -202,6 +215,37 @@ def depth_to_point_cloud(depth_buffer, width=320, height=240, fov=60, near=0.1, 
     points = np.stack([x, y, z], axis=-1).reshape(-1, 3)
     valid = (z.flatten() > near) & (z.flatten() < far * 0.99)
     return points[valid], valid
+
+
+def _extract_masked_points(depth_arr, color_mask_2d, width, height, fov=60, near=0.1, far=10.0):
+    """
+    [F13] Extract 3D points only from pixels where color_mask_2d is non-zero.
+    This ensures PCA runs on the actual detected color region, not the whole scene.
+    """
+    fy = height / (2.0 * np.tan(np.radians(fov / 2.0)))
+    fx = fy * (width / height)
+    cx, cy = width / 2.0, height / 2.0
+
+    ys, xs = np.where(color_mask_2d > 0)
+    if len(xs) == 0:
+        return np.empty((0, 3))
+
+    raw_d = depth_arr[ys, xs].astype(np.float32)
+    valid = (raw_d > 0) & (raw_d < 1.0)
+    xs, ys, raw_d = xs[valid], ys[valid], raw_d[valid]
+    if len(xs) == 0:
+        return np.empty((0, 3))
+
+    z = far * near / (far - (far - near) * raw_d)
+    depth_ok = (z > near) & (z < far * 0.99)
+    xs, ys, z = xs[depth_ok], ys[depth_ok], z[depth_ok]
+    if len(xs) == 0:
+        return np.empty((0, 3))
+
+    x3 = (xs - cx) * z / fx
+    y3 = (ys - cy) * z / fy
+    return np.stack([x3, y3, z], axis=1)
+
 
 class PerceptionModule:
     def __init__(self):
@@ -256,20 +300,49 @@ class PerceptionModule:
         if len(object_points) < 10:
             return results
 
-        # --- G) PCA on all object points for target pose ---
-        try:
-            center, vectors, dims = compute_pca(object_points)
-            refined = refine_object_points(object_points, center, vectors, dims)
-            if len(refined) > 10:
-                center, vectors, dims = compute_pca(refined)
-            results['target_pose'] = {
-                'center': center.tolist(),
-                'axes': vectors.tolist(),
-                'dimensions': dims.tolist()
-            }
-        except ValueError:
-            pass
+        # --- G) [F13] PCA on RED-MASKED region only ---
+        # Build a per-pixel red mask from the HSV ranges directly.
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        red_mask_2d = np.zeros((height, width), dtype=np.uint8)
+        for (lo, hi) in COLOR_RANGES_HSV['red']:
+            red_mask_2d |= cv2.inRange(hsv, lo, hi)
+        # Small morphological clean-up (same as detect_objects_by_color)
+        k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        red_mask_2d = cv2.morphologyEx(red_mask_2d, cv2.MORPH_CLOSE, k3)
+        red_mask_2d = cv2.morphologyEx(red_mask_2d, cv2.MORPH_OPEN,  k3)
 
+        red_pts = _extract_masked_points(depth_arr, red_mask_2d, width, height)
+
+        if len(red_pts) >= 10:
+            # PCA only on red pixels — gives true cylinder centroid
+            try:
+                center, vectors, dims = compute_pca(red_pts)
+                refined = refine_object_points(red_pts, center, vectors, dims)
+                if len(refined) >= 10:
+                    center, vectors, dims = compute_pca(refined)
+                results['target_pose'] = {
+                    'center': center.tolist(),
+                    'axes':   vectors.tolist(),
+                    'dimensions': dims.tolist()
+                }
+            except ValueError:
+                pass
+        else:
+            # Fallback: PCA on all non-plane points (original behaviour)
+            try:
+                center, vectors, dims = compute_pca(object_points)
+                refined = refine_object_points(object_points, center, vectors, dims)
+                if len(refined) > 10:
+                    center, vectors, dims = compute_pca(refined)
+                results['target_pose'] = {
+                    'center': center.tolist(),
+                    'axes':   vectors.tolist(),
+                    'dimensions': dims.tolist()
+                }
+            except ValueError:
+                pass
+
+        # --- H) PCA per obstacle color ---
         for det in detections:
             if det['color'] in ['blue', 'pink', 'orange', 'yellow', 'black']:
                 x, y, w, h = det['bbox']
@@ -284,13 +357,14 @@ class PerceptionModule:
                     results['obstacle_poses'].append({
                         'color': det['color'],
                         'center': oc.tolist(),
-                        'axes': ov.tolist(),
+                        'axes':   ov.tolist(),
                         'dimensions': od.tolist()
                     })
                 except ValueError:
                     continue
 
         return results
+
 
 if __name__ == '__main__':
 
@@ -304,10 +378,10 @@ if __name__ == '__main__':
 
     theta = np.random.uniform(0, 2 * np.pi, num_obj)
     r = 0.04 * np.sqrt(np.random.rand(num_obj))
-    cx = r * np.cos(theta) + 0.2
-    cy = r * np.sin(theta) - 0.1
+    cx_ = r * np.cos(theta) + 0.2
+    cy_ = r * np.sin(theta) - 0.1
     cz = np.random.uniform(0.625, 0.625 + 0.12, num_obj)
-    cyl_pts = np.stack([cx, cy, cz], axis=1)
+    cyl_pts = np.stack([cx_, cy_, cz], axis=1)
 
     full_cloud = np.concatenate([plane_pts, cyl_pts], axis=0)
     np.random.shuffle(full_cloud)
@@ -317,20 +391,20 @@ if __name__ == '__main__':
                                   distance_threshold=0.02, min_inliers_ratio=0.3)
     plane_mask, model = ransac.run()
     obj_pts = full_cloud[~plane_mask]
-    print(f"RANSAC → Plane: {np.sum(plane_mask)} pts, Objects: {len(obj_pts)} pts")
+    print(f"RANSAC -> Plane: {np.sum(plane_mask)} pts, Objects: {len(obj_pts)} pts")
     if model:
         print(f"  Plane (A,B,C,D): ({model[0]:.4f}, {model[1]:.4f}, {model[2]:.4f}, {model[3]:.4f})")
 
     c1, v1, d1 = compute_pca(obj_pts)
-    print(f"Preliminary PCA → center={c1.round(4)}, dims={d1.round(4)}")
+    print(f"Preliminary PCA -> center={c1.round(4)}, dims={d1.round(4)}")
     refined = refine_object_points(obj_pts, c1, v1, d1, tolerance=1.1)
     c2, v2, d2 = compute_pca(refined)
-    print(f"Final PCA → center={c2.round(4)}, dims={d2.round(4)}")
+    print(f"Final PCA -> center={c2.round(4)}, dims={d2.round(4)}")
 
     # --- Test color detection ---
     test_img = np.zeros((240, 320, 3), dtype=np.uint8)
-    cv2.rectangle(test_img, (50, 50), (150, 150), (0, 0, 255), -1)
-    cv2.rectangle(test_img, (200, 100), (280, 180), (255, 0, 0), -1)
+    cv2.rectangle(test_img, (50, 50), (150, 150), (0, 0, 255), -1)   # pure red BGR
+    cv2.rectangle(test_img, (200, 100), (280, 180), (0, 165, 255), -1)  # orange BGR
     dets = detect_objects_by_color(test_img, min_area=100)
     print(f"\nColor detection: {len(dets)} objects found")
     for d in dets:

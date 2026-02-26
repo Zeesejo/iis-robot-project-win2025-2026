@@ -23,6 +23,8 @@ FIXES in this revision
        so the robot slows down proportionally and does not ram the table.
   [F8] _in_approach + _approach_depth_smooth reset when FSM leaves APPROACH
        so stale state never carries over to the next attempt.
+  [F9] Fixed bare `if lidar:` which raises ValueError when lidar is a
+       numpy array; replaced with numpy-safe `if lidar is not None and len(lidar) > 0:`.
 """
 
 import pybullet as p
@@ -97,6 +99,16 @@ GRASP_RANGE_M   = 0.55
 # [F7] During APPROACH, robot slows to near-zero at this world distance
 APPROACH_SLOW_M = 1.0   # start slowing below 1.0 m
 APPROACH_STOP_M = 0.55  # stop wheels at this distance
+
+
+def _lidar_has_data(lidar):
+    """Numpy-safe check: True if lidar contains at least one reading."""
+    if lidar is None:
+        return False
+    try:
+        return len(lidar) > 0
+    except TypeError:
+        return False
 
 
 class CognitiveArchitecture:
@@ -289,7 +301,7 @@ class CognitiveArchitecture:
         return math.hypot(max(abs(lx)-0.75, 0.0), max(abs(ly)-0.40, 0.0))
 
     def _lidar_avoidance(self, lidar, fwd, relaxed=False, pose=None):
-        if lidar is None or len(lidar) == 0:
+        if not _lidar_has_data(lidar):
             return fwd, 0.0
         if pose is not None and self.table_position is not None:
             td = self._distance_to_table(pose[0], pose[1])
@@ -630,8 +642,6 @@ class CognitiveArchitecture:
                     self.current_waypoint = self.action_planner.get_next_waypoint()
 
         # ── APPROACH ────────────────────────────────────────────────────────
-        # [F4] Use world-frame target vector for bearing; tighter speed clamp.
-        # [F7] Speed now computed from 2D world-frame distance (not frozen cam depth).
         elif self.fsm.state == RobotState.APPROACH:
             if not self._in_approach:
                 self._approach_depth_smooth = float('inf')
@@ -762,22 +772,15 @@ class CognitiveArchitecture:
             self._set_wheels(fv-av, fv+av)
 
         elif mode == 'approach_visual':
-            # [F7] Speed is now based on 2D world-frame distance to target,
-            # not on the frozen EMA camera depth.  This means the robot slows
-            # down proportionally as it closes in, regardless of whether a
-            # fresh depth pixel was seen this tick.
             pose       = ctrl.get('pose')
             world_tgt  = ctrl.get('world_target') or ctrl.get('target')
             lidar      = ctrl.get('lidar')
             cam_depth  = ctrl.get('camera_depth', float('inf'))
             world_dist = ctrl.get('world_dist_2d', float('inf'))
 
-            # [F7] Use world_dist (2D) for speed control; fall back to
-            # cam_depth only if world position is unavailable.
             if world_dist < float('inf'):
                 sd = world_dist
             else:
-                # EMA smooth depth (only decreases fast, increases slow)
                 if cam_depth < self._approach_depth_smooth:
                     self._approach_depth_smooth = cam_depth
                 else:
@@ -785,7 +788,6 @@ class CognitiveArchitecture:
                                                    + 0.3 * cam_depth)
                 sd = self._approach_depth_smooth
 
-            # World-frame heading error to target
             if world_tgt is not None and pose is not None:
                 dx_w = world_tgt[0] - pose[0]
                 dy_w = world_tgt[1] - pose[1]
@@ -795,22 +797,21 @@ class CognitiveArchitecture:
             else:
                 he = ctrl.get('camera_bearing', 0.0)
 
-            # [F7] Speed: proportional to world distance, stop at APPROACH_STOP_M
             if sd > APPROACH_SLOW_M:
                 fv = np.clip(2.0 * (sd - APPROACH_STOP_M), 0.3, 3.0)
             elif sd > APPROACH_STOP_M:
                 fv = np.clip(1.5 * (sd - APPROACH_STOP_M), 0.05, 1.0)
             else:
-                fv = 0.0   # within grasp range – stop wheels
+                fv = 0.0
 
             av = 5.0 * he
 
-            # Lidar obstacle avoidance (relaxed — we're near the table)
+            # [F9] numpy-safe lidar check
             if sd > 1.0:
                 fv, at = self._lidar_avoidance(lidar, fv, relaxed=True, pose=pose)
                 av    += at
             else:
-                if lidar:
+                if _lidar_has_data(lidar):          # <-- was bare `if lidar:`
                     mf = min(lidar[i % len(lidar)] for i in range(-2, 3))
                     if mf < 0.12:
                         fv = 0.0
@@ -915,7 +916,6 @@ def main():
           f"angle_kp={LEARNING_DEFAULTS['angle_kp']:.2f}")
     print("[Init] Mission: navigate to table, grasp red cylinder\n")
 
-    # ── SENSE-THINK-ACT loop ──────────────────────────────────────────────
     while p.isConnected():                      # DO NOT TOUCH
         try:
             cog.fsm.tick()                      # [F1] advance step-based FSM timer

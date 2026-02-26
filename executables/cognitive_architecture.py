@@ -40,6 +40,23 @@ FIX HISTORY (grasp relevant):
           spinning in place. The robot navigates immediately.
         - Particle filter _SIGMA_LIDAR tightened 0.3->0.15 in state_estimation.py
           for faster wall-anchoring and less odometry drift.
+  [F45] Blue-obstacle false-positive fix + RANSAC speedup:
+        - perception.py: RED HSV tightened to H=0-8 / H=162-180, S>=150, V>=60.
+          Eliminates warm low-saturation reflections on blue/orange obstacle faces
+          that were triggering false red detections.
+        - _TARGET_Z_MIN raised 0.60 -> 0.63 m:
+          table surface = 0.625 m; cylinder centroid = 0.695 m.
+          Any detection below 0.63 m is a floor-level false positive (e.g. the
+          blue obstacle face at z~0.20 m).
+        - _update_target_from_detection: added obstacle proximity rejection.
+          If the candidate world point is within _OBS_REJECT_RADIUS (0.45 m) of
+          any known obstacle XY position, it is treated as an obstacle reflection
+          and discarded. This catches the case where the cylinder is behind the
+          blue obstacle and its depth reading picks up the obstacle face.
+        - F44 synth target also inits target_position_smoothed so the
+          MAX_JUMP_M=1.0 guard correctly fires on the first real camera hit.
+        - perception.py: RANSAC max_iterations 500->100 (early-exit already
+          in place); eliminates the CPU spike that caused user Ctrl+C.
 """
 
 import pybullet as p
@@ -96,6 +113,15 @@ MIN_TARGET_DEPTH = 0.2
 MAX_JUMP_M       = 1.0
 _CAM_TILT        = 0.2
 
+# -- [F45] Z height filter: cylinder centroid = 0.695 m; table surface = 0.625 m.
+#    Anything detected below 0.63 m is floor/obstacle-face level, not on table.
+_TARGET_Z_MIN    = 0.63
+_TARGET_Z_MAX    = 0.95
+
+# -- [F45] Obstacle proximity rejection radius (m).
+#    If detected world XY is within this distance of a known obstacle, reject.
+_OBS_REJECT_RADIUS = 0.45
+
 # -- Approach tuning ---------------------------------------------------------
 GRASP_RANGE_M    = 0.55
 APPROACH_STOP_M  = 0.40
@@ -107,7 +133,7 @@ STANDOFF_DIST_M  = 0.65
 _STUCK_DIST_M  = 0.10
 _STUCK_TIMEOUT = 4.0
 
-# -- [F42] Search spin - faster -----------------------------------------------
+# -- [F42] Search spin --------------------------------------------------------
 _SPIN_ANGULAR_VEL = 5.0
 _SPIN_STEPS       = 150
 
@@ -117,16 +143,12 @@ _ORBIT_RADIUS = 1.5
 # -- Room safety bounds ------------------------------------------------------
 _ROOM_BOUND = 3.5
 
-# -- Target Z clamp ----------------------------------------------------------
-_TARGET_Z_MIN = 0.60
-_TARGET_Z_MAX = 0.95
-
 # -- Grasp IK constants ------------------------------------------------------
 _GRASP_WORLD_Z       = TABLE_HEIGHT + (TARGET_HEIGHT / 2.0) + 0.01  # ~0.695
 _GRASP_ABOVE_WORLD_Z = _GRASP_WORLD_Z + 0.15                         # ~0.845
 _GRASP_LIFT_POS      = 0.0
 
-# -- [F43] Touch sensor: torque threshold on finger joints -------------------
+# -- [F43] Touch sensor debounce ---------------------------------------------
 _TOUCH_TORQUE_THRESHOLD = 8.0
 _TOUCH_STABLE_FRAMES    = 5
 
@@ -434,11 +456,43 @@ class CognitiveArchitecture:
         return [world_x, world_y, world_z]
 
     def _update_target_from_detection(self, new_pos, depth_m, bearing):
+        """
+        Update the smoothed target position from a new camera detection.
+
+        [F45] Added two additional rejection gates before accepting:
+          1. Z-height gate: world_z must be >= _TARGET_Z_MIN (0.63 m).
+             The table surface is at 0.625 m; the cylinder centroid at 0.695 m.
+             Anything below 0.63 m is a floor-level obstacle-face reflection.
+          2. Obstacle proximity gate: if the candidate XY is within
+             _OBS_REJECT_RADIUS (0.45 m) of any known obstacle, the detection
+             is likely picking up an obstacle face or its reflection, not the
+             cylinder behind it.  Reject and wait for a better line-of-sight.
+        """
+        # [F45] Gate 1: Z-height filter
+        if new_pos[2] < _TARGET_Z_MIN:
+            if self.step_counter % 120 == 0:
+                print(f"[F45] Rejected detection: z={new_pos[2]:.3f} < "
+                      f"_TARGET_Z_MIN={_TARGET_Z_MIN} (floor/obstacle level)")
+            return False
+
+        # [F45] Gate 2: Obstacle proximity filter
+        for obs_xy in self.obstacles:
+            dist_to_obs = np.hypot(new_pos[0] - obs_xy[0],
+                                   new_pos[1] - obs_xy[1])
+            if dist_to_obs < _OBS_REJECT_RADIUS:
+                if self.step_counter % 120 == 0:
+                    print(f"[F45] Rejected detection: too close to obstacle "
+                          f"at ({obs_xy[0]:.2f},{obs_xy[1]:.2f}), "
+                          f"dist={dist_to_obs:.2f}m")
+                return False
+
+        # MAX_JUMP guard (original)
         if self.target_position_smoothed is not None:
             jump = np.hypot(new_pos[0] - self.target_position_smoothed[0],
                             new_pos[1] - self.target_position_smoothed[1])
             if jump > MAX_JUMP_M:
                 return False
+
         self.target_detection_count += 1
         self.target_camera_bearing   = bearing
         self.target_camera_depth     = depth_m
@@ -532,6 +586,7 @@ class CognitiveArchitecture:
                 bearing = math.atan2(-(cx_px - CAM_CX), CAM_FX)
                 wp      = self._pixel_depth_to_world(cx_px, cy_px,
                                                      true_d, estimated_pose)
+                # [F45] Z clamp now uses raised _TARGET_Z_MIN
                 wp[2]   = float(np.clip(wp[2], _TARGET_Z_MIN, _TARGET_Z_MAX))
 
                 if self.table_position is not None:
@@ -553,6 +608,7 @@ class CognitiveArchitecture:
                     if np.hypot(pca_world[0]-wp[0], pca_world[1]-wp[1]) < 0.5:
                         wp = pca_world
 
+                # [F45] _update_target_from_detection now also checks Z and obstacle proximity
                 accepted = self._update_target_from_detection(wp, true_d, bearing)
                 if accepted and self.step_counter % 10 == 0:
                     print(f"[CogArch] TARGET at "
@@ -642,26 +698,25 @@ class CognitiveArchitecture:
         if sensor_data['target_detected']:
             target_pos = sensor_data['target_position']
 
-        # [F44] SEARCH FAST-SKIP: if table position is already known from the
-        # initial map, we know exactly where to navigate - there is no need to
-        # spin and wait for the camera to see the target first.  Inject the
-        # table position as a synthetic "target detected" so the FSM transitions
-        # SEARCH->NAVIGATE immediately on the very first iteration.
+        # [F44] SEARCH FAST-SKIP + [F45] init smoother fix:
+        # When the table is already known from initial_map.json, skip the spin
+        # and navigate directly. Also set target_position_smoothed so the
+        # MAX_JUMP guard fires correctly on the first real camera detection.
         if (self.fsm.state == RobotState.SEARCH
                 and self.table_position is not None
                 and not sensor_data['target_detected']):
-            # Use the table centroid as the navigation goal until the camera
-            # actually detects the red cylinder close-up.
-            synth_z  = _GRASP_WORLD_Z  # approximate cylinder height
+            synth_z   = _GRASP_WORLD_Z
             synth_pos = [self.table_position[0],
                          self.table_position[1],
                          synth_z]
-            # Only do this if we haven't already set target_position from vision
             if self.target_position is None:
-                self.target_position = synth_pos
+                self.target_position          = synth_pos
+                # [F45] Also seed the smoother so MAX_JUMP_M=1.0 fires
+                # correctly when vision detects something far from table.
+                self.target_position_smoothed = list(synth_pos)
                 self.target_camera_depth = np.hypot(
                     synth_pos[0] - pose[0], synth_pos[1] - pose[1])
-                sensor_data = dict(sensor_data)  # shallow copy to avoid mutation
+                sensor_data = dict(sensor_data)
                 sensor_data['target_detected'] = True
                 sensor_data['target_position'] = synth_pos
                 target_pos = synth_pos

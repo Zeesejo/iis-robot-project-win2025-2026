@@ -15,9 +15,15 @@ SCENE_OBJECTS = {
 # [F15-A] Lower saturation/value thresholds relaxed to S>=100, V>=60.
 # [F21] Widened to H=0-15 / H=160-180 and lowered to S>=80, V>=50 as safety
 #       net for any residual PyBullet lighting desaturation on the cylinder.
+# [F45] Tightened BACK to H=0-8 / H=162-180, S>=150, V>=60.
+#       Rationale: logs showed the BLUE obstacle being flagged as red with
+#       red_pixels=538 (H=0-15, S>=80). The blue obstacle face lit by PyBullet
+#       ambient light can show warm H=10-15 low-saturation pixels (S~80-110).
+#       Raising S from 80 to 150 eliminates those washed-out reflections.
+#       The real red cylinder has high paint saturation (S>=180 in simulation).
 COLOR_RANGES_HSV = {
-    'red':    [(np.array([0,    80,  50]),  np.array([15,  255, 255])),
-               (np.array([160,  80,  50]),  np.array([180, 255, 255]))],
+    'red':    [(np.array([0,   150,  60]),  np.array([8,   255, 255])),
+               (np.array([162, 150,  60]),  np.array([180, 255, 255]))],
     'brown':  [(np.array([10,  80,  30]),   np.array([25,  180, 180]))],
     'blue':   [(np.array([100, 120,  70]),  np.array([130, 255, 255]))],
     'pink':   [(np.array([140,  40, 100]),  np.array([160, 255, 255]))],
@@ -95,7 +101,6 @@ def detect_objects_by_color(bgr_image, min_area=200):
     hsv = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2HSV)
 
     if _DEBUG_HSV:
-        # Sample a 20x20 patch from the image centre
         h, w = bgr_image.shape[:2]
         patch = hsv[h//2-10:h//2+10, w//2-10:w//2+10]
         if patch.size > 0:
@@ -108,7 +113,6 @@ def detect_objects_by_color(bgr_image, min_area=200):
         combined_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
         for (lower, upper) in ranges:
             combined_mask |= cv2.inRange(hsv, lower, upper)
-        # Use smaller kernel for red to preserve small objects
         kernel_size = (3, 3) if color_name == 'red' else (5, 5)
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, kernel_size)
         combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel)
@@ -293,9 +297,9 @@ class PerceptionModule:
         results = {'detections': detections, 'table_plane': None,
                    'target_pose': None, 'obstacle_poses': []}
 
-        # [F21-DEBUG] Log how many red pixels are seen every 240 frames
+        # [F21-DEBUG] Log how many red pixels are seen every ~1s (at 10fps perception)
         self._red_debug_counter += 1
-        if self._red_debug_counter % 24 == 0:  # every ~1s at 10fps perception
+        if self._red_debug_counter % 24 == 0:
             hsv_dbg = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
             red_dbg = np.zeros((height, width), dtype=np.uint8)
             for (lo, hi) in COLOR_RANGES_HSV['red']:
@@ -303,9 +307,8 @@ class PerceptionModule:
             n_red = int(np.sum(red_dbg > 0))
             if n_red > 0 or self._red_debug_counter % 240 == 0:
                 print(f"[RedDebug] red_pixels={n_red} "
-                      f"(H range 0-15 + 160-180, S>=80, V>=50)")
+                      f"(H 0-8 + 162-180, S>=150, V>=60)")
             if n_red == 0 and self._red_debug_counter % 240 == 0:
-                # Sample the H channel at the image centre to help diagnose
                 cy_c, cx_c = height // 2, width // 2
                 sample = hsv_dbg[cy_c-5:cy_c+5, cx_c-5:cx_c+5]
                 if sample.size > 0:
@@ -317,8 +320,13 @@ class PerceptionModule:
         if len(points_3d) < 10:
             return results
 
+        # [F45] Reduced max_iterations 500->100. The early-exit
+        # `if best_count >= self.min_inliers: break` already makes this fast
+        # once a good horizontal plane (floor/table) is found. 100 iterations
+        # is more than enough for a flat axis-aligned scene. This prevents a
+        # CPU spike that caused user Ctrl+C during normal navigation.
         ransac = RANSAC_Segmentation(
-            points=points_3d, max_iterations=500,
+            points=points_3d, max_iterations=100,
             distance_threshold=0.02, min_inliers_ratio=0.2
         )
         plane_mask, plane_model = ransac.run()
@@ -358,9 +366,6 @@ class PerceptionModule:
             except ValueError:
                 pass
         # [F21] Do NOT fall back to whole-scene PCA when no red pixels found.
-        # The fallback was producing giant dims=[10, 8, 4] from the full scene
-        # cloud, which confused the cognitive architecture into thinking a
-        # target had been found far away.
 
         for det in detections:
             if det['color'] in ['blue', 'pink', 'orange', 'yellow', 'black']:
@@ -406,7 +411,7 @@ if __name__ == '__main__':
     np.random.shuffle(full_cloud)
     print(f"\nSynthetic scene: {len(full_cloud)} pts ({num_plane} plane, {num_obj} cylinder)")
 
-    ransac = RANSAC_Segmentation(full_cloud, max_iterations=500,
+    ransac = RANSAC_Segmentation(full_cloud, max_iterations=100,
                                   distance_threshold=0.02, min_inliers_ratio=0.3)
     plane_mask, model = ransac.run()
     obj_pts = full_cloud[~plane_mask]

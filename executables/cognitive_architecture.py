@@ -8,23 +8,28 @@ SENSE-THINK-ACT Cycle:
     ACT:    Execute motion commands, control gripper
 
 FIXES in this revision
-  [F1] fsm.tick() now called once per STA step – step-based timeouts work.
-  [F2] CAMERA_HEIGHT updated to 0.67 m (robot-1.urdf: base_spawn(0.1)
-       + torso_joint_z(0.3) + cam_z_offset(0.27) = 0.67 m).
-  [F3] approach_standoff reset on every NAVIGATE re-entry, not only on
-       FAILURE, so stale standoffs from previous runs are discarded.
-  [F4] APPROACH_VISUAL rewritten: uses world-frame bearing to tracked
-       target (not raw camera bearing which is 0 when no fresh detection),
-       stops cleanly when depth < 0.55 m, and clamps fwd speed tightly.
-  [F5] Raised dist-to-table rejection gate to 3.5 m (was 3.0).
-  [F6] distance_for_fsm during APPROACH uses 2D world-frame distance to
-       target (not frozen camera depth) so GRASP transition fires at <0.55m.
-  [F7] approach_visual speed in act() uses np.hypot(world_tgt - pose)
-       so the robot slows down proportionally and does not ram the table.
-  [F8] _in_approach + _approach_depth_smooth reset when FSM leaves APPROACH
-       so stale state never carries over to the next attempt.
-  [F9] Fixed bare `if lidar:` which raises ValueError when lidar is a
-       numpy array; replaced with numpy-safe `if lidar is not None and len(lidar) > 0:`.
+  [F1]  fsm.tick() now called once per STA step – step-based timeouts work.
+  [F2]  CAMERA_HEIGHT updated to 0.67 m (robot-1.urdf: base_spawn(0.1)
+        + torso_joint_z(0.3) + cam_z_offset(0.27) = 0.67 m).
+  [F3]  approach_standoff reset on every NAVIGATE re-entry, not only on
+        FAILURE, so stale standoffs from previous runs are discarded.
+  [F4]  APPROACH_VISUAL rewritten: uses world-frame bearing to tracked
+        target (not raw camera bearing which is 0 when no fresh detection),
+        stops cleanly when depth < 0.55 m, and clamps fwd speed tightly.
+  [F5]  Raised dist-to-table rejection gate to 3.5 m (was 3.0).
+  [F6]  distance_for_fsm during APPROACH uses 2D world-frame distance to
+        target (not frozen camera depth) so GRASP transition fires at <0.55m.
+  [F7]  approach_visual speed in act() uses np.hypot(world_tgt - pose)
+        so the robot slows down proportionally and does not ram the table.
+  [F8]  _in_approach + _approach_depth_smooth reset when FSM leaves APPROACH
+        so stale state never carries over to the next attempt.
+  [F9]  Fixed bare `if lidar:` which raises ValueError when lidar is a
+        numpy array; replaced with numpy-safe check.
+  [F10] Stuck detection in think(): if robot X/Y hasn't moved 0.1 m in
+        4 s while NAVIGATE, clear standoff + replan from current pose so
+        the robot never oscillates against a wall indefinitely.
+  [F11] action_planning.py: smarter bypass (both perpendicular directions
+        tested, room-bounds clamped, table uses 2.0 m clearance).
 """
 
 import pybullet as p
@@ -73,7 +78,7 @@ WHEEL_BASELINE  = 0.45
 # [F2] robot-1.urdf camera is on torso_link at xyz="0.12 0 0.27":
 #   base_spawn(0.1) + torso_joint_z(0.3) + cam_z(0.27) = 0.67 m
 CAMERA_HEIGHT   = 0.67
-CAMERA_FORWARD  = 0.12   # camera 0.12 m forward on torso (kept for PCA path only)
+CAMERA_FORWARD  = 0.12
 DEPTH_NEAR      = 0.1
 DEPTH_FAR       = 10.0
 
@@ -86,19 +91,23 @@ CAM_FY   = (240 / 2.0) / np.tan(np.radians(_FOV_V / 2))
 CAM_CX, CAM_CY = 160.0, 120.0
 
 TARGET_COLOR     = 'red'
-MAX_TARGET_DEPTH = 3.5   # [F5] gate raised
+MAX_TARGET_DEPTH = 3.5
 MIN_TARGET_DEPTH = 0.2
-MAX_JUMP_M       = 1.0   # EMA jump filter threshold
+MAX_JUMP_M       = 1.0
 
 # Camera tilt compensation (rpy="0 0.2 0" in robot-1.urdf)
 _CAM_TILT = 0.2   # radians downward
 
 # ── Approach tuning ──────────────────────────────────────────────────────
-# [F6] FSM APPROACH→GRASP triggers when 2D world-frame distance < this
 GRASP_RANGE_M   = 0.55
-# [F7] During APPROACH, robot slows to near-zero at this world distance
-APPROACH_SLOW_M = 1.0   # start slowing below 1.0 m
-APPROACH_STOP_M = 0.55  # stop wheels at this distance
+APPROACH_SLOW_M = 1.0
+APPROACH_STOP_M = 0.55
+
+# ── Stuck detection ──────────────────────────────────────────────────────
+# [F10] If the robot hasn't moved this far in STUCK_TIMEOUT seconds,
+# we declare it stuck and force a replan.
+_STUCK_DIST_M   = 0.10   # metres
+_STUCK_TIMEOUT  = 4.0    # seconds (= 4 * 240 steps)
 
 
 def _lidar_has_data(lidar):
@@ -167,7 +176,7 @@ class CognitiveArchitecture:
         self.obstacles                 = []
         self.current_waypoint          = None
         self.approach_standoff         = None
-        self._last_fsm_state           = None   # [F3] track state changes
+        self._last_fsm_state           = None
 
         # M4 perception results
         self.last_perception_result = None
@@ -176,9 +185,13 @@ class CognitiveArchitecture:
 
         self._failure_reset_done = False
 
-        # [F8] APPROACH-specific state – reset whenever we leave APPROACH
+        # [F8] APPROACH-specific state
         self._in_approach           = False
         self._approach_depth_smooth = float('inf')
+
+        # [F10] Stuck detection state
+        self._stuck_pose      = None   # (x, y) snapshot
+        self._stuck_timer     = 0      # steps since last movement
 
         # Timing
         self.step_counter = 0
@@ -267,10 +280,6 @@ class CognitiveArchitecture:
         return False
 
     def _compute_approach_standoff(self, target_pos, robot_pose):
-        """
-        Compute a standoff point 0.65 m from the target on the side
-        facing the robot.  Uses table orientation if known.
-        """
         standoff_dist = 0.65
         if self.table_orientation is not None:
             yaw  = p.getEulerFromQuaternion(self.table_orientation)[2]
@@ -334,31 +343,20 @@ class CognitiveArchitecture:
     # ────────────────────── camera → world projection ──────────────────────
 
     def _pixel_depth_to_world(self, px, py, depth_m, robot_pose):
-        """
-        Convert (pixel, depth_metres) to world-frame [x,y,z].
-        Accounts for camera tilt (_CAM_TILT rad downward pitch).
-        """
-        # Normalised image coordinates
         nx = (px - CAM_CX) / CAM_FX
         ny = (py - CAM_CY) / CAM_FY
-
-        # Un-project to camera frame (z forward, x right, y down)
         cam_x = depth_m * nx
         cam_y = depth_m * ny
         cam_z = depth_m
-
-        # Rotate by camera pitch (tilt down = positive pitch around y-axis)
         ct = math.cos(_CAM_TILT)
         st = math.sin(_CAM_TILT)
-        body_forward = ct * cam_z - st * cam_y   # x in body frame
-        body_up      = st * cam_z + ct * cam_y   # z in body frame (positive = up if cam_y<0)
-        body_lateral = cam_x                     # y in body frame (right = positive)
-
+        body_forward = ct * cam_z - st * cam_y
+        body_up      = st * cam_z + ct * cam_y
+        body_lateral = cam_x
         rx, ry, rt = robot_pose
         world_x = rx + body_forward * math.cos(rt) - (-body_lateral) * math.sin(rt)
         world_y = ry + body_forward * math.sin(rt) + (-body_lateral) * math.cos(rt)
-        world_z = CAMERA_HEIGHT - body_up   # body_up positive = below camera
-
+        world_z = CAMERA_HEIGHT - body_up
         return [world_x, world_y, world_z]
 
     def _update_target_from_detection(self, new_pos, depth_m, bearing):
@@ -367,11 +365,9 @@ class CognitiveArchitecture:
                             new_pos[1] - self.target_position_smoothed[1])
             if jump > MAX_JUMP_M:
                 return False
-
         self.target_detection_count += 1
         self.target_camera_bearing  = bearing
         self.target_camera_depth    = depth_m
-
         alpha = 0.5 if self.target_detection_count <= 5 else 0.15
         if self.target_position_smoothed is None:
             self.target_position_smoothed = list(new_pos)
@@ -541,6 +537,9 @@ class CognitiveArchitecture:
                 and self._last_fsm_state != RobotState.NAVIGATE):
             self.approach_standoff = None
             self.current_waypoint  = None
+            # [F10] Also reset stuck tracker on every fresh NAVIGATE entry
+            self._stuck_pose  = (pose[0], pose[1])
+            self._stuck_timer = 0
 
         # [F8] Reset approach state whenever we LEAVE APPROACH
         if (self._last_fsm_state == RobotState.APPROACH
@@ -552,6 +551,46 @@ class CognitiveArchitecture:
 
         if self.fsm.state != RobotState.FAILURE:
             self._failure_reset_done = False
+
+        # ── [F10] Stuck detection (NAVIGATE only) ────────────────────────
+        if current_state == RobotState.NAVIGATE:
+            if self._stuck_pose is None:
+                self._stuck_pose  = (pose[0], pose[1])
+                self._stuck_timer = 0
+            else:
+                moved = np.hypot(pose[0] - self._stuck_pose[0],
+                                 pose[1] - self._stuck_pose[1])
+                if moved > _STUCK_DIST_M:
+                    # Made meaningful progress – reset the tracker
+                    self._stuck_pose  = (pose[0], pose[1])
+                    self._stuck_timer = 0
+                else:
+                    self._stuck_timer += 1
+                    stuck_secs = self._stuck_timer * self.dt
+                    if stuck_secs >= _STUCK_TIMEOUT:
+                        print(f"[F10] STUCK detected at "
+                              f"({pose[0]:.2f}, {pose[1]:.2f}) – "
+                              f"replanning from current pose")
+                        # Force a full replan from the current position
+                        self.approach_standoff = None
+                        self.current_waypoint  = None
+                        self._stuck_pose       = (pose[0], pose[1])
+                        self._stuck_timer      = 0
+                        # Recompute standoff from current pose so it
+                        # doesn't land behind the wall again
+                        if self.target_position is not None:
+                            self.approach_standoff = \
+                                self._compute_approach_standoff(
+                                    self.target_position, pose)
+                            print(f"[F10] New standoff: "
+                                  f"({self.approach_standoff[0]:.2f}, "
+                                  f"{self.approach_standoff[1]:.2f})")
+        else:
+            # Not in NAVIGATE – keep tracker dormant
+            self._stuck_pose  = None
+            self._stuck_timer = 0
+
+        # ──────────────────────────────────────────────────────────────────
 
         target_pos = self.kb.query_position('target')
         if sensor_data['target_detected']:
@@ -576,10 +615,6 @@ class CognitiveArchitecture:
                       f"({self.approach_standoff[0]:.2f}, "
                       f"{self.approach_standoff[1]:.2f})")
 
-            # [F6] Use 2D world-frame distance as the FSM distance signal
-            # during APPROACH so the GRASP transition fires correctly.
-            # During NAVIGATE, keep using standoff distance so the robot
-            # stops at the standoff point, not at the target itself.
             if self.fsm.state == RobotState.APPROACH:
                 distance_for_fsm = distance_2d
             elif (self.approach_standoff is not None
@@ -806,12 +841,11 @@ class CognitiveArchitecture:
 
             av = 5.0 * he
 
-            # [F9] numpy-safe lidar check
             if sd > 1.0:
                 fv, at = self._lidar_avoidance(lidar, fv, relaxed=True, pose=pose)
                 av    += at
             else:
-                if _lidar_has_data(lidar):          # <-- was bare `if lidar:`
+                if _lidar_has_data(lidar):
                     mf = min(lidar[i % len(lidar)] for i in range(-2, 3))
                     if mf < 0.12:
                         fv = 0.0

@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Target: red cylinder r=0.04m, h=0.12m, mass=0.5kg -->
+<robot name="target_object">
+  <link name="cylinder_link">
+    <inertial>
+      <origin xyz="0 0 0.06" rpy="0 0 0"/>
+      <mass value="0.5"/>
+      <inertia ixx="0.0005" ixy="0" ixz="0" iyy="0.0005" iyz="0" izz="0.0002"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0.06" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.04" length="0.12"/></geometry>
+      <material name="red"><color rgba="1.0 0.0 0.0 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0.06" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.04" length="0.12"/></geometry>
+    </collision>
+  </link>
+</robot>

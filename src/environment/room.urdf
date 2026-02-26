@@ -1,0 +1,129 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 10x10x10 room: floor, 4 walls, ceiling -->
+<robot name="room">
+
+  <link name="world"/>
+
+  <!-- FLOOR -->
+  <link name="floor">
+    <inertial>
+      <mass value="0"/>
+      <inertia ixx="0" ixy="0" ixz="0" iyy="0" iyz="0" izz="0"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><box size="10 10 0.02"/></geometry>
+      <material name="floor_color"><color rgba="0.2 0.2 0.2 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><box size="10 10 0.02"/></geometry>
+    </collision>
+  </link>
+  <joint name="floor_joint" type="fixed">
+    <parent link="world"/>
+    <child link="floor"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+
+  <!-- WALL NORTH -->
+  <link name="wall_north">
+    <inertial>
+      <mass value="0"/>
+      <inertia ixx="0" ixy="0" ixz="0" iyy="0" iyz="0" izz="0"/>
+    </inertial>
+    <visual>
+      <geometry><box size="10 0.1 10"/></geometry>
+      <material name="wall_color"><color rgba="0.8 0.8 0.8 1"/></material>
+    </visual>
+    <collision>
+      <geometry><box size="10 0.1 10"/></geometry>
+    </collision>
+  </link>
+  <joint name="wall_north_joint" type="fixed">
+    <parent link="world"/>
+    <child link="wall_north"/>
+    <origin xyz="0 5 5" rpy="0 0 0"/>
+  </joint>
+
+  <!-- WALL SOUTH -->
+  <link name="wall_south">
+    <inertial>
+      <mass value="0"/>
+      <inertia ixx="0" ixy="0" ixz="0" iyy="0" iyz="0" izz="0"/>
+    </inertial>
+    <visual>
+      <geometry><box size="10 0.1 10"/></geometry>
+      <material name="wall_color"><color rgba="0.8 0.8 0.8 1"/></material>
+    </visual>
+    <collision>
+      <geometry><box size="10 0.1 10"/></geometry>
+    </collision>
+  </link>
+  <joint name="wall_south_joint" type="fixed">
+    <parent link="world"/>
+    <child link="wall_south"/>
+    <origin xyz="0 -5 5" rpy="0 0 0"/>
+  </joint>
+
+  <!-- WALL EAST -->
+  <link name="wall_east">
+    <inertial>
+      <mass value="0"/>
+      <inertia ixx="0" ixy="0" ixz="0" iyy="0" iyz="0" izz="0"/>
+    </inertial>
+    <visual>
+      <geometry><box size="0.1 10 10"/></geometry>
+      <material name="wall_color"><color rgba="0.8 0.8 0.8 1"/></material>
+    </visual>
+    <collision>
+      <geometry><box size="0.1 10 10"/></geometry>
+    </collision>
+  </link>
+  <joint name="wall_east_joint" type="fixed">
+    <parent link="world"/>
+    <child link="wall_east"/>
+    <origin xyz="5 0 5" rpy="0 0 0"/>
+  </joint>
+
+  <!-- WALL WEST -->
+  <link name="wall_west">
+    <inertial>
+      <mass value="0"/>
+      <inertia ixx="0" ixy="0" ixz="0" iyy="0" iyz="0" izz="0"/>
+    </inertial>
+    <visual>
+      <geometry><box size="0.1 10 10"/></geometry>
+      <material name="wall_color"><color rgba="0.8 0.8 0.8 1"/></material>
+    </visual>
+    <collision>
+      <geometry><box size="0.1 10 10"/></geometry>
+    </collision>
+  </link>
+  <joint name="wall_west_joint" type="fixed">
+    <parent link="world"/>
+    <child link="wall_west"/>
+    <origin xyz="-5 0 5" rpy="0 0 0"/>
+  </joint>
+
+  <!-- CEILING -->
+  <link name="ceiling">
+    <inertial>
+      <mass value="0"/>
+      <inertia ixx="0" ixy="0" ixz="0" iyy="0" iyz="0" izz="0"/>
+    </inertial>
+    <visual>
+      <geometry><box size="10 10 0.02"/></geometry>
+      <material name="ceiling_color"><color rgba="1.0 1.0 1.0 1"/></material>
+    </visual>
+    <collision>
+      <geometry><box size="10 10 0.02"/></geometry>
+    </collision>
+  </link>
+  <joint name="ceiling_joint" type="fixed">
+    <parent link="world"/>
+    <child link="ceiling"/>
+    <origin xyz="0 0 10" rpy="0 0 0"/>
+  </joint>
+
+</robot>

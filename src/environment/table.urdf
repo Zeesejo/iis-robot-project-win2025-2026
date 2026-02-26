@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Table: 1.5m x 0.8m surface at z=0.625m, brown, mass=10kg -->
+<robot name="table">
+  <link name="table_base">
+    <inertial>
+      <origin xyz="0 0 0.3125" rpy="0 0 0"/>
+      <mass value="10.0"/>
+      <inertia ixx="0.5" ixy="0" ixz="0" iyy="0.5" iyz="0" izz="0.3"/>
+    </inertial>
+    <!-- Tabletop -->
+    <visual>
+      <origin xyz="0 0 0.6" rpy="0 0 0"/>
+      <geometry><box size="1.5 0.8 0.05"/></geometry>
+      <material name="brown"><color rgba="0.5 0.3 0.1 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0.6" rpy="0 0 0"/>
+      <geometry><box size="1.5 0.8 0.05"/></geometry>
+    </collision>
+    <!-- Leg 1 -->
+    <visual>
+      <origin xyz="0.65 0.35 0.3" rpy="0 0 0"/>
+      <geometry><box size="0.05 0.05 0.6"/></geometry>
+      <material name="brown"><color rgba="0.5 0.3 0.1 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0.65 0.35 0.3" rpy="0 0 0"/>
+      <geometry><box size="0.05 0.05 0.6"/></geometry>
+    </collision>
+    <!-- Leg 2 -->
+    <visual>
+      <origin xyz="-0.65 0.35 0.3" rpy="0 0 0"/>
+      <geometry><box size="0.05 0.05 0.6"/></geometry>
+      <material name="brown"><color rgba="0.5 0.3 0.1 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="-0.65 0.35 0.3" rpy="0 0 0"/>
+      <geometry><box size="0.05 0.05 0.6"/></geometry>
+    </collision>
+    <!-- Leg 3 -->
+    <visual>
+      <origin xyz="0.65 -0.35 0.3" rpy="0 0 0"/>
+      <geometry><box size="0.05 0.05 0.6"/></geometry>
+      <material name="brown"><color rgba="0.5 0.3 0.1 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0.65 -0.35 0.3" rpy="0 0 0"/>
+      <geometry><box size="0.05 0.05 0.6"/></geometry>
+    </collision>
+    <!-- Leg 4 -->
+    <visual>
+      <origin xyz="-0.65 -0.35 0.3" rpy="0 0 0"/>
+      <geometry><box size="0.05 0.05 0.6"/></geometry>
+      <material name="brown"><color rgba="0.5 0.3 0.1 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="-0.65 -0.35 0.3" rpy="0 0 0"/>
+      <geometry><box size="0.05 0.05 0.6"/></geometry>
+    </collision>
+  </link>
+</robot>

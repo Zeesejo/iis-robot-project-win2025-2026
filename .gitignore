@@ -42,7 +42,6 @@ Thumbs.db
 executables/frame_*_rgb.png
 executables/frame_*_depth.png
 executables/*.png
-initial_map.json
 temp_*.py
 temp_*
 

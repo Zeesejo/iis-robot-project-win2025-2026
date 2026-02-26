@@ -5,34 +5,23 @@ FIX HISTORY:
   [F26] world-frame target, body-frame XY clamp, force 50N
   [F27] stow phase drives all arm joints to 0, no IK
   [F31] Z passed as pure world frame, no double offset
-  [F32] IK end-effector = joint 16 (gripper_base_joint) -- WRONG, reverted
-  [F33] CRITICAL geometry fix:
-        - IK end-effector = link 15 (wrist_roll_link, MOVABLE)
-        - Lift MUST be 0.0 during grasp (lift_joint is FIXED in URDF anyway)
-  [F37] restPoses shoulder=1.47 -- WRONG: arm cannot reach upward-forward
-        to cylinder that is at SAME Z as shoulder (0.695m)
-  [F39] CRITICAL geometry fix #2:
-        PALM_Z_OFFSET corrected to 0.05 m:
-          gripper_base_joint origin xyz='0 0 0.05' from wrist_roll_link
-          left/right finger joints: xyz='0.04 ±0.04 0' -- fingers extend in X!
-          Fingers add ZERO to Z. Only gripper_base adds 0.05.
-          Old value 0.075 was wrong (added phantom 0.025)
+  [F33] IK EE = link 15 (wrist_roll_link, MOVABLE)
+        lift=0 during grasp (lift_joint is prismatic in robot-1.urdf;
+        at lift=0, shoulder Z = 0.695 m = cylinder Z exactly).
+  [F39] PALM_Z_OFFSET = 0.05 (gripper_base_joint z=0.05; fingers in X/Y)
+  [F40] restPoses corrected:
+        shoulder=0.0 (horizontal) because shoulder IS at cyl_z when lift=0.
+        Arm extends FORWARD-HORIZONTALLY to reach cylinder.
+        wrist_pitch=0.0, elbow=0.0, arm_base=0.0, wrist_roll=0.0.
 
-        restPoses corrected for DOWNWARD-FORWARD reach:
-          shoulder = -0.90 rad  (arm angles downward, ~52 deg below horizontal)
-          elbow    =  0.40 rad  (slightly bent to compensate Z)
-          wrist_pitch = 0.50 rad  (tilts palm forward/downward to face cylinder)
-          arm_base = 0.00, wrist_roll = 0.00
-
-        GEOMETRY PROOF:
-          Shoulder joint Z = 0.695 m (same as cylinder Z)
-          At shoulder=-0.90: cos(-0.90)=0.622 -> elbow is 0.249m ABOVE shoulder
-          elbow Z = 0.695 + 0.249 = 0.944
-          At shoulder=-0.90: sin(-0.90)=0.783 -> elbow is 0.313m FORWARD
-          With elbow=+0.40 from shoulder frame: wrist_pitch reachable at Z=0.745
-          Total arm can place wrist at cyl_z+0.05 (= 0.745) with these angles.
-
-        lift_joint is FIXED in URDF -- cannot be controlled, no-op.
+  GEOMETRY (robot-1.urdf, base at z=0.10 m):
+    torso      z=0.40  (+0.30)
+    lift@0     z=0.62  (+0.22 joint origin, lift=0)
+    arm_base   z=0.67  (+0.05)
+    shoulder   z=0.695 (+0.025)  <- exactly = TABLE_HEIGHT+TARGET_HEIGHT/2+0.01
+    => shoulder horizontal reach places wrist at z=0.695+0.05=0.745
+       which is 0.05m (PALM_Z_OFFSET) above the cylinder centre.
+       IK target = cyl_z + PALM_Z_OFFSET = 0.745. Palm lands at 0.695. ✓
 """
 
 import pybullet as p
@@ -45,14 +34,11 @@ import math
 MAX_REACH = 0.55
 
 # IK end-effector = link 15 = wrist_roll_link (child of wrist_roll_joint).
-# This is the last MOVABLE joint in the arm chain.
 _IK_EE_LINK = 15
 
-# [F39] Z offset from wrist_roll_link origin to palm centre:
-#   gripper_base_joint: xyz='0 0 0.05' from wrist_roll_link  -> +0.050 m in Z
-#   left/right finger joints: xyz='0.04 ±0.04 0' -> fingers extend in X, NOT Z
-#   Finger midpoint adds 0 to Z.
-#   TOTAL: 0.050 m (NOT 0.075 -- old value had phantom +0.025)
+# [F39] Z offset from wrist_roll_link to palm centre.
+#   gripper_base_joint xyz='0 0 0.05' -> +0.05 m
+#   fingers are at xyz='0.04 ±0.04 0' -> extend in X, add 0 to Z.
 _PALM_Z_OFFSET = 0.050
 
 
@@ -141,23 +127,21 @@ def grasp_object(robot_id, target_pos, target_orient,
     Move the robot arm to grasp an object.
 
     target_pos : [x, y, z] WORLD frame.
-        XY : converted to body frame, clamped to MAX_REACH, back to world.
-        Z  : world Z of the PALM (cylinder centre, e.g. 0.695 m).
-             Internally offset by +PALM_Z_OFFSET (0.050) so IK drives
-             the WRIST there and palm lands at target Z.
-
-    target_orient : quaternion for identity [0,0,0,1].
+      XY: body-frame clamped to MAX_REACH, converted back to world.
+      Z : world Z of the PALM (e.g. 0.695 = cylinder centre).
+          Internally +PALM_Z_OFFSET so IK drives the WRIST to (palm_z+0.05),
+          placing the palm at palm_z.
 
     phase:
-        'stow'          - zero all arm joints, no IK
-        'reach_above'   - IK to (tx, ty, palm_z+0.15)
-        'reach_target'  - IK to (tx, ty, palm_z)
-        'close_gripper' - IK hold + close fingers
+      'stow'          - zero all arm joints, no IK
+      'reach_above'   - IK to (tx, ty, palm_z+0.15)
+      'reach_target'  - IK to (tx, ty, palm_z)
+      'close_gripper' - IK hold + close fingers
 
-    NOTE: lift_joint is FIXED in robot.urdf -- cannot be controlled.
-    The arm_base (shoulder) joint is at world Z = 0.695 m, same as the
-    cylinder. The arm must angle DOWNWARD-FORWARD to place the palm at
-    cylinder Z. restPoses are set accordingly.
+    [F40] restPoses: shoulder=0 (horizontal). Shoulder joint is at
+    world Z = 0.695 m (= cylinder Z) when lift=0. Arm extends FORWARD-
+    HORIZONTALLY; IK wrist target = cyl_z + 0.05 = 0.745 m, which is
+    achievable with shoulder near-horizontal.
     """
     num_joints_total = p.getNumJoints(robot_id)
 
@@ -199,13 +183,13 @@ def grasp_object(robot_id, target_pos, target_orient,
     base_yaw = p.getEulerFromQuaternion(base_orn)[2]
 
     # ------------------------------------------------------------------ #
-    # 3. XY body-frame clamp; Z = palm target + PALM_Z_OFFSET for wrist IK
+    # 3. XY body-frame clamp; IK wrist Z = palm_z + PALM_Z_OFFSET
     # ------------------------------------------------------------------ #
     dx_w = target_pos[0] - base_pos[0]
     dy_w = target_pos[1] - base_pos[1]
 
-    palm_z  = float(np.clip(target_pos[2], 0.50, 1.20))
-    ik_wz   = palm_z + _PALM_Z_OFFSET
+    palm_z = float(np.clip(target_pos[2], 0.50, 1.20))
+    ik_wz  = palm_z + _PALM_Z_OFFSET
 
     cy =  math.cos(-base_yaw)
     sy =  math.sin(-base_yaw)
@@ -225,14 +209,13 @@ def grasp_object(robot_id, target_pos, target_orient,
 
     # ------------------------------------------------------------------ #
     # 4. IK
-    # EE = _IK_EE_LINK = 15 (wrist_roll_link, MOVABLE)
-    # [F39] restPoses: shoulder=-0.90 (downward-forward), elbow=0.40,
-    #   wrist_pitch=0.50. Shoulder is at Z=0.695 = cylinder Z.
-    #   Arm must angle down-forward to place palm at cylinder Z.
+    # [F40] restPoses: shoulder=0 (horizontal). Shoulder Z = 0.695 m =
+    # cylinder Z. Arm horizontal reaches wrist to Z~0.745 (= cyl_z+0.05)
+    # which is the IK target. This gives a clean convergent solution.
     # ------------------------------------------------------------------ #
     lower_limits  = [-3.14, -1.00, -0.50, -1.57, -3.14]
     upper_limits  = [ 3.14,  1.57,  2.00,  1.57,  3.14]
-    rest_poses    = [ 0.00, -0.90,  0.40,  0.50,  0.00]   # [F39] downward reach
+    rest_poses    = [ 0.00,  0.00,  0.00,  0.00,  0.00]   # [F40] horizontal
     joint_ranges  = [u - l for u, l in zip(upper_limits, lower_limits)]
 
     ik_solution = p.calculateInverseKinematics(
@@ -253,7 +236,7 @@ def grasp_object(robot_id, target_pos, target_orient,
         return False
 
     # ------------------------------------------------------------------ #
-    # 5. Map IK solution -> arm joints
+    # 5. Map IK solution slots -> arm joints
     # ------------------------------------------------------------------ #
     non_fixed_upto_ee = [
         j for j in range(_IK_EE_LINK + 1)
@@ -299,7 +282,7 @@ if __name__ == "__main__":
     p.setGravity(0, 0, -9.81)
     p.setAdditionalSearchPath(pybullet_data.getDataPath())
     p.loadURDF("plane.urdf")
-    robot_id = p.loadURDF("../robot/robot.urdf", basePosition=[0, 0, 0.2])
+    robot_id = p.loadURDF("../robot/robot-1.urdf", basePosition=[0, 0, 0.1])
     goal      = [2.0, 2.0]
     test_pose = [0.0, 0.0, 0.0]
     for _ in range(2400):

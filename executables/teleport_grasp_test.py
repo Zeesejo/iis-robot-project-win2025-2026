@@ -8,14 +8,20 @@ faces it directly, forces FSM -> GRASP.
 FIX HISTORY:
   F31 - real world Z; orientation [0,pi/2,0]
   F32 - IK XY from ground-truth (tx,ty); orientation [0,0,0]
-  F33 - lift=0.0 during grasp; IK EE=link15 (wrist_roll, movable);
-        Z offset +0.075 for palm length inside grasp_object().
+  F33 - lift=0.0 during grasp; IK EE=link15 (wrist_roll, movable).
   F34 - resetJointState before stepSimulation
-  F35 - resetJointState ALL joints to 0.0 only (non-zero -> explosion)
+  F35 - resetJointState ALL joints to 0.0
   F36 - disable gravity during teleport+reset; re-enable after
-  F37 - restPoses shoulder=1.47 to bias IK toward horizontal-forward
-  F38 - STANDOFF_M increased to 0.80m so robot spawns further from
-        cylinder; gives arm room to extend forward without table collision.
+  F37 - restPoses shoulder=1.47 to bias IK -- WRONG (reverted in F40)
+  F38 - STANDOFF_M increased to 0.80m
+  F39 - PALM_Z_OFFSET=0.05, restPoses shoulder=-0.90 -- WRONG direction
+  F40 - [THIS FIX]
+        1. teleport z=0.05 (half base-box height 0.1 m) to sit flush on floor
+        2. _set_lift: skip silently if lift_joint is None
+        3. isConnected() guard before cleanup loop
+        4. restPoses shoulder=0.0 (horizontal) -- shoulder is exactly at
+           cyl_z=0.695 m when lift=0; arm extends forward horizontally
+        5. IK wrist target = cyl_z + 0.05 (PALM_Z_OFFSET); palm at cyl_z
 ======================================================================
 """
 
@@ -35,12 +41,12 @@ from src.modules.fsm import RobotFSM, RobotState
 from src.modules.knowledge_reasoning import get_knowledge_base
 
 # ---------------------------------------------------------------------------
-STANDOFF_M      = 0.80    # [F38] was 0.55 - more room for arm to extend
+STANDOFF_M      = 0.80    # m in front of cylinder
 GRASP_TIMEOUT_S = 30.0
 DT              = 1.0 / 240.0
 
-_CYL_Z   = TABLE_HEIGHT + (TARGET_HEIGHT / 2.0) + 0.01   # ~0.695 m
-_ABOVE_Z = _CYL_Z + 0.15                                  # ~0.845 m
+_CYL_Z   = TABLE_HEIGHT + (TARGET_HEIGHT / 2.0) + 0.01   # 0.695 m
+_ABOVE_Z = _CYL_Z + 0.15                                  # 0.845 m
 
 _GRASP_ORN_EULER   = [0.0, 0.0, 0.0]
 _WRIST_ROLL_LINK   = 15
@@ -55,11 +61,16 @@ def _set_wheels(robot_id, v=0):
 
 
 def _set_lift(robot_id, lift_joint, pos):
-    if lift_joint is not None:
+    """[F40] silently skip if lift_joint is None or disconnected."""
+    if lift_joint is None:
+        return
+    try:
         p.setJointMotorControl2(robot_id, lift_joint,
                                 p.POSITION_CONTROL,
                                 targetPosition=pos,
                                 force=100, maxVelocity=0.5)
+    except Exception:
+        pass
 
 
 def _detect_joints(robot_id):
@@ -84,15 +95,16 @@ def _detect_joints(robot_id):
 
 def _link_pos(robot_id, link_idx):
     try:
-        return p.getLinkState(robot_id, link_idx)[0]
+        return p.getLinkState(robot_id, link_idx,
+                              computeForwardKinematics=1)[4]
     except Exception:
         return None
 
 
 def _teleport_and_settle(robot_id, pos, orn_q, lift_joint, name_to_idx):
     """
-    [F36] Safe teleport: disable gravity, teleport, reset joints,
-    settle gently without gravity, re-enable gravity, settle with gravity.
+    [F36] Safe teleport: gravity off, reset joints, settle, gravity on.
+    [F40] teleport Z = half-base-height (0.05m) so wheels sit flush.
     """
     p.setGravity(0, 0, 0)
     p.resetBaseVelocity(robot_id,
@@ -126,7 +138,7 @@ def _teleport_and_settle(robot_id, pos, orn_q, lift_joint, name_to_idx):
 
 def main():
     print("=" * 60)
-    print("  TELEPORT GRASP TEST  [F38]")
+    print("  TELEPORT GRASP TEST  [F40]")
     print(f"  Cylinder Z = {_CYL_Z:.3f} m   Above Z = {_ABOVE_Z:.3f} m")
     print(f"  Standoff   = {STANDOFF_M:.2f} m")
     print("=" * 60)
@@ -146,7 +158,6 @@ def main():
     tx, ty, tz = tgt_pos_pb
     print(f"[Test] Cylinder:      ({tx:.3f}, {ty:.3f}, {tz:.3f})")
 
-    # Place robot STANDOFF_M between origin and cylinder (cyl->origin direction)
     angle_cyl_to_origin = math.atan2(-ty, -tx)
     robot_x = tx + STANDOFF_M * math.cos(angle_cyl_to_origin)
     robot_y = ty + STANDOFF_M * math.sin(angle_cyl_to_origin)
@@ -157,18 +168,19 @@ def main():
           f"yaw={math.degrees(face_yaw):.1f} deg")
     print(f"[Test] Dist to cyl:   {math.hypot(tx-robot_x, ty-robot_y):.3f} m")
 
-    print("[Test] Teleporting (gravity-off settle)...")
-    _teleport_and_settle(robot_id, [robot_x, robot_y, 0.1],
+    # [F40] z=0.05 = half of base_link box height (box size 0.5x0.4x0.1)
+    print("[Test] Teleporting...")
+    _teleport_and_settle(robot_id, [robot_x, robot_y, 0.05],
                          orn_q, lift_joint, name_to_idx)
 
     bp, _ = p.getBasePositionAndOrientation(robot_id)
     wr_pos = _link_pos(robot_id, _WRIST_ROLL_LINK)
     gb_pos = _link_pos(robot_id, _GRIPPER_BASE_LINK)
-    print(f"[Test] Robot base Z:  {bp[2]:.3f}  (expected ~0.10)")
+    print(f"[Test] Robot base Z:  {bp[2]:.3f}  (expected ~0.05)")
     if wr_pos:
-        print(f"[Test] wrist Z:       {wr_pos[2]:.3f}")
+        print(f"[Test] wrist Z:       {wr_pos[2]:.3f}  (expected ~0.695)")
     if gb_pos:
-        print(f"[Test] palm Z:        {gb_pos[2]:.3f}")
+        print(f"[Test] palm Z:        {gb_pos[2]:.3f}  (expected ~0.695)")
     print(f"[Test] Cylinder Z:    {tz:.3f}")
 
     kb.add_position('target', tx, ty, tz)
@@ -192,6 +204,10 @@ def main():
     last_log_s = -1
 
     while True:
+        if not p.isConnected():
+            print("[Test] PyBullet disconnected — exiting.")
+            break
+
         fsm.tick()
         t_sim  = fsm.get_time_in_state()
         t_wall = time.time() - start_time
@@ -208,33 +224,45 @@ def main():
         _set_lift(robot_id, lift_joint, 0.0)
         _set_wheels(robot_id, 0)
 
-        grasp_object(robot_id, tgt_p, grasp_orn,
-                     arm_joints=arm_joints or None,
-                     close_gripper=close,
-                     phase=phase)
+        try:
+            grasp_object(robot_id, tgt_p, grasp_orn,
+                         arm_joints=arm_joints or None,
+                         close_gripper=close,
+                         phase=phase)
+        except Exception as e:
+            print(f"[Test] grasp_object error: {e}")
+            break
 
-        contacts = p.getContactPoints(bodyA=robot_id, bodyB=target_id)
-        if contacts and len(contacts) > 0:
-            contact_detected = True
+        try:
+            contacts = p.getContactPoints(bodyA=robot_id, bodyB=target_id)
+            if contacts and len(contacts) > 0:
+                contact_detected = True
+        except Exception:
+            pass
 
         t_s = int(t_wall)
         if t_s != last_log_s:
             last_log_s = t_s
-            fps = [f"{p.getJointState(robot_id, gj)[0]:.3f}"
-                   for gj in gripper_joints]
-            wr_pos = _link_pos(robot_id, _WRIST_ROLL_LINK)
-            gb_pos = _link_pos(robot_id, _GRIPPER_BASE_LINK)
-            wr_str = (f"wrist=({wr_pos[0]:.3f},{wr_pos[1]:.3f},{wr_pos[2]:.3f})"
-                      if wr_pos else "wrist=N/A")
-            gb_str = (f"palm=({gb_pos[0]:.3f},{gb_pos[1]:.3f},{gb_pos[2]:.3f})"
-                      if gb_pos else "palm=N/A")
+            try:
+                fps = [f"{p.getJointState(robot_id, gj)[0]:.3f}"
+                       for gj in gripper_joints]
+                wr_pos = _link_pos(robot_id, _WRIST_ROLL_LINK)
+                gb_pos = _link_pos(robot_id, _GRIPPER_BASE_LINK)
+                wr_str = (f"wrist=({wr_pos[0]:.3f},{wr_pos[1]:.3f},{wr_pos[2]:.3f})"
+                          if wr_pos else "wrist=N/A")
+                gb_str = (f"palm=({gb_pos[0]:.3f},{gb_pos[1]:.3f},{gb_pos[2]:.3f})"
+                          if gb_pos else "palm=N/A")
+                print(f"[t={t_s:2d}s|sim={t_sim:.1f}s] {phase:13s} "
+                      f"ik_z={ik_z:.3f}  contact={'YES' if contact_detected else 'no '}  "
+                      f"fingers={fps}  {wr_str}  {gb_str}  "
+                      f"cyl=({tx:.3f},{ty:.3f},{tz:.3f})")
+            except Exception:
+                pass
 
-            print(f"[t={t_s:2d}s|sim={t_sim:.1f}s] {phase:13s} "
-                  f"ik_z={ik_z:.3f}  contact={'YES' if contact_detected else 'no '}  "
-                  f"fingers={fps}  {wr_str}  {gb_str}  "
-                  f"cyl=({tx:.3f},{ty:.3f},{tz:.3f})")
-
-        p.stepSimulation()
+        try:
+            p.stepSimulation()
+        except Exception:
+            break
         time.sleep(DT)
 
         if contact_detected and phase == 'close_gripper' and t_sim > 8.0:

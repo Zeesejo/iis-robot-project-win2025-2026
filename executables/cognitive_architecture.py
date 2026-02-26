@@ -88,19 +88,15 @@ def get_nav_camera_image(robot_id, lidar_link):
     Forward-looking nav camera derived from the LIDAR link world state.
     Uses p.getLinkState (permitted). Does NOT use the forbidden
     p.getBasePositionAndOrientation().
-    Returns (rgb, depth_2d, mask, cam_pos_world, forward_vec, view_matrix).
     """
     link_state = p.getLinkState(robot_id, lidar_link)
     pos = np.array(link_state[0])
     orn = link_state[1]
-
     rot     = p.getMatrixFromQuaternion(orn)
     forward = np.array([rot[0], rot[3], rot[6]])
     up      = np.array([rot[2], rot[5], rot[8]])
-
     cam_pos = pos + 0.05 * forward
     target  = cam_pos + forward
-
     view_matrix = p.computeViewMatrix(
         cam_pos.tolist(), target.tolist(), up.tolist())
     proj_matrix = p.computeProjectionMatrixFOV(60, 1.0, 0.1, 10.0)
@@ -125,6 +121,28 @@ def cam_point_to_world(cam_point, cam_pos_world, forward_vec):
             + cam_point[2] * fwd
             + cam_point[0] * right
             + cam_point[1] * cam_up).tolist()
+
+
+# ===================== PATH PLANNING HELPER =====================
+
+def _build_path(est_x, est_y, goal, obstacle_map_for_pf, kb):
+    """
+    Plan an A* path from current estimated position to goal.
+    Strips the start waypoint (robot is already there).
+    Returns list of (x, y) waypoints, index reset to 0.
+    """
+    obs_for_path = [
+        {'position': [ox, oy, 0], 'size': 0.4}
+        for ox, oy in obstacle_map_for_pf
+    ]
+    path = plan_path_prolog(
+        est_x, est_y, goal[0], goal[1], obs_for_path, kb)
+    # Drop the first waypoint — it is the robot's current position.
+    # Keeping it causes immediate arrival detection and confuses wp indexing.
+    if len(path) > 1:
+        path = path[1:]
+    print(f"[CogArch] Path planned: {len(path)} waypoints to {goal}")
+    return path
 
 
 # ===================== MAIN COGNITIVE LOOP =====================
@@ -207,22 +225,18 @@ def main():
     search_rotation   = init_theta
     current_waypoints = []
     waypoint_idx      = 0
+    nav_goal          = None      # the current navigation goal (x, y)
     grasp_target_pos  = None
     lift_z            = 0.9
     step_count        = 0
     path_planned      = False
 
-    # PF update: run full sensor update every 3 steps to save CPU
-    PF_UPDATE_EVERY  = 3
-    # Camera throttle: ~24 Hz
-    CAM_EVERY_N_STEPS = 10
-    # Progress log: every 5 seconds
-    LOG_EVERY_STEPS  = 240 * 5
-    # Search timeout: 2 s, then fall back to KB table
+    PF_UPDATE_EVERY      = 3
+    CAM_EVERY_N_STEPS    = 10
+    LOG_EVERY_STEPS      = 240 * 5
     SEARCH_TIMEOUT_STEPS = 480
     search_step_count    = 0
 
-    # Cached frames
     _nav_rgb     = None
     _nav_depth   = None
     _nav_cam_pos = None
@@ -238,8 +252,8 @@ def main():
     while p.isConnected():  # DO NOT TOUCH
 
         step_count += 1
-        cam_tick    = (step_count % CAM_EVERY_N_STEPS == 0)
-        pf_tick     = (step_count % PF_UPDATE_EVERY == 0)
+        cam_tick = (step_count % CAM_EVERY_N_STEPS == 0)
+        pf_tick  = (step_count % PF_UPDATE_EVERY   == 0)
 
         # ======= SENSE =======
         sensors = preprocess_all(robot_id, lidar_link, camera_link,
@@ -252,7 +266,6 @@ def main():
 
         dx, dy, dtheta = odometry.update(joints)
 
-        # M5: PF predict every step; full update every PF_UPDATE_EVERY steps
         pf.predict(dx, dy, dtheta)
         if pf_tick and lidar is not None:
             pf.update(lidar, obstacle_map_for_pf)
@@ -278,7 +291,7 @@ def main():
             except Exception as exc:
                 perc_logger.log(exc)
 
-        # Perception on cached nav frame
+        # Perception on cached nav frame (SEARCH / NAVIGATE only)
         if (_nav_depth is not None
                 and mission_event == 'tick'
                 and fsm.state in (State.SEARCH, State.NAVIGATE)):
@@ -296,6 +309,7 @@ def main():
                             w[2] = 0.685
                             kb.assert_target_estimate(*w)
                             grasp_target_pos = w
+                            nav_goal      = w[:2]
                             mission_event = 'target_found'
                             mission_data  = {'target_pos': w[:2]}
                             path_planned  = False
@@ -307,6 +321,7 @@ def main():
                         if tc is not None:
                             wt = cam_point_to_world(tc, _nav_cam_pos, _nav_forward)
                             kb.assert_table_position(wt[0], wt[1])
+                            nav_goal      = wt[:2]
                             mission_event = 'table_found'
                             mission_data  = {'table_pos': wt[:2]}
                             path_planned  = False
@@ -314,7 +329,7 @@ def main():
             except Exception as exc:
                 perc_logger.log(exc)
 
-        # Wrist camera: ALIGN/GRASP only
+        # Wrist camera: ALIGN / GRASP
         if (fsm.state in (State.ALIGN, State.GRASP)
                 and cam_tick
                 and _wrist_depth is not None
@@ -325,7 +340,9 @@ def main():
                 rot = p.getMatrixFromQuaternion(cam_orn)
                 fwd = [rot[0], rot[3], rot[6]]
                 up  = [rot[2], rot[5], rot[8]]
-                tgt = [cam_pos[0]+fwd[0], cam_pos[1]+fwd[1], cam_pos[2]+fwd[2]]
+                tgt = [cam_pos[0]+fwd[0],
+                       cam_pos[1]+fwd[1],
+                       cam_pos[2]+fwd[2]]
                 wrist_view = p.computeViewMatrix(cam_pos, tgt, up)
                 w_pts, w_cols = depth_to_pointcloud(
                     _wrist_depth, _wrist_rgb, proj_np, wrist_view)
@@ -342,33 +359,35 @@ def main():
             except Exception as exc:
                 perc_logger.log(exc)
 
-        # Search timeout -> KB table
+        # Search timeout -> fall back to KB table position
         if fsm.state == State.SEARCH and mission_event == 'tick':
             search_step_count += 1
             if search_step_count >= SEARCH_TIMEOUT_STEPS:
                 table_pos = kb.get_table_position()
                 if table_pos:
+                    nav_goal      = list(table_pos)
                     mission_event = 'table_found'
-                    mission_data  = {'table_pos': list(table_pos)}
+                    mission_data  = {'table_pos': nav_goal}
                     path_planned  = False
                     print(f"[CogArch] Search timeout — KB table: {table_pos}")
                     search_step_count = 0
         else:
             search_step_count = 0
 
-        # Waypoint arrival
+        # Waypoint arrival check
         if (fsm.state == State.NAVIGATE
                 and current_waypoints
                 and waypoint_idx < len(current_waypoints)
                 and mission_event == 'tick'):
             wx, wy = current_waypoints[waypoint_idx]
-            if np.hypot(est_x - wx, est_y - wy) < 0.25:
+            if np.hypot(est_x - wx, est_y - wy) < 0.30:
                 waypoint_idx += 1
                 if waypoint_idx >= len(current_waypoints):
                     mission_event = 'at_table'
                     print("[CogArch] Reached table area.")
                 else:
                     mission_event = 'waypoint_reached'
+                    print(f"[CogArch] Waypoint {waypoint_idx}/{len(current_waypoints)} reached.")
 
         # ALIGN check
         if fsm.state == State.ALIGN and mission_event == 'tick':
@@ -409,22 +428,20 @@ def main():
             nav_ctrl.rotate_to(search_rotation, est_theta)
 
         elif action == 'plan_path' and not path_planned:
-            goal = cmd.get('goal') or fsm.table_position
+            # nav_goal is set when the FSM fires table_found / target_found
+            goal = nav_goal or fsm.table_position
             if goal is not None:
-                obs_for_path = [
-                    {'position': [ox, oy, 0], 'size': 0.4}
-                    for ox, oy in obstacle_map_for_pf
-                ]
-                path = plan_path_prolog(
-                    est_x, est_y, goal[0], goal[1], obs_for_path, kb)
-                print(f"[CogArch] Path planned: {len(path)} waypoints to {goal}")
+                path = _build_path(
+                    est_x, est_y, goal,
+                    obstacle_map_for_pf, kb)
                 fsm.set_waypoints(path)
                 current_waypoints = path
                 waypoint_idx = 0
                 path_planned = True
                 if path:
-                    wx, wy = path[0]
-                    nav_ctrl.drive_to(wx, wy, est_x, est_y, est_theta)
+                    nav_ctrl.drive_to(
+                        path[0][0], path[0][1],
+                        est_x, est_y, est_theta)
 
         elif action in ('continue_nav', 'next_waypoint'):
             if current_waypoints and waypoint_idx < len(current_waypoints):
@@ -432,12 +449,24 @@ def main():
                 nav_ctrl.drive_to(wx, wy, est_x, est_y, est_theta)
 
         elif action == 'backup':
+            # Back up for 2 s, then re-plan from current position
             p.setJointMotorControl2(robot_id, left_joint,
                                      p.VELOCITY_CONTROL,
                                      targetVelocity=-2.0, force=10.0)
             p.setJointMotorControl2(robot_id, right_joint,
                                      p.VELOCITY_CONTROL,
                                      targetVelocity=-2.0, force=10.0)
+            # Re-plan immediately after backup so NAVIGATE has fresh waypoints
+            if nav_goal is not None:
+                path = _build_path(
+                    est_x, est_y, nav_goal,
+                    obstacle_map_for_pf, kb)
+                fsm.set_waypoints(path)
+                current_waypoints = path
+                waypoint_idx = 0
+                path_planned = True
+                print(f"[CogArch] Re-planned after collision: "
+                      f"{len(path)} waypoints")
 
         elif action == 'align_arm':
             if grasp_target_pos:
@@ -447,6 +476,7 @@ def main():
                     grasp_target_pos[2] + 0.15
                 ])
             else:
+                # Keep driving toward table while waiting for target sight
                 if current_waypoints and waypoint_idx < len(current_waypoints):
                     wx, wy = current_waypoints[waypoint_idx]
                     nav_ctrl.drive_to(wx, wy, est_x, est_y, est_theta)
@@ -458,19 +488,25 @@ def main():
         elif action == 'lift_object':
             if grasp_target_pos:
                 done = arm_ctrl.move_to_position([
-                    grasp_target_pos[0], grasp_target_pos[1], lift_z])
+                    grasp_target_pos[0],
+                    grasp_target_pos[1],
+                    lift_z
+                ])
                 if done:
                     mission_event = 'lift_success'
 
         elif action in ('stop', 'idle', 'hold'):
             p.setJointMotorControl2(robot_id, left_joint,
-                                     p.VELOCITY_CONTROL, targetVelocity=0, force=10.0)
+                                     p.VELOCITY_CONTROL,
+                                     targetVelocity=0, force=10.0)
             p.setJointMotorControl2(robot_id, right_joint,
-                                     p.VELOCITY_CONTROL, targetVelocity=0, force=10.0)
+                                     p.VELOCITY_CONTROL,
+                                     targetVelocity=0, force=10.0)
 
         if fsm.is_terminal():
             table_pos = kb.get_table_position() or [0, 0]
-            dist_rem  = np.hypot(est_x - table_pos[0], est_y - table_pos[1])
+            dist_rem  = np.hypot(est_x - table_pos[0],
+                                 est_y - table_pos[1])
             learner.end_trial(
                 success=(fsm.state == State.DONE),
                 distance_remaining=dist_rem,

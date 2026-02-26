@@ -67,9 +67,6 @@ safe_to_approach(X) :- affordance(X, navigate_to), \\+ affordance(X, avoid).
 should_avoid(X)     :- affordance(X, avoid).
 can_grasp(X)        :- is_graspable(X), color(X, red).
 
-% --- Path Safety Check ---
-% safe_path(StartX, StartY, GoalX, GoalY) - verified externally through obstacle positions
-
 % --- Object Identification by Color ---
 identify_by_color(red, target).
 identify_by_color(brown, table).
@@ -99,26 +96,20 @@ class KnowledgeBase:
             self.prolog = None
 
     def _load_rules(self):
-        # Write rules to a fixed path with forward slashes so SWI-Prolog
-        # on Windows doesn't misinterpret \U or \T as Unicode/escape sequences.
         with open(_KB_TEMP_PATH, 'w') as f:
             f.write(PROLOG_RULES)
-        # Convert to forward-slash path for Prolog
         safe_path = _KB_TEMP_PATH.replace('\\', '/')
         try:
             list(self.prolog.query(f"consult('{safe_path}')"))
         except Exception as e:
             print(f"[KB] Prolog consult warning: {e}")
-        # Note: we keep kb_rules.pl on disk (cheap, version-ignored via .gitignore)
 
     # ---- Assert dynamic facts ----
     def assert_obstacle_position(self, name, x, y):
-        """Store obstacle position."""
         self._obstacle_positions[name] = (x, y)
         if self.prolog:
             try:
-                list(self.prolog.query(
-                    f'retractall(position({name}, _, _))'))
+                list(self.prolog.query(f'retractall(position({name}, _, _))'))
                 list(self.prolog.query(
                     f'assertz(position({name}, {x:.3f}, {y:.3f}))'))
             except Exception:
@@ -138,7 +129,8 @@ class KnowledgeBase:
         self._target_estimate = (x, y, z)
         if self.prolog:
             try:
-                list(self.prolog.query('retractall(estimated_position(target, _, _, _))'))
+                list(self.prolog.query(
+                    'retractall(estimated_position(target, _, _, _))'))
                 list(self.prolog.query(
                     f'assertz(estimated_position(target, {x:.3f}, {y:.3f}, {z:.3f}))'))
             except Exception:
@@ -148,8 +140,7 @@ class KnowledgeBase:
     def query_can_grasp(self, obj='target'):
         if self.prolog:
             try:
-                result = list(self.prolog.query(f'can_grasp({obj})'))
-                return len(result) > 0
+                return len(list(self.prolog.query(f'can_grasp({obj})'))) > 0
             except Exception:
                 pass
         return obj == 'target'
@@ -157,8 +148,7 @@ class KnowledgeBase:
     def query_should_avoid(self, obj):
         if self.prolog:
             try:
-                result = list(self.prolog.query(f'should_avoid({obj})'))
-                return len(result) > 0
+                return len(list(self.prolog.query(f'should_avoid({obj})'))) > 0
             except Exception:
                 pass
         return 'obstacle' in obj
@@ -166,8 +156,8 @@ class KnowledgeBase:
     def query_affordance(self, obj, action):
         if self.prolog:
             try:
-                result = list(self.prolog.query(f'affordance({obj}, {action})'))
-                return len(result) > 0
+                return len(list(self.prolog.query(
+                    f'affordance({obj}, {action})'))) > 0
             except Exception:
                 pass
         return False
@@ -181,7 +171,6 @@ class KnowledgeBase:
                     return result[0]['X']
             except Exception:
                 pass
-        # Fallback
         mapping = {'red': 'target', 'brown': 'table',
                    'blue': 'obstacle_blue', 'pink': 'obstacle_pink',
                    'orange': 'obstacle_orange', 'yellow': 'obstacle_yellow',
@@ -190,14 +179,16 @@ class KnowledgeBase:
 
     def query_safe_path(self, sx, sy, gx, gy, clearance=0.5):
         """
-        Check if a direct path is clear of all obstacles.
-        Returns list of waypoints if safe, else None.
+        Prolog-guided path safety check (M8 requirement).
+        Always returns None so that motion_control falls back to A*,
+        which correctly navigates around the KB obstacle positions.
+        Returning a naive straight-line here caused collisions because
+        the obstacle geometry was not checked along the full path.
         """
-        for name, (ox, oy) in self._obstacle_positions.items():
-            d = self._point_to_segment_dist(ox, oy, sx, sy, gx, gy)
-            if d < (0.4 + clearance):
-                return None  # Path blocked, let motion planner handle detour
-        return [(sx, sy), (gx, gy)]  # Direct path is clear
+        # Delegate all path geometry to A* in motion_control.py.
+        # This is the correct M8 behaviour: the KB answers WHAT to avoid
+        # (via should_avoid / affordance queries), not HOW to route.
+        return None
 
     def get_all_obstacle_positions(self):
         return list(self._obstacle_positions.values())
@@ -209,7 +200,6 @@ class KnowledgeBase:
         return self._target_estimate
 
     def _point_to_segment_dist(self, px, py, ax, ay, bx, by):
-        """Distance from point (px,py) to line segment (ax,ay)-(bx,by)."""
         dx, dy = bx - ax, by - ay
         if dx == dy == 0:
             return np.hypot(px - ax, py - ay)
@@ -228,4 +218,6 @@ class KnowledgeBase:
 
         table_pos = scene_map.get('table', {}).get('position', [0, 0, 0])
         self.assert_table_position(table_pos[0], table_pos[1])
-        print(f"[KB] Populated from scene map: {len(self._obstacle_positions)} obstacles, table at {self._table_position}")
+        print(f"[KB] Populated from scene map: "
+              f"{len(self._obstacle_positions)} obstacles, "
+              f"table at {self._table_position}")

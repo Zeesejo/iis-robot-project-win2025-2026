@@ -1,1 +1,176 @@
+"""
+M4 - Perception Module
+Object detection by color/size from RGBD, RANSAC plane fitting,
+and PCA on point clouds for pose estimation.
+"""
 
+import numpy as np
+
+
+# ===================== DEPTH -> POINT CLOUD =====================
+
+def depth_to_pointcloud(depth, rgb, proj_matrix, view_matrix,
+                         img_w=320, img_h=240):
+    """
+    Convert a PyBullet depth buffer + RGB image to a 3D point cloud
+    with colour annotations.
+    Returns: points (N,3), colors (N,3)
+    """
+    depth = np.array(depth)
+    rgb_arr = np.array(rgb).reshape(img_h, img_w, 4)[:, :, :3] / 255.0
+
+    # Unproject pixel coordinates
+    fx = proj_matrix[0]  # simplified; full unproject below
+    fy = proj_matrix[5]
+    cx, cy = img_w / 2.0, img_h / 2.0
+
+    near, far = 0.1, 10.0
+    # Convert PyBullet's normalized depth to metric distance
+    z = far * near / (far - (far - near) * depth)
+
+    u_idx, v_idx = np.meshgrid(np.arange(img_w), np.arange(img_h))
+    x = (u_idx - cx) * z / (fx * img_w * 0.5)
+    y = (v_idx - cy) * z / (fy * img_h * 0.5)
+
+    points = np.stack([x.ravel(), y.ravel(), z.ravel()], axis=-1)
+    colors = rgb_arr.reshape(-1, 3)
+
+    # Remove points at max range (background)
+    valid = z.ravel() < (far * 0.99)
+    return points[valid], colors[valid]
+
+
+# ===================== COLOR-BASED DETECTION =====================
+
+def detect_by_color(points, colors, target_color, tol=0.25):
+    """
+    Filter point cloud by RGB color proximity.
+    target_color: [r, g, b] in [0,1]
+    Returns: filtered points (N,3)
+    """
+    target = np.array(target_color)
+    diff = np.linalg.norm(colors - target, axis=1)
+    mask = diff < tol
+    return points[mask]
+
+
+def detect_table(points, colors):
+    """Detect the brown table surface."""
+    return detect_by_color(points, colors, [0.5, 0.3, 0.1], tol=0.25)
+
+
+def detect_target(points, colors):
+    """Detect the red target cylinder."""
+    return detect_by_color(points, colors, [1.0, 0.0, 0.0], tol=0.3)
+
+
+def detect_obstacles(points, colors):
+    """Detect obstacle colors (blue, pink, orange, yellow, black)."""
+    obstacle_colors = [
+        [0.0, 0.0, 1.0],
+        [1.0, 0.4, 0.7],
+        [1.0, 0.5, 0.0],
+        [1.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0],
+    ]
+    detected = []
+    for col in obstacle_colors:
+        pts = detect_by_color(points, colors, col, tol=0.3)
+        if len(pts) > 10:
+            detected.append(pts)
+    return detected
+
+
+# ===================== RANSAC PLANE FITTING =====================
+
+def ransac_plane(points, n_iter=200, dist_thresh=0.02):
+    """
+    RANSAC-based plane fitting on a 3D point cloud.
+    Returns: (normal, d) of best plane, inlier mask.
+    """
+    if len(points) < 3:
+        return None, None
+
+    best_inliers = None
+    best_count = 0
+    best_normal = None
+    best_d = None
+
+    for _ in range(n_iter):
+        idx = np.random.choice(len(points), 3, replace=False)
+        p1, p2, p3 = points[idx]
+        v1 = p2 - p1
+        v2 = p3 - p1
+        normal = np.cross(v1, v2)
+        norm = np.linalg.norm(normal)
+        if norm < 1e-6:
+            continue
+        normal = normal / norm
+        d = -np.dot(normal, p1)
+        dists = np.abs(np.dot(points, normal) + d)
+        inliers = dists < dist_thresh
+        count = np.sum(inliers)
+        if count > best_count:
+            best_count = count
+            best_inliers = inliers
+            best_normal = normal
+            best_d = d
+
+    return (best_normal, best_d), best_inliers
+
+
+def fit_table_plane(points, colors):
+    """
+    Detect table surface plane using RANSAC.
+    Returns plane parameters and table center.
+    """
+    table_pts = detect_table(points, colors)
+    if len(table_pts) < 10:
+        return None, None
+    (normal, d), inliers = ransac_plane(table_pts)
+    if inliers is None:
+        return None, None
+    table_inlier_pts = table_pts[inliers]
+    center = table_inlier_pts.mean(axis=0)
+    return (normal, d), center
+
+
+# ===================== PCA FOR POSE ESTIMATION =====================
+
+def pca_pose(points):
+    """
+    Run PCA on a point cloud to estimate object pose.
+    Returns: center (3,), principal axes (3,3), extents (3,)
+    """
+    if len(points) < 3:
+        return None, None, None
+    center = points.mean(axis=0)
+    centered = points - center
+    cov = np.cov(centered.T)
+    eigenvalues, eigenvectors = np.linalg.eigh(cov)
+    # Sort by descending eigenvalue
+    order = np.argsort(eigenvalues)[::-1]
+    eigenvalues = eigenvalues[order]
+    eigenvectors = eigenvectors[:, order]
+    extents = 2.0 * np.sqrt(np.maximum(eigenvalues, 0))
+    return center, eigenvectors, extents  # eigenvectors: columns are principal axes
+
+
+def estimate_grasp_pose(target_points):
+    """
+    Use PCA on the target cylinder point cloud to get optimal grasp center + orientation.
+    Returns: grasp_position (3,), grasp_orientation_matrix (3,3)
+    """
+    center, axes, extents = pca_pose(target_points)
+    if center is None:
+        return None, None
+    # Primary axis of cylinder = column with largest extent
+    return center, axes
+
+
+def estimate_obstacle_pose(obstacle_points):
+    """
+    Use PCA on obstacle point cloud to find avoidance pose.
+    Returns: center, axes, extents
+    """
+    return pca_pose(obstacle_points)

@@ -49,7 +49,7 @@ from src.modules.knowledge_reasoning import get_knowledge_base
 # from src.modules.learning import Learner, DEFAULT_PARAMETERS as LEARNING_DEFAULTS
 LEARNING_DEFAULTS = {'nav_kp': 1.0, 'nav_ki': 0.0, 'nav_kd': 0.1, 'angle_kp': 1.0}
 
-# ── Robot physical constants ──────────────────────────────────────────────────
+# ── Robot physical constants ─────────────────────────────────────────────
 WHEEL_RADIUS    = 0.1
 WHEEL_BASELINE  = 0.45
 CAMERA_HEIGHT   = 0.55   # base(0.1) + torso(0.3) + cam_z(0.15)
@@ -57,7 +57,7 @@ CAMERA_FORWARD  = 0.25   # camera 0.25 m ahead of robot centre (kept for PCA pat
 DEPTH_NEAR      = 0.1
 DEPTH_FAR       = 10.0
 
-# ── Perception tuning ─────────────────────────────────────────────────────────
+# ── Perception tuning ────────────────────────────────────────────────────
 # Correct horizontal FOV for PyBullet's 4:3 camera (aspect = 320/240)
 _FOV_V   = 60.0
 _ASPECT  = 320.0 / 240.0
@@ -146,7 +146,7 @@ class CognitiveArchitecture:
         self._initialize_world_knowledge()
         self._initialize_motors()
 
-    # ──────────────────────────── initialisation ─────────────────────────────
+    # ─────────────────────────── initialisation ───────────────────────────
 
     def _initialize_motors(self):
         for i in self.wheel_joints:
@@ -215,7 +215,7 @@ class CognitiveArchitecture:
         elif 0.4 < r < 0.6 and 0.2 < g < 0.4:              return 'brown'
         return 'unknown'
 
-    # ──────────────────────────── helpers ────────────────────────────────────
+    # ─────────────────────────── helpers ────────────────────────────────────
 
     def _check_gripper_contact(self):
         contacts = p.getContactPoints(bodyA=self.robot_id, bodyB=self.target_id)
@@ -286,14 +286,12 @@ class CognitiveArchitecture:
                 s = mf/oth; fwd *= s; av = 3.0*(1-s)*(1 if al>ar else -1)
         return fwd, av
 
-    # ──────────────────────── camera → world projection ──────────────────────
+    # ────────────────────── camera → world projection ──────────────────────
 
     def _pixel_depth_to_world(self, px, py, depth_m, robot_pose):
         """
         Convert a single (pixel, depth_metres) observation to world-frame [x,y,z].
         FIX 2: body_x = cam_z only (removed erroneous + CAMERA_FORWARD offset).
-        The depth reading is the distance from the camera optical centre;
-        adding CAMERA_FORWARD was double-counting the camera mount offset.
         """
         cam_x = (px - CAM_CX) * depth_m / CAM_FX
         cam_y = (py - CAM_CY) * depth_m / CAM_FY
@@ -308,11 +306,9 @@ class CognitiveArchitecture:
 
     def _update_target_from_detection(self, new_pos, depth_m, bearing):
         """
-        Apply EMA filter to a new raw target detection and update
-        self.target_position / self.target_position_smoothed.
-        Returns True if the detection was accepted.
+        Apply EMA filter to a new raw target detection.
+        Returns True if accepted.
         """
-        # Jump filter – tight threshold, no count exemption
         if self.target_position_smoothed is not None:
             jump = np.hypot(new_pos[0] - self.target_position_smoothed[0],
                             new_pos[1] - self.target_position_smoothed[1])
@@ -323,7 +319,6 @@ class CognitiveArchitecture:
         self.target_camera_bearing  = bearing
         self.target_camera_depth    = depth_m
 
-        # Trust new readings more early on (cold start), less once stable
         alpha = 0.5 if self.target_detection_count <= 5 else 0.15
         if self.target_position_smoothed is None:
             self.target_position_smoothed = list(new_pos)
@@ -336,19 +331,12 @@ class CognitiveArchitecture:
         self.kb.add_position('target', *self.target_position)
         return True
 
-    # ══════════════════════════════ SENSE ════════════════════════════════════
+    # ════════════════════════════ SENSE ═══════════════════════════════
 
     def sense(self):
         """
         SENSE phase.
-        Runs the full M4 PerceptionModule every 10 steps:
-          • detect_objects_by_color  (HSV detection for all objects)
-          • edge_contour_segmentation (structural segmentation)
-          • depth_to_point_cloud     (3-D reconstruction from depth buffer)
-          • RANSAC_Segmentation      (table-plane extraction)
-          • compute_pca / refine_object_points (target pose estimation)
-        Target world position is derived from PCA centre when available,
-        with per-pixel depth projection as fallback.
+        Runs the full M4 PerceptionModule every 10 steps.
         """
         pre          = get_sensor_data(self.robot_id,
                                        self.sensor_camera_id,
@@ -374,14 +362,12 @@ class CognitiveArchitecture:
                                  float(estimated_pose[0]),
                                  float(estimated_pose[1]), 0.0)
 
-        # ── M4: Full PerceptionModule every 10 steps ──────────────────────
+        # ── M4: Full PerceptionModule every 10 steps ──────────────────
         if rgb is not None and depth is not None and self.step_counter % 10 == 0:
-            # process_frame runs: color detection, edge segmentation,
-            # depth→point-cloud, RANSAC plane, PCA object pose
             perc = self.perception.process_frame(rgb, depth, width=320, height=240)
             self.last_perception_result = perc
 
-            # ── A) RANSAC table plane ──────────────────────────────────────
+            # ── A) RANSAC table plane ────────────────────────────────
             if perc['table_plane'] is not None:
                 model   = perc['table_plane']['model']
                 inliers = perc['table_plane']['num_inliers']
@@ -402,13 +388,13 @@ class CognitiveArchitecture:
                           f"{[f'{v:.3f}' for v in pca['center']]}, "
                           f"dims={[f'{v:.3f}' for v in pca['dimensions']]}")
 
-            # ── C) Obstacle poses from PCA (blue/pink/orange/yellow/black) ─
+            # ── C) Obstacle poses from PCA ────────────────────────────────
             if perc['obstacle_poses'] and self.step_counter % 240 == 0:
                 for op in perc['obstacle_poses']:
                     print(f"[M4-PCA] Obstacle '{op['color']}' centre: "
                           f"{[f'{v:.3f}' for v in op['center']]}")
 
-            # ── D) Color detection → target position ──────────────────────
+            # ── D) Color detection log ────────────────────────────────────
             rgb_array  = np.reshape(rgb, (240, 320, 4)).astype(np.uint8)
             bgr        = cv2.cvtColor(rgb_array, cv2.COLOR_RGBA2BGR)
             detections = perc['detections']
@@ -426,7 +412,7 @@ class CognitiveArchitecture:
                 n_edg = int(np.sum(edge_map > 0))
                 print(f"[M4-Edge] seg_pixels={n_seg}, edge_pixels={n_edg}")
 
-            # ── F) Red target → world position ────────────────────────────
+            # ── F) Red target → world position ─────────────────────────────
             depth_arr = np.array(depth).reshape(240, 320)
             red_dets  = sorted(
                 [d for d in detections if d['color'] == TARGET_COLOR],
@@ -453,7 +439,7 @@ class CognitiveArchitecture:
                     continue
 
                 # FIX 3a: block cold-start EMA on far/uncertain readings
-                if self.target_position_smoothed is None and true_d > 2.5:
+                if self.target_position_smoothed is None and true_d > 3.0:
                     continue
 
                 bearing = math.atan2(-(cx_px - CAM_CX), CAM_FX)
@@ -461,10 +447,11 @@ class CognitiveArchitecture:
                                                      true_d, estimated_pose)
 
                 # FIX 3b: reject detections geometrically far from known table
+                # Threshold 3.5m: accounts for pose drift + projection error
                 if self.table_position is not None:
                     dist_to_table = np.hypot(wp[0] - self.table_position[0],
                                              wp[1] - self.table_position[1])
-                    if dist_to_table > 1.5:
+                    if dist_to_table > 3.5:
                         if self.step_counter % 60 == 0:
                             print(f"[M4] Rejected detection at "
                                   f"({wp[0]:.2f},{wp[1]:.2f}) – "
@@ -474,7 +461,7 @@ class CognitiveArchitecture:
                 # ── G) Prefer PCA-refined 3-D centre when available ────────
                 if self.pca_target_pose is not None:
                     pca_c      = self.pca_target_pose['center']
-                    pca_body_x = pca_c[2] + CAMERA_FORWARD
+                    pca_body_x = pca_c[2]           # FIX: removed + CAMERA_FORWARD
                     pca_body_y = -pca_c[0]
                     rx, ry, rt = estimated_pose
                     pca_wx     = rx + pca_body_x*math.cos(rt) - pca_body_y*math.sin(rt)
@@ -513,7 +500,7 @@ class CognitiveArchitecture:
             'perception':            self.last_perception_result,
         }
 
-    # ══════════════════════════════ THINK ════════════════════════════════════
+    # ════════════════════════════ THINK ═══════════════════════════════
 
     def think(self, sensor_data):
         """THINK phase: FSM update + action planning."""
@@ -574,7 +561,7 @@ class CognitiveArchitecture:
 
         ctrl = {'mode': 'idle', 'target': None, 'gripper': 'open'}
 
-        # ── SEARCH ────────────────────────────────────────────────────────
+        # ── SEARCH ────────────────────────────────────────────────────────────────
         if self.fsm.state == RobotState.SEARCH:
             if self.table_position:
                 td = np.hypot(self.table_position[0]-pose[0],
@@ -592,7 +579,7 @@ class CognitiveArchitecture:
             else:
                 ctrl = {'mode': 'search_rotate', 'angular_vel': 3.0}
 
-        # ── NAVIGATE ──────────────────────────────────────────────────────
+        # ── NAVIGATE ────────────────────────────────────────────────────────────
         elif self.fsm.state == RobotState.NAVIGATE:
             cam_d       = sensor_data.get('target_camera_depth', float('inf'))
             use_relaxed = cam_d < 2.5 and sensor_data['target_detected']
@@ -611,7 +598,7 @@ class CognitiveArchitecture:
                     self.action_planner.advance_waypoint()
                     self.current_waypoint = self.action_planner.get_next_waypoint()
 
-        # ── APPROACH ──────────────────────────────────────────────────────
+        # ── APPROACH ────────────────────────────────────────────────────────────
         elif self.fsm.state == RobotState.APPROACH:
             if not getattr(self, '_in_approach', False):
                 self._approach_depth_smooth = float('inf')
@@ -624,7 +611,7 @@ class CognitiveArchitecture:
                         'camera_bearing': sensor_data.get('target_camera_bearing', 0.0),
                         'camera_depth':   sensor_data.get('target_camera_depth', float('inf'))}
 
-        # ── GRASP ─────────────────────────────────────────────────────────
+        # ── GRASP ──────────────────────────────────────────────────────────────
         elif self.fsm.state == RobotState.GRASP:
             if target_pos:
                 gp    = self.grasp_planner.plan_grasp(target_pos)
@@ -638,15 +625,15 @@ class CognitiveArchitecture:
                         'orientation':  gp['orientation'],
                         'phase':        phase}
 
-        # ── LIFT ──────────────────────────────────────────────────────────
+        # ── LIFT ────────────────────────────────────────────────────────────────
         elif self.fsm.state == RobotState.LIFT:
             ctrl = {'mode': 'lift', 'lift_height': 0.2, 'gripper': 'close'}
 
-        # ── SUCCESS ───────────────────────────────────────────────────────
+        # ── SUCCESS ─────────────────────────────────────────────────────────────
         elif self.fsm.state == RobotState.SUCCESS:
             ctrl = {'mode': 'success', 'gripper': 'close'}
 
-        # ── FAILURE ───────────────────────────────────────────────────────
+        # ── FAILURE ─────────────────────────────────────────────────────────────
         elif self.fsm.state == RobotState.FAILURE:
             if not self._failure_reset_done:
                 self.approach_standoff        = None
@@ -661,7 +648,7 @@ class CognitiveArchitecture:
 
         return ctrl
 
-    # ══════════════════════════════ ACT ══════════════════════════════════════
+    # ════════════════════════════ ACT ═════════════════════════════════
 
     def _stow_arm(self):
         for j in self.arm_joints:
@@ -681,14 +668,12 @@ class CognitiveArchitecture:
         if mode not in ('grasp', 'lift', 'success'):
             self._stow_arm()
 
-        # ── search: rotate in place ────────────────────────────────────────
         if mode == 'search_rotate':
             av = ctrl.get('angular_vel', 3.0)
             if self.step_counter % 240 == 0:
                 print(f"[Act] SEARCH rotate {av:.1f} rad/s")
             self._set_wheels(-av, av)
 
-        # ── search: drive toward table ─────────────────────────────────────
         elif mode == 'search_approach':
             tgt, pose, lidar = ctrl['target'], ctrl['pose'], ctrl.get('lidar')
             dx, dy   = tgt[0]-pose[0], tgt[1]-pose[1]
@@ -704,7 +689,6 @@ class CognitiveArchitecture:
                       f"heading={np.degrees(he):.0f} deg")
             self._set_wheels(fv-av, fv+av)
 
-        # ── search: orbit table ────────────────────────────────────────────
         elif mode == 'search_orbit':
             tp, pose = ctrl['table_pos'], ctrl['pose']
             r_orb    = ctrl.get('orbit_radius', 2.0)
@@ -724,7 +708,6 @@ class CognitiveArchitecture:
                 print(f"[Act] ORBIT r={cur_r:.2f}m (target {r_orb:.1f}m)")
             self._set_wheels(fv-av, fv+av)
 
-        # ── navigate / approach (waypoint) ────────────────────────────────
         elif mode in ('navigate', 'approach'):
             tgt, pose = ctrl['target'], ctrl['pose']
             lidar     = ctrl.get('lidar')
@@ -744,7 +727,6 @@ class CognitiveArchitecture:
                       f"fwd={fv:.1f}, turn={av:.1f}")
             self._set_wheels(fv-av, fv+av)
 
-        # ── visual servoing approach ───────────────────────────────────────
         elif mode == 'approach_visual':
             bearing   = ctrl.get('camera_bearing', 0.0)
             cam_depth = ctrl.get('camera_depth', float('inf'))
@@ -776,7 +758,6 @@ class CognitiveArchitecture:
                       f"fwd={fv:.1f}, turn={av:.1f}")
             self._set_wheels(fv-av, fv+av)
 
-        # ── grasp sequence ────────────────────────────────────────────────
         elif mode == 'grasp':
             self._set_wheels(0, 0)
             phase = ctrl.get('phase', 'close_gripper')
@@ -796,7 +777,6 @@ class CognitiveArchitecture:
                          arm_joints=self.arm_joints or None,
                          close_gripper=close)
 
-        # ── lift ──────────────────────────────────────────────────────────
         elif mode == 'lift':
             self._set_wheels(0, 0)
             for fi in self.gripper_joints:
@@ -812,7 +792,6 @@ class CognitiveArchitecture:
             if self.step_counter % 120 == 0:
                 print("[Act] LIFT: raising object")
 
-        # ── idle / success / failure ───────────────────────────────────────
         elif mode in ('idle', 'success', 'failure'):
             if mode == 'failure':
                 if self.step_counter % 240 == 0:
@@ -839,7 +818,7 @@ class CognitiveArchitecture:
                                             targetVelocity=0, force=1500)
 
 
-# ══════════════════════════════════ MAIN ═════════════════════════════════════
+# ═════════════════════════════════ MAIN ══════════════════════════════════
 
 def main():
     print("="*60)
@@ -872,7 +851,7 @@ def main():
           f"angle_kp={LEARNING_DEFAULTS['angle_kp']:.2f}")
     print("[Init] Mission: navigate to table, grasp red cylinder\n")
 
-    # ── SENSE-THINK-ACT loop ────────────────────────────────────────────────
+    # ── SENSE-THINK-ACT loop ──────────────────────────────────────────────
     while p.isConnected():                      # DO NOT TOUCH
         try:
             sensor_data      = cog.sense()

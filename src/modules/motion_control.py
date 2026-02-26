@@ -1,25 +1,30 @@
 """
 Module 6: Motion Control & Planning
-Provides PID controllers, navigation, manipulation, and path planning
 
 FIX HISTORY:
-  [F26] grasp_object: world-frame target, body-frame XY clamp, force 50N
-  [F27] stow phase: drive all arm joints to 0 before IK
-  [F31] remove double-Z offset bug; Z passed as pure world frame
-  [F32] CRITICAL audit fixes:
-        - IK end-effector link = 16 (gripper_base_joint, FIXED joint whose
-          child is gripper_base). Using arm_joints[-1]=15 (wrist_roll_joint)
-          placed IK target at the wrist, 5-8 cm short of the fingers.
-        - Grasp orientation = [0,0,0] (identity). The URDF finger joints are
-          prismatic along Y with origin xyz="0.04 ±0.04 0", meaning fingers
-          close laterally (Y-axis) and the gripper opening faces +X (forward).
-          [0,pi/2,0] rotated the gripper to point down, which is wrong.
-          With [0,0,0] the gripper faces forward and wraps around the cylinder.
-        - IK joint mapping: calculateInverseKinematics returns one angle per
-          non-fixed DOF in the entire chain (lift + arm). We now slice the
-          solution by counting non-fixed joints UP TO gripper_base_joint(16),
-          then pick only the slots corresponding to arm_joints [8,9,11,12,15].
-        - Stow returns immediately after zeroing joints - no IK called.
+  [F26] world-frame target, body-frame XY clamp, force 50N
+  [F27] stow phase drives all arm joints to 0, no IK
+  [F31] Z passed as pure world frame, no double offset
+  [F32] IK end-effector = joint 16 (gripper_base_joint) -- WRONG, reverted
+  [F33] CRITICAL geometry fix:
+        - IK end-effector = link 15 (wrist_roll_joint child = wrist_roll_link).
+          This is the LAST MOVABLE joint. PyBullet calculateInverseKinematics
+          requires a movable (non-fixed) link index. Using a fixed-joint link
+          (16 = gripper_base_joint) silently fails and produces garbage.
+        - IK Z target = world_Z + PALM_Z_OFFSET (0.075 m) to compensate for
+          the palm chain beyond the wrist:
+            gripper_base_joint origin z=0.05
+            finger midpoint z~=0.025
+            total = 0.075 m
+          So IK drives wrist to (world_Z + 0.075), placing palm at world_Z.
+        - Lift MUST be 0.0 during grasp. At lift=0 the arm_base is at 0.670m
+          world Z, only 2.5 cm below cylinder Z (0.695). The arm goes nearly
+          horizontal (angle=-1.7 deg), horizontal reach = 0.82m > MAX_REACH=0.55
+          so the XY clamp kicks in correctly.
+          At lift=0.3 (previous bug) arm_base=0.970, arm must angle 27.5cm
+          downward, consuming all horizontal reach -> IK fails -> arm snaps up.
+        - DO NOT call setJointMotorControl2 on lift_joint inside this function.
+          Caller is responsible for setting lift to 0.0 before grasp.
 """
 
 import pybullet as p
@@ -31,10 +36,17 @@ import math
 # Maximum horizontal reach of arm from robot centre (m)
 MAX_REACH = 0.55
 
-# IK end-effector: gripper_base_joint (index 16, FIXED) -
-# PyBullet uses the child link of this joint as the IK target frame.
-# This places the IK target at the gripper palm, not the wrist.
-_GRIPPER_BASE_JOINT_IDX = 16
+# [F33] IK end-effector = link 15 = wrist_roll_link (child of wrist_roll_joint).
+# This is the last MOVABLE joint in the arm chain.
+# PyBullet IK silently breaks when given a fixed-joint link index.
+_IK_EE_LINK = 15
+
+# [F33] Z offset from wrist_roll_link origin to palm centre:
+#   gripper_base_joint origin z=0.050
+#   left/right finger origin z=0.000, x=0.04 (fingers extend in X)
+#   palm centre approx midpoint = 0.025 beyond gripper_base
+#   total = 0.050 + 0.025 = 0.075 m
+_PALM_Z_OFFSET = 0.075
 
 
 class PIDController:
@@ -121,25 +133,29 @@ def grasp_object(robot_id, target_pos, target_orient,
     """
     Move the robot arm to grasp an object.
 
-    target_pos : [x, y, z] in WORLD frame.
-        XY  - converted to body frame, clamped to MAX_REACH, back to world.
-        Z   - passed AS-IS (world frame, e.g. cylinder centre ~0.695 m).
+    target_pos : [x, y, z] WORLD frame.
+        XY : converted to body frame, clamped to MAX_REACH, back to world.
+        Z  : world Z of the PALM (e.g. cylinder centre 0.695 m).
+             Internally offset by +PALM_Z_OFFSET so IK drives the WRIST
+             to the correct position (palm ends up at target Z).
 
-    target_orient : quaternion.  Use [0,0,0,1] (identity / [0,0,0] euler).
-        The URDF gripper opens along +X (finger prismatic joints in Y with
-        origin offset in X).  Identity orientation keeps gripper facing
-        forward, which is correct for a horizontal approach grasp.
+    target_orient : quaternion [0,0,0,1] for identity.
+        Gripper faces +X (forward). Fingers close in Y.
 
     phase:
-        'stow'          - zero all arm joints, return immediately (no IK)
-        'reach_above'   - IK to target_pos (caller sets Z = cyl_z + 0.15)
-        'reach_target'  - IK to target_pos (caller sets Z = cyl_z)
+        'stow'          - zero all arm joints, no IK, return immediately
+        'reach_above'   - IK to (tx, ty, palm_z+0.15)
+        'reach_target'  - IK to (tx, ty, palm_z)
         'close_gripper' - IK hold + close fingers
+
+    IMPORTANT: Caller must ensure lift_joint = 0.0 before/during grasp.
+    At lift=0: arm_base_z=0.670, nearly level with cylinder (0.695).
+    At lift=0.3: arm_base_z=0.970, IK cannot reach down to 0.695 -> FAIL.
     """
     num_joints_total = p.getNumJoints(robot_id)
 
     # ------------------------------------------------------------------ #
-    # 1. Discover joints
+    # 1. Discover arm + finger joints
     # ------------------------------------------------------------------ #
     if arm_joints is None:
         arm_joints = []
@@ -159,12 +175,8 @@ def grasp_object(robot_id, target_pos, target_orient,
         if 'left_finger_joint' in jname or 'right_finger_joint' in jname:
             finger_joints.append(i)
 
-    # [F32] IK end-effector = gripper_base_joint (idx 16, FIXED).
-    # PyBullet IK targets the child link of the given joint index.
-    gripper_link_idx = _GRIPPER_BASE_JOINT_IDX
-
     # ------------------------------------------------------------------ #
-    # [F27] Stow: zero all arm joints, NO IK
+    # [F27] Stow: zero all arm joints, no IK
     # ------------------------------------------------------------------ #
     if phase == 'stow':
         for j in arm_joints:
@@ -180,17 +192,20 @@ def grasp_object(robot_id, target_pos, target_orient,
     base_yaw = p.getEulerFromQuaternion(base_orn)[2]
 
     # ------------------------------------------------------------------ #
-    # 3. XY clamp to reachable range; Z straight through (world frame)
+    # 3. XY body-frame clamp; Z = palm target + PALM_Z_OFFSET for wrist IK
     # ------------------------------------------------------------------ #
-    dx_w  = target_pos[0] - base_pos[0]
-    dy_w  = target_pos[1] - base_pos[1]
-    world_z = float(np.clip(target_pos[2], 0.50, 1.20))
+    dx_w = target_pos[0] - base_pos[0]
+    dy_w = target_pos[1] - base_pos[1]
 
-    # rotate to body frame
+    # [F33] IK Z: drive WRIST to (palm_world_Z + offset) so palm lands at palm_world_Z
+    palm_z  = float(np.clip(target_pos[2], 0.50, 1.20))
+    ik_wz   = palm_z + _PALM_Z_OFFSET
+
+    # rotate XY to body frame
     cy =  math.cos(-base_yaw)
     sy =  math.sin(-base_yaw)
-    bx = dx_w * cy - dy_w * sy   # forward
-    by = dx_w * sy + dy_w * cy   # lateral
+    bx = dx_w * cy - dy_w * sy
+    by = dx_w * sy + dy_w * cy
 
     horiz = math.hypot(bx, by)
     if horiz > MAX_REACH:
@@ -203,25 +218,22 @@ def grasp_object(robot_id, target_pos, target_orient,
     sy2  = math.sin(base_yaw)
     ik_x = base_pos[0] + bx * cy2 - by * sy2
     ik_y = base_pos[1] + bx * sy2 + by * cy2
-    ik_z = world_z
 
     # ------------------------------------------------------------------ #
     # 4. IK
-    # [F32] Joint limits cover the 5 revolute arm DOFs only.
-    #       The IK solution vector covers ALL non-fixed joints up to
-    #       gripper_link_idx. We build a mapping: for each joint in
-    #       arm_joints, find its position in the non-fixed list that
-    #       IK returns.
+    # [F33] End-effector = _IK_EE_LINK = 15 (wrist_roll_link, MOVABLE).
+    # Using a FIXED link index with calculateInverseKinematics causes
+    # PyBullet to produce garbage solutions silently.
     # ------------------------------------------------------------------ #
     lower_limits = [-3.14, -1.00, -0.50, -1.57, -3.14]
     upper_limits = [ 3.14,  1.57,  2.00,  1.57,  3.14]
-    rest_poses   = [ 0.00,  0.50,  1.00,  0.00,  0.00]
+    rest_poses   = [ 0.00,  0.30,  0.80,  0.00,  0.00]
     joint_ranges = [u - l for u, l in zip(upper_limits, lower_limits)]
 
     ik_solution = p.calculateInverseKinematics(
         robot_id,
-        gripper_link_idx,
-        [ik_x, ik_y, ik_z],
+        _IK_EE_LINK,
+        [ik_x, ik_y, ik_wz],
         targetOrientation=target_orient,
         lowerLimits=lower_limits,
         upperLimits=upper_limits,
@@ -232,23 +244,22 @@ def grasp_object(robot_id, target_pos, target_orient,
     )
 
     if not ik_solution:
+        print("[Motion Control] IK returned empty solution")
         return False
 
     # ------------------------------------------------------------------ #
-    # 5. Map IK solution slots -> arm joints
-    # [F32] calculateInverseKinematics returns one value per non-fixed
-    #       joint in the ENTIRE chain up to gripper_link_idx.
-    #       Build the non-fixed list up to (not including) gripper_base_joint
-    #       to get the correct slot index for each arm joint.
+    # 5. Map IK solution -> arm joints
+    # IK returns one value per non-fixed joint in the chain up to
+    # _IK_EE_LINK (inclusive). Build the non-fixed list up to that link.
     # ------------------------------------------------------------------ #
-    non_fixed_upto_gripper = [
-        j for j in range(gripper_link_idx)
+    non_fixed_upto_ee = [
+        j for j in range(_IK_EE_LINK + 1)
         if p.getJointInfo(robot_id, j)[2] != p.JOINT_FIXED
     ]
 
     for joint_idx in arm_joints:
-        if joint_idx in non_fixed_upto_gripper:
-            slot = non_fixed_upto_gripper.index(joint_idx)
+        if joint_idx in non_fixed_upto_ee:
+            slot = non_fixed_upto_ee.index(joint_idx)
             if slot < len(ik_solution):
                 info   = p.getJointInfo(robot_id, joint_idx)
                 lo, hi = info[8], info[9]
@@ -277,7 +288,7 @@ def grasp_object(robot_id, target_pos, target_orient,
 
 
 # --------------------------
-# Standalone Test Mode
+# Standalone Test
 # --------------------------
 if __name__ == "__main__":
     print("[Motion Control] Running in test mode...")

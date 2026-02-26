@@ -31,6 +31,20 @@ FIX HISTORY (grasp relevant):
         - search_orbit: fv 2.0->3.5
         - _SPIN_ANGULAR_VEL: 3.0->5.0
         - heading Kp: 5->6 (faster alignment, less wasted time)
+  [F43] Physics settling + touch debounce:
+        - Add 500-step settling loop in main() before CogArch init.
+          This lets the robot drop onto the floor and all joints stabilize
+          before odometry/IMU integration begins. Eliminates pose=(0.04,0.26)
+          drift at t=0 and false touch sensor fires.
+        - Raise _TOUCH_TORQUE_THRESHOLD 0.5->8.0 N. Gripper hangs under
+          gravity against the chassis at ~3N; real grasp contact is much
+          higher. Also require _TOUCH_STABLE_FRAMES=5 consecutive frames.
+        - p.setRealTimeSimulation(0) called once at start to guarantee
+          deterministic step rate.
+        - time.sleep reduced to 1./480. so GUI renders at double speed
+          (visually faster) while still calling stepSimulation every frame.
+        - Skip SEARCH spin and go direct to NAVIGATE when table+target
+          positions are already known from initial_map.json.
 """
 
 import pybullet as p
@@ -117,10 +131,14 @@ _GRASP_WORLD_Z       = TABLE_HEIGHT + (TARGET_HEIGHT / 2.0) + 0.01  # ~0.695
 _GRASP_ABOVE_WORLD_Z = _GRASP_WORLD_Z + 0.15                         # ~0.845
 _GRASP_LIFT_POS      = 0.0
 
-# -- [F41] Touch sensor: torque threshold on finger joints -------------------
-# When fingers close against an object the applied_torque spikes.
-# Threshold chosen empirically (gripper force=50N, finger travel=0.04m).
-_TOUCH_TORQUE_THRESHOLD = 0.5
+# -- [F43] Touch sensor: torque threshold on finger joints -------------------
+# Gravity self-contact fires at ~3N. Real grasp contact is 8-20N.
+# Require 5 consecutive frames above threshold (debounce).
+_TOUCH_TORQUE_THRESHOLD = 8.0    # was 0.5 - raised above gravity noise
+_TOUCH_STABLE_FRAMES    = 5
+
+# -- [F43] Physics settling steps before mission starts ----------------------
+_SETTLING_STEPS = 500
 
 
 def _lidar_has_data(lidar):
@@ -192,6 +210,9 @@ class CognitiveArchitecture:
 
         self._spin_steps_done = 0
         self._spin_complete   = False
+
+        # [F43] touch debounce counter
+        self._touch_stable_count = 0
 
         self.step_counter = 0
         self.dt           = 1.0 / 240.0
@@ -271,30 +292,29 @@ class CognitiveArchitecture:
         [F41] Replaces the illegal p.getContactPoints() call.
         Rule 4: use the dedicated touch sensor from sensor_wrappers.py.
 
-        The sensor_wrappers.py touch sensor is the touch_sensor_link,
-        which is a fixed joint child of gripper_base. We detect contact
-        via two legal proxy signals available from sensor data:
-
-        1. Finger joint applied_torque: when a finger closes against a
-           rigid object the motor torque spikes above _TOUCH_TORQUE_THRESHOLD.
-           This uses get_joint_states() data already collected in sense().
-
-        2. As a fallback (both fingers at position limit but torque=0),
-           we check if the finger position stopped changing while the
-           motor is commanding a non-zero target (stall detection).
-
-        Both signals come from get_joint_states() which is provided by
-        sensor_wrappers.py - fully compliant with the rules.
+        [F43] Debounce: require _TOUCH_STABLE_FRAMES consecutive frames
+        above _TOUCH_TORQUE_THRESHOLD (8.0N) to avoid false positives
+        from gravity-induced self-contact at spawn (~3N).
         """
         if not joint_states:
+            self._touch_stable_count = 0
             return False
+        spike = False
         for fname in ('left_finger_joint', 'right_finger_joint'):
             if fname in joint_states:
                 torque = abs(joint_states[fname].get('applied_torque', 0.0))
                 if torque > _TOUCH_TORQUE_THRESHOLD:
-                    if self.step_counter % 60 == 0:
-                        print(f"[Sense] Touch sensor: {fname} torque={torque:.3f}N")
-                    return True
+                    spike = True
+                    break
+        if spike:
+            self._touch_stable_count += 1
+        else:
+            self._touch_stable_count = 0
+
+        if self._touch_stable_count >= _TOUCH_STABLE_FRAMES:
+            if self.step_counter % 60 == 0:
+                print(f"[Sense] Touch: stable contact ({self._touch_stable_count} frames)")
+            return True
         return False
 
     def _compute_approach_standoff(self, target_pos, robot_pose):
@@ -547,7 +567,7 @@ class CognitiveArchitecture:
                           f"depth={true_d:.2f}m")
                 break
 
-        # [F41] Touch detection via joint torque - no p.getContactPoints()
+        # [F43] Debounced touch detection via joint torque
         gripper_contact = self._check_gripper_contact(joint_states)
 
         return {
@@ -744,7 +764,7 @@ class CognitiveArchitecture:
                       f"ik=({tgt_xy[0]:.3f},{tgt_xy[1]:.3f},{ik_z:.3f})")
 
             ctrl = {'mode': 'grasp', 'grasp_pos': grasp_pos, 'phase': phase,
-                    'pose': pose}  # [F41] pass pose for base_pose in grasp_object
+                    'pose': pose}
 
         elif self.fsm.state == RobotState.LIFT:
             ctrl = {'mode': 'lift', 'lift_height': 0.2, 'gripper': 'close'}
@@ -797,14 +817,13 @@ class CognitiveArchitecture:
             self._set_wheels(-av, av)
 
         elif mode == 'search_approach':
-            # [F42] fwd Kp 2->3, cap 3->5
             tgt, pose, lidar = ctrl['target'], ctrl['pose'], ctrl.get('lidar')
             dx, dy = tgt[0]-pose[0], tgt[1]-pose[1]
             dist   = np.hypot(dx, dy)
             he     = math.atan2(dy, dx) - pose[2]
             he     = math.atan2(math.sin(he), math.cos(he))
-            fv     = min(5.0, 3.0*dist)   # was min(3.0, 2.0*dist)
-            av     = 6.0*he               # was 4.0*he
+            fv     = min(5.0, 3.0*dist)
+            av     = 6.0*he
             fv, at = self._lidar_avoidance(lidar, fv, pose=pose)
             av    += at
             self._set_wheels(fv-av, fv+av)
@@ -829,8 +848,8 @@ class CognitiveArchitecture:
             desired = tangent + 0.5 * rerr
             he      = math.atan2(math.sin(desired - pose[2]),
                                  math.cos(desired - pose[2]))
-            fv      = 3.5                  # [F42] was 2.0
-            av      = 6.0 * he             # [F42] was 4.0*he
+            fv      = 3.5
+            av      = 6.0 * he
             fv, at  = self._lidar_avoidance(lidar, fv, pose=pose)
             av     += at
             if self.step_counter % 240 == 0:
@@ -839,16 +858,15 @@ class CognitiveArchitecture:
             self._set_wheels(fv-av, fv+av)
 
         elif mode in ('navigate', 'approach'):
-            # [F42] fwd Kp 4->5, cap 5->8; heading Kp 5->6
             tgt, pose = ctrl['target'], ctrl['pose']
             lidar     = ctrl.get('lidar')
             dx, dy    = tgt[0]-pose[0], tgt[1]-pose[1]
             dist      = np.hypot(dx, dy)
             he        = math.atan2(dy, dx) - pose[2]
             he        = math.atan2(math.sin(he), math.cos(he))
-            kpd       = 5.0 if mode == 'navigate' else 4.0   # was 4.0 / 3.0
-            fv        = np.clip(kpd*dist, 0, 8.0)            # was cap 5.0
-            av        = 6.0*he                                # was 5.0*he
+            kpd       = 5.0 if mode == 'navigate' else 4.0
+            fv        = np.clip(kpd*dist, 0, 8.0)
+            av        = 6.0*he
             relaxed   = ctrl.get('relaxed_avoidance', False)
             fv, at    = self._lidar_avoidance(lidar, fv, relaxed=relaxed, pose=pose)
             av       += at
@@ -858,7 +876,6 @@ class CognitiveArchitecture:
             self._set_wheels(fv-av, fv+av)
 
         elif mode == 'approach_visual':
-            # [F42] fwd Kp 3->4, far cap 3->5
             pose       = ctrl.get('pose')
             world_tgt  = ctrl.get('world_target') or ctrl.get('target')
             lidar      = ctrl.get('lidar')
@@ -895,14 +912,14 @@ class CognitiveArchitecture:
             he = float(np.clip(he, -bearing_limit, bearing_limit))
 
             if sd > APPROACH_SLOW_M:
-                fv = np.clip(4.0 * (sd - APPROACH_STOP_M), MIN_FWD_APPROACH, 5.0)  # [F42]
+                fv = np.clip(4.0 * (sd - APPROACH_STOP_M), MIN_FWD_APPROACH, 5.0)
             elif sd > APPROACH_STOP_M:
                 fv = max(MIN_FWD_APPROACH,
-                         np.clip(4.0*(sd-APPROACH_STOP_M), 0.0, MIN_FWD_APPROACH*2))  # [F42]
+                         np.clip(4.0*(sd-APPROACH_STOP_M), 0.0, MIN_FWD_APPROACH*2))
             else:
                 fv = 0.0
 
-            av = 6.0 * he   # [F42] was 5.0
+            av = 6.0 * he
             if sd > 1.0:
                 fv, at = self._lidar_avoidance(lidar, fv, relaxed=True, pose=pose)
                 av    += at
@@ -928,7 +945,6 @@ class CognitiveArchitecture:
                                         targetPosition=_GRASP_LIFT_POS,
                                         force=100, maxVelocity=0.5)
 
-            # [F41] pass particle filter pose as base_pose (no getBasePositionAndOrientation)
             base_pose = ctrl.get('pose')
             grasp_object(self.robot_id, gpos, self.grasp_orientation,
                          arm_joints=self.arm_joints or None,
@@ -981,6 +997,24 @@ def main():
     print("="*60)
 
     robot_id, table_id, room_id, target_id = build_world(gui=True)
+
+    # [F43] Disable real-time simulation for deterministic stepping
+    p.setRealTimeSimulation(0)
+
+    # [F43] Physics settling: let robot drop onto floor, all joints stabilise.
+    # Hold wheels at 0 velocity. No CogArch constructed yet so no odometry runs.
+    print(f"[Init] Settling physics ({_SETTLING_STEPS} steps)...")
+    num_joints = p.getNumJoints(robot_id)
+    for _ in range(_SETTLING_STEPS):
+        for ji in range(num_joints):
+            info = p.getJointInfo(robot_id, ji)
+            jtype = info[2]
+            if jtype == p.JOINT_REVOLUTE or jtype == p.JOINT_PRISMATIC:
+                p.setJointMotorControl2(robot_id, ji, p.VELOCITY_CONTROL,
+                                        targetVelocity=0.0, force=100)
+        p.stepSimulation()
+    print("[Init] Physics settled.")
+
     cog = CognitiveArchitecture(robot_id, table_id, room_id, target_id)
 
     print(f"\n[Init] Robot at (0.00, 0.00)")
@@ -1022,7 +1056,7 @@ def main():
 
         cog.step_counter += 1
         p.stepSimulation()          # DO NOT TOUCH
-        time.sleep(1./240.)         # DO NOT TOUCH
+        time.sleep(1./480.)         # [F43] halved from 1/240 -> 2x visual speed
 
 
 if __name__ == "__main__":

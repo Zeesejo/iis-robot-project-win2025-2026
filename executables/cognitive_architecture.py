@@ -19,17 +19,12 @@ FIXES in this revision
   [F9]  Fixed bare `if lidar:` numpy-safe check.
   [F10] Stuck detection in think(): replan after 4 s without 0.1 m progress.
   [F11] action_planning.py: smarter bypass, room-bounds clamped.
-  [F12] approach_visual stall fix:
-        - APPROACH_STOP_M lowered to 0.40 m (was 0.55)
-        - MIN_FWD_APPROACH=0.5 enforced so friction never wins
-        - Lidar emergency threshold lowered to 0.07 m (was 0.12)
-        - Final-push guard: if world_dist<0.55 drive at MIN_FWD regardless
-  [F13] perception.py: tightened red HSV (H=0-8 + H=165-180, S>=140, V>=80),
-        PCA runs on red-masked pixels only.
-  [F14] Three-part improvement to SEARCH + standoff:
-        A) 360 spin-in-place at search start (panoramic sweep)
-        B) Standoff now placed on the TARGET'S side of the table
-        C) Standoff validity check (room bounds + obstacle clearance)
+  [F12] approach_visual stall fix.
+  [F13] perception.py: tightened red HSV, PCA on red-masked pixels only.
+  [F14] 360 spin-search, target-side standoff, standoff validity check.
+  [F15] A) Red HSV S>=100/V>=60 for long-range detection.
+        B) Orbit direction picks the side that faces origin (robot start),
+           radius reduced 2.0->1.5 m for better small-cylinder visibility.
 """
 
 import pybullet as p
@@ -44,11 +39,8 @@ import json
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-# M2
 from src.environment.world_builder import build_world
-# M3
 from src.modules.sensor_preprocessing import get_sensor_data, get_sensor_id
-# M4 - full perception module
 from src.modules.perception import (
     PerceptionModule,
     detect_objects_by_color,
@@ -60,16 +52,11 @@ from src.modules.perception import (
     SCENE_OBJECTS,
     COLOR_RANGES_HSV,
 )
-# M5
 from src.modules.state_estimation import state_estimate, initialize_state_estimator
-# M6
 from src.modules.motion_control import PIDController, move_to_goal, grasp_object
-# M7
 from src.modules.fsm import RobotFSM, RobotState
 from src.modules.action_planning import get_action_planner, get_grasp_planner
-# M8
 from src.modules.knowledge_reasoning import get_knowledge_base
-# M9: Learning [DISABLED]
 LEARNING_DEFAULTS = {'nav_kp': 1.0, 'nav_ki': 0.0, 'nav_kd': 0.1, 'angle_kp': 1.0}
 
 # -- Robot physical constants ------------------------------------------------
@@ -92,36 +79,31 @@ TARGET_COLOR     = 'red'
 MAX_TARGET_DEPTH = 3.5
 MIN_TARGET_DEPTH = 0.2
 MAX_JUMP_M       = 1.0
-
-# Camera tilt compensation
-_CAM_TILT = 0.2   # radians downward
+_CAM_TILT        = 0.2
 
 # -- Approach tuning ---------------------------------------------------------
-GRASP_RANGE_M      = 0.55
-APPROACH_STOP_M    = 0.40
-APPROACH_SLOW_M    = 1.0
-MIN_FWD_APPROACH   = 0.50
-STANDOFF_DIST_M    = 0.65   # metres from target to standoff point
+GRASP_RANGE_M    = 0.55
+APPROACH_STOP_M  = 0.40
+APPROACH_SLOW_M  = 1.0
+MIN_FWD_APPROACH = 0.50
+STANDOFF_DIST_M  = 0.65
 
 # -- Stuck detection ---------------------------------------------------------
-_STUCK_DIST_M   = 0.10
-_STUCK_TIMEOUT  = 4.0
+_STUCK_DIST_M  = 0.10
+_STUCK_TIMEOUT = 4.0
 
 # -- [F14-A] 360 spin constants ----------------------------------------------
-_SPIN_ANGULAR_VEL = 3.0          # rad/s  (wheel differential)
-_SPIN_FULL_RAD    = 2 * math.pi  # one full revolution
-# Wall-clock seconds for one full spin: 2*pi / 3.0 * (WHEEL_BASELINE/2) ....
-# Easier: just count sim steps.  At 240 Hz and 3.0 rad/s differential:
-#   angular_vel_body = (right - left) / BASELINE = 2*3.0/0.45 = 13.3 rad/s
-#   steps for 2*pi = 2*pi / 13.3 * 240 ≈ 113 steps  -> use 150 for margin.
-_SPIN_STEPS       = 150          # steps to complete one full 360
+_SPIN_ANGULAR_VEL = 3.0
+_SPIN_STEPS       = 150
 
-# -- Room safety bounds for standoff check -----------------------------------
-_ROOM_BOUND = 3.5   # metres from origin
+# -- [F15-B] Orbit radius reduced for better small-object visibility ---------
+_ORBIT_RADIUS = 1.5   # was 2.0
+
+# -- Room safety bounds ------------------------------------------------------
+_ROOM_BOUND = 3.5
 
 
 def _lidar_has_data(lidar):
-    """Numpy-safe check: True if lidar contains at least one reading."""
     if lidar is None:
         return False
     try:
@@ -131,7 +113,6 @@ def _lidar_has_data(lidar):
 
 
 class CognitiveArchitecture:
-    """Main cognitive architecture: Sense-Think-Act loop."""
 
     def __init__(self, robot_id, table_id, room_id, target_id):
         self.robot_id  = robot_id
@@ -148,10 +129,11 @@ class CognitiveArchitecture:
         self.grasp_planner  = get_grasp_planner()
         self.kb             = get_knowledge_base()
 
-        nav_kp = LEARNING_DEFAULTS['nav_kp']
-        nav_ki = LEARNING_DEFAULTS['nav_ki']
-        nav_kd = LEARNING_DEFAULTS['nav_kd']
-        self.nav_pid = PIDController(Kp=nav_kp, Ki=nav_ki, Kd=nav_kd)
+        self.nav_pid = PIDController(
+            Kp=LEARNING_DEFAULTS['nav_kp'],
+            Ki=LEARNING_DEFAULTS['nav_ki'],
+            Kd=LEARNING_DEFAULTS['nav_kd']
+        )
 
         self.wheel_joints = [0, 1, 2, 3]
         self.wheel_names  = ['fl_wheel_joint', 'fr_wheel_joint',
@@ -186,7 +168,6 @@ class CognitiveArchitecture:
         self._stuck_pose  = None
         self._stuck_timer = 0
 
-        # [F14-A] 360 spin tracking
         self._spin_steps_done = 0
         self._spin_complete   = False
 
@@ -196,7 +177,7 @@ class CognitiveArchitecture:
         self._initialize_world_knowledge()
         self._initialize_motors()
 
-    # ----------------------- initialisation --------------------------------
+    # -----------------------------------------------------------------------
 
     def _initialize_motors(self):
         for i in self.wheel_joints:
@@ -265,7 +246,7 @@ class CognitiveArchitecture:
         elif 0.4 < r < 0.6 and 0.2 < g < 0.4:  return 'brown'
         return 'unknown'
 
-    # ----------------------- helpers --------------------------------------
+    # -----------------------------------------------------------------------
 
     def _check_gripper_contact(self):
         contacts = p.getContactPoints(bodyA=self.robot_id, bodyB=self.target_id)
@@ -275,26 +256,18 @@ class CognitiveArchitecture:
             return True
         return False
 
-    # ── [F14-B/C] Improved standoff computation ──────────────────────────────
     def _compute_approach_standoff(self, target_pos, robot_pose):
         """
-        [F14-B] Place standoff on the side of the table nearest the TARGET
-        (the red cylinder), not nearest the robot.  This minimises the arm
-        reach required to grasp the cylinder.
-
-        [F14-C] Validate the standoff: it must be inside room bounds and
-        not within 0.35 m of any known obstacle.  If invalid, try the
-        opposite side.  Final fallback: original robot-side logic.
+        [F14-B] Place standoff on the table side nearest the target cylinder.
+        [F14-C] Validate: inside room bounds and clear of obstacles.
         """
         sd = STANDOFF_DIST_M
 
         def _candidate(normal_2d):
-            """Return standoff candidate given an outward 2D unit normal."""
             nx, ny = normal_2d
             return [target_pos[0] + sd * nx, target_pos[1] + sd * ny]
 
         def _valid(cand):
-            """True if candidate is inside room and not too close to obstacles."""
             cx, cy = cand
             if abs(cx) > _ROOM_BOUND or abs(cy) > _ROOM_BOUND:
                 return False
@@ -303,51 +276,33 @@ class CognitiveArchitecture:
                     return False
             return True
 
-        # --- [F14-B] Pick best normal based on cylinder position on table ----
         best_normal = None
         if self.table_position is not None and self.table_orientation is not None:
             tx, ty, _ = self.table_position
             yaw = p.getEulerFromQuaternion(self.table_orientation)[2]
             cos_y, sin_y = math.cos(yaw), math.sin(yaw)
-
-            # Table local-frame axes (unit vectors in world frame)
-            # x-axis of table (half-length along it)
-            ax = [cos_y, sin_y]
-            # y-axis of table (half-width)
+            ax = [cos_y,  sin_y]
             ay = [-sin_y, cos_y]
-
-            # Cylinder position in table local frame
             dx_w = target_pos[0] - tx
             dy_w = target_pos[1] - ty
-            loc_x = dx_w * cos_y  + dy_w * sin_y   # along table length
-            loc_y = dx_w * -sin_y + dy_w * cos_y   # along table width
-
-            # Table half-dims (fall back to defaults if unavailable)
+            loc_x =  dx_w * cos_y + dy_w * sin_y
+            loc_y = -dx_w * sin_y + dy_w * cos_y
             hs = self.table_size
             half_len = (hs[0] / 2) if hs else 0.75
             half_wid = (hs[1] / 2) if hs else 0.40
-
-            # Normalised position inside table: positive means closer to
-            # positive edge, negative means closer to negative edge.
-            norm_x = loc_x / max(half_len, 0.01)   # in [-1, 1] roughly
+            norm_x = loc_x / max(half_len, 0.01)
             norm_y = loc_y / max(half_wid, 0.01)
-
-            # The edge the cylinder is nearest to in the larger normalised axis
             if abs(norm_x) >= abs(norm_y):
-                # Cylinder is closer to one of the two length-ends
                 sign   = 1 if norm_x > 0 else -1
                 normal = [sign * ax[0], sign * ax[1]]
             else:
-                # Closer to one of the two width-sides
                 sign   = 1 if norm_y > 0 else -1
                 normal = [sign * ay[0], sign * ay[1]]
-
             best_normal = normal
             print(f"[F14-B] Cylinder local=({loc_x:.2f},{loc_y:.2f}) -> "
                   f"approach normal=({normal[0]:.2f},{normal[1]:.2f})")
 
         elif self.table_orientation is not None:
-            # Have orientation but no position: original two-edge heuristic
             yaw  = p.getEulerFromQuaternion(self.table_orientation)[2]
             dir1 = [-math.sin(yaw),  math.cos(yaw)]
             dir2 = [ math.sin(yaw), -math.cos(yaw)]
@@ -357,25 +312,20 @@ class CognitiveArchitecture:
                                     (dx*dir2[0]+dy*dir2[1]) else dir2)
 
         if best_normal is not None:
-            # --- [F14-C] Validity check ---
             cand = _candidate(best_normal)
             if _valid(cand):
                 print(f"[F14-C] Standoff ({cand[0]:.2f},{cand[1]:.2f}) valid")
                 return cand
-
-            # Try opposite side
-            opp_normal = [-best_normal[0], -best_normal[1]]
-            opp_cand   = _candidate(opp_normal)
+            opp  = [-best_normal[0], -best_normal[1]]
+            opp_cand = _candidate(opp)
             if _valid(opp_cand):
-                print(f"[F14-C] Primary standoff blocked, using opposite side "
+                print(f"[F14-C] Primary blocked, using opposite "
                       f"({opp_cand[0]:.2f},{opp_cand[1]:.2f})")
                 return opp_cand
+            print("[F14-C] Both sides blocked - falling back to robot-side")
 
-            print("[F14-C] Both sides blocked – falling back to robot-side")
-
-        # --- Final fallback: approach from robot's current direction --------
         dx, dy = target_pos[0]-robot_pose[0], target_pos[1]-robot_pose[1]
-        d      = np.hypot(dx, dy)
+        d = np.hypot(dx, dy)
         if d > 0.01:
             return [target_pos[0] - sd*dx/d, target_pos[1] - sd*dy/d]
         return list(target_pos[:2])
@@ -423,8 +373,6 @@ class CognitiveArchitecture:
                 s = mf/oth; fwd *= s; av = 3.0*(1-s)*(1 if al>ar else -1)
         return fwd, av
 
-    # -------------------- camera -> world projection -----------------------
-
     def _pixel_depth_to_world(self, px, py, depth_m, robot_pose):
         nx = (px - CAM_CX) / CAM_FX
         ny = (py - CAM_CY) / CAM_FY
@@ -457,7 +405,7 @@ class CognitiveArchitecture:
         else:
             for k in range(3):
                 self.target_position_smoothed[k] = (
-                    alpha * new_pos[k] + (1 - alpha) * self.target_position_smoothed[k]
+                    alpha * new_pos[k] + (1-alpha) * self.target_position_smoothed[k]
                 )
         self.target_position = list(self.target_position_smoothed)
         self.kb.add_position('target', *self.target_position)
@@ -505,8 +453,8 @@ class CognitiveArchitecture:
 
             if perc['target_pose'] is not None:
                 self.pca_target_pose = perc['target_pose']
-                pca = self.pca_target_pose
                 if self.step_counter % 240 == 0:
+                    pca = self.pca_target_pose
                     print(f"[M4-PCA] Object cloud centre (cam-frame): "
                           f"{[f'{v:.3f}' for v in pca['center']]}, "
                           f"dims={[f'{v:.3f}' for v in pca['dimensions']]}")
@@ -525,9 +473,8 @@ class CognitiveArchitecture:
                       f"{[d['color'] for d in detections]}")
 
             if self.step_counter % 240 == 0:
-                depth_arr  = np.array(depth).reshape(240, 320)
-                seg_mask, edge_map = edge_contour_segmentation(
-                    bgr, min_contour_area=300)
+                depth_arr_log = np.array(depth).reshape(240, 320)
+                seg_mask, edge_map = edge_contour_segmentation(bgr, min_contour_area=300)
                 print(f"[M4-Edge] seg_pixels={int(np.sum(seg_mask > 0))}, "
                       f"edge_pixels={int(np.sum(edge_map > 0))}")
 
@@ -541,7 +488,6 @@ class CognitiveArchitecture:
                 x, y, w, h = det['bbox']
                 cx_px = int(x + w / 2)
                 cy_px = int(y + h / 2)
-
                 if not (0 <= cy_px < 240 and 0 <= cx_px < 320):
                     continue
                 raw_d = depth_arr[cy_px, cx_px]
@@ -575,10 +521,10 @@ class CognitiveArchitecture:
                     pca_body_x = pca_c[2]
                     pca_body_y = -pca_c[0]
                     rx, ry, rt = estimated_pose
-                    pca_wx     = rx + pca_body_x*math.cos(rt) - pca_body_y*math.sin(rt)
-                    pca_wy     = ry + pca_body_x*math.sin(rt) + pca_body_y*math.cos(rt)
-                    pca_wz     = CAMERA_HEIGHT - pca_c[1]
-                    pca_world  = [pca_wx, pca_wy, pca_wz]
+                    pca_wx = rx + pca_body_x*math.cos(rt) - pca_body_y*math.sin(rt)
+                    pca_wy = ry + pca_body_x*math.sin(rt) + pca_body_y*math.cos(rt)
+                    pca_wz = CAMERA_HEIGHT - pca_c[1]
+                    pca_world = [pca_wx, pca_wy, pca_wz]
                     if np.hypot(pca_world[0]-wp[0], pca_world[1]-wp[1]) < 0.5:
                         wp = pca_world
                         if self.step_counter % 60 == 0:
@@ -613,8 +559,8 @@ class CognitiveArchitecture:
 
     def think(self, sensor_data):
         pose = sensor_data['pose']
-
         current_state = self.fsm.state
+
         if (current_state == RobotState.NAVIGATE
                 and self._last_fsm_state != RobotState.NAVIGATE):
             self.approach_standoff = None
@@ -622,7 +568,6 @@ class CognitiveArchitecture:
             self._stuck_pose  = (pose[0], pose[1])
             self._stuck_timer = 0
 
-        # [F14-A] Reset spin counter when entering SEARCH from a non-SEARCH state
         if (current_state == RobotState.SEARCH
                 and self._last_fsm_state != RobotState.SEARCH):
             self._spin_steps_done = 0
@@ -639,7 +584,6 @@ class CognitiveArchitecture:
         if self.fsm.state != RobotState.FAILURE:
             self._failure_reset_done = False
 
-        # -- [F10] Stuck detection (NAVIGATE only) ---------------------------
         if current_state == RobotState.NAVIGATE:
             if self._stuck_pose is None:
                 self._stuck_pose  = (pose[0], pose[1])
@@ -652,27 +596,18 @@ class CognitiveArchitecture:
                     self._stuck_timer = 0
                 else:
                     self._stuck_timer += 1
-                    stuck_secs = self._stuck_timer * self.dt
-                    if stuck_secs >= _STUCK_TIMEOUT:
-                        print(f"[F10] STUCK detected at "
-                              f"({pose[0]:.2f}, {pose[1]:.2f}) - "
-                              f"replanning from current pose")
+                    if self._stuck_timer * self.dt >= _STUCK_TIMEOUT:
+                        print(f"[F10] STUCK at ({pose[0]:.2f},{pose[1]:.2f}) - replanning")
                         self.approach_standoff = None
                         self.current_waypoint  = None
                         self._stuck_pose       = (pose[0], pose[1])
                         self._stuck_timer      = 0
                         if self.target_position is not None:
-                            self.approach_standoff = \
-                                self._compute_approach_standoff(
-                                    self.target_position, pose)
-                            print(f"[F10] New standoff: "
-                                  f"({self.approach_standoff[0]:.2f}, "
-                                  f"{self.approach_standoff[1]:.2f})")
+                            self.approach_standoff = self._compute_approach_standoff(
+                                self.target_position, pose)
         else:
             self._stuck_pose  = None
             self._stuck_timer = 0
-
-        # -------------------------------------------------------------------
 
         target_pos = self.kb.query_position('target')
         if sensor_data['target_detected']:
@@ -696,7 +631,6 @@ class CognitiveArchitecture:
                 print(f"[CogArch] Computed approach standoff: "
                       f"({self.approach_standoff[0]:.2f}, "
                       f"{self.approach_standoff[1]:.2f})")
-
             if self.fsm.state == RobotState.APPROACH:
                 distance_for_fsm = distance_2d
             elif (self.approach_standoff is not None
@@ -724,10 +658,6 @@ class CognitiveArchitecture:
 
         # -- SEARCH ----------------------------------------------------------
         if self.fsm.state == RobotState.SEARCH:
-            # [F14-A] Phase 1: spin 360 before doing anything else.
-            # During spin the camera sweeps the full room - if red is spotted
-            # the FSM will transition to NAVIGATE automatically (via fsm.update
-            # above) and we skip directly to NAVIGATE logic next tick.
             if not self._spin_complete:
                 self._spin_steps_done += 1
                 if self._spin_steps_done >= _SPIN_STEPS:
@@ -736,14 +666,14 @@ class CognitiveArchitecture:
                 ctrl = {'mode': 'search_spin_full',
                         'angular_vel': _SPIN_ANGULAR_VEL}
             else:
-                # Phase 2: approach/orbit table as before
                 if self.table_position:
                     td = np.hypot(self.table_position[0]-pose[0],
                                   self.table_position[1]-pose[1])
-                    if td < 2.0:
+                    if td < _ORBIT_RADIUS + 0.5:
                         ctrl = {'mode': 'search_orbit',
                                 'table_pos': self.table_position[:2],
-                                'pose': pose, 'orbit_radius': 2.0,
+                                'pose': pose,
+                                'orbit_radius': _ORBIT_RADIUS,
                                 'lidar': sensor_data['lidar']}
                     else:
                         ctrl = {'mode': 'search_approach',
@@ -818,7 +748,6 @@ class CognitiveArchitecture:
                 self.target_detection_count   = 0
                 self.pca_target_pose          = None
                 self.table_plane_model        = None
-                # Also reset spin so next SEARCH does a fresh 360
                 self._spin_steps_done         = 0
                 self._spin_complete           = False
                 self._failure_reset_done      = True
@@ -847,7 +776,6 @@ class CognitiveArchitecture:
         if mode not in ('grasp', 'lift', 'success'):
             self._stow_arm()
 
-        # [F14-A] New spin mode: spin in place counter-clockwise
         if mode == 'search_spin_full':
             av = ctrl.get('angular_vel', _SPIN_ANGULAR_VEL)
             self._set_wheels(-av, av)
@@ -875,22 +803,42 @@ class CognitiveArchitecture:
             self._set_wheels(fv-av, fv+av)
 
         elif mode == 'search_orbit':
-            tp, pose = ctrl['table_pos'], ctrl['pose']
-            r_orb    = ctrl.get('orbit_radius', 2.0)
-            lidar    = ctrl.get('lidar')
-            dx, dy   = pose[0]-tp[0], pose[1]-tp[1]
-            cur_r    = np.hypot(dx, dy)
-            ang_ft   = math.atan2(dy, dx)
-            tangent  = ang_ft + math.pi/2
-            rerr     = cur_r - r_orb
-            desired  = tangent + 0.5*rerr
-            he       = math.atan2(math.sin(desired-pose[2]), math.cos(desired-pose[2]))
-            fv       = 2.0
-            av       = 4.0*he
-            fv, at   = self._lidar_avoidance(lidar, fv, pose=pose)
-            av      += at
+            tp, pose  = ctrl['table_pos'], ctrl['pose']
+            r_orb     = ctrl.get('orbit_radius', _ORBIT_RADIUS)
+            lidar     = ctrl.get('lidar')
+            dx, dy    = pose[0]-tp[0], pose[1]-tp[1]
+            cur_r     = np.hypot(dx, dy)
+            ang_ft    = math.atan2(dy, dx)   # angle from table to robot
+
+            # [F15-B] Choose orbit direction so the robot sweeps the face of
+            # the table that is visible from the origin (robot start point).
+            # The face toward origin has angle = atan2(-tp[1], -tp[0]).
+            # We pick the tangent direction (CW or CCW) that moves the robot
+            # toward that face rather than away from it.
+            origin_angle = math.atan2(-tp[1], -tp[0])  # dir from table to origin
+            # CCW tangent at robot's current angle:
+            ccw_tangent = ang_ft + math.pi / 2
+            # CW tangent:
+            cw_tangent  = ang_ft - math.pi / 2
+            # Pick whichever tangent direction is closer to origin_angle
+            def _ang_diff(a, b):
+                return math.atan2(math.sin(a - b), math.cos(a - b))
+            use_ccw = abs(_ang_diff(ccw_tangent, origin_angle)) < \
+                      abs(_ang_diff(cw_tangent,  origin_angle))
+            tangent = ccw_tangent if use_ccw else cw_tangent
+
+            rerr    = cur_r - r_orb
+            desired = tangent + 0.5 * rerr
+            he      = math.atan2(math.sin(desired - pose[2]),
+                                 math.cos(desired - pose[2]))
+            fv      = 2.0
+            av      = 4.0 * he
+            fv, at  = self._lidar_avoidance(lidar, fv, pose=pose)
+            av     += at
             if self.step_counter % 240 == 0:
-                print(f"[Act] ORBIT r={cur_r:.2f}m (target {r_orb:.1f}m)")
+                dir_label = 'CCW' if use_ccw else 'CW'
+                print(f"[Act] ORBIT {dir_label} r={cur_r:.2f}m "
+                      f"(target {r_orb:.1f}m)")
             self._set_wheels(fv-av, fv+av)
 
         elif mode in ('navigate', 'approach'):
@@ -918,7 +866,6 @@ class CognitiveArchitecture:
             lidar      = ctrl.get('lidar')
             cam_depth  = ctrl.get('camera_depth', float('inf'))
             world_dist = ctrl.get('world_dist_2d', float('inf'))
-
             sd = world_dist if world_dist < float('inf') else cam_depth
 
             if world_tgt is not None and pose is not None:
@@ -934,8 +881,7 @@ class CognitiveArchitecture:
                 fv = np.clip(3.0 * (sd - APPROACH_STOP_M), MIN_FWD_APPROACH, 3.0)
             elif sd > APPROACH_STOP_M:
                 fv = max(MIN_FWD_APPROACH,
-                         np.clip(3.0 * (sd - APPROACH_STOP_M), 0.0,
-                                 MIN_FWD_APPROACH * 2))
+                         np.clip(3.0*(sd-APPROACH_STOP_M), 0.0, MIN_FWD_APPROACH*2))
             else:
                 fv = 0.0
 
@@ -1054,9 +1000,9 @@ def main():
           f"angle_kp={LEARNING_DEFAULTS['angle_kp']:.2f}")
     print("[Init] Mission: navigate to table, grasp red cylinder\n")
 
-    while p.isConnected():                      # DO NOT TOUCH
+    while p.isConnected():
         try:
-            cog.fsm.tick()                      # [F1] advance step-based FSM timer
+            cog.fsm.tick()
             sensor_data      = cog.sense()
             control_commands = cog.think(sensor_data)
             cog.act(control_commands)
@@ -1078,8 +1024,8 @@ def main():
                   f"Pose=({pose[0]:.2f},{pose[1]:.2f},{np.degrees(pose[2]):.0f}deg))")
 
         cog.step_counter += 1
-        p.stepSimulation()                      # DO NOT TOUCH
-        time.sleep(1./240.)                     # DO NOT TOUCH
+        p.stepSimulation()
+        time.sleep(1./240.)
 
 
 if __name__ == "__main__":

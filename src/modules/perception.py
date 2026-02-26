@@ -11,12 +11,15 @@ SCENE_OBJECTS = {
     'black_obs':  {'rgb': [0.0, 0.0, 0.0], 'type': 'cube',    'dims': [0.4, 0.4, 0.4]},
 }
 
-# [F13] Red HSV tightened: H=0-8 and H=165-180, S>=140, V>=80.
-#       This excludes orange (H=10-25) which was bleeding into the old H=0-20 range.
-#       Orange lower saturation raised to 150 so it cannot reach into red territory.
+# [F13] Red HSV tightened to exclude orange (H=0-8 + H=165-180).
+# [F15-A] Lower saturation/value thresholds relaxed to S>=100, V>=60 so the
+#         small cylinder (~8-12 px wide at 2m) is still detected at long range
+#         where PyBullet lighting slightly desaturates colours.
+#         Orange safety: orange lower bound is S>=150 and H>=9, so there is
+#         zero overlap with red (H=0-8 or H=165-180, S>=100).
 COLOR_RANGES_HSV = {
-    'red':    [(np.array([0,   140,  80]),  np.array([8,   255, 255])),
-               (np.array([165, 140,  80]),  np.array([180, 255, 255]))],
+    'red':    [(np.array([0,   100,  60]),  np.array([8,   255, 255])),
+               (np.array([165, 100,  60]),  np.array([180, 255, 255]))],
     'brown':  [(np.array([10,  80,  30]),   np.array([25,  180, 180]))],
     'blue':   [(np.array([100, 120,  70]),  np.array([130, 255, 255]))],
     'pink':   [(np.array([140,  40, 100]),  np.array([160, 255, 255]))],
@@ -182,7 +185,7 @@ def compute_pca(points):
 
 
 def refine_object_points(points, obb_center, obb_vectors, obb_dims, tolerance=1.1):
-    """Geometric refinement — removes outlier points."""
+    """Geometric refinement - removes outlier points."""
     if len(points) == 0:
         return points
     v1 = obb_vectors[:, 0]
@@ -220,7 +223,7 @@ def depth_to_point_cloud(depth_buffer, width=320, height=240, fov=60, near=0.1, 
 def _extract_masked_points(depth_arr, color_mask_2d, width, height, fov=60, near=0.1, far=10.0):
     """
     [F13] Extract 3D points only from pixels where color_mask_2d is non-zero.
-    This ensures PCA runs on the actual detected color region, not the whole scene.
+    Ensures PCA runs on the actual detected colour region, not the whole scene.
     """
     fy = height / (2.0 * np.tan(np.radians(fov / 2.0)))
     fx = fy * (width / height)
@@ -250,7 +253,7 @@ def _extract_masked_points(depth_arr, color_mask_2d, width, height, fov=60, near
 class PerceptionModule:
     def __init__(self):
         self.sift_extractor = SiftFeatureExtractor()
-        self.knowledge_base = {}   # SIFT KB built from observations
+        self.knowledge_base = {}
 
     def build_knowledge_base(self, category_images):
         for cat, img_list in category_images.items():
@@ -270,7 +273,6 @@ class PerceptionModule:
         bgr = cv2.cvtColor(rgb_array, cv2.COLOR_RGBA2BGR)
 
         detections = detect_objects_by_color(bgr)
-
         seg_mask, _ = edge_contour_segmentation(bgr, min_contour_area=300)
 
         depth_arr = np.array(depth).reshape(height, width)
@@ -282,7 +284,6 @@ class PerceptionModule:
         if len(points_3d) < 10:
             return results
 
-        # --- E) RANSAC: Identify the table plane ---
         ransac = RANSAC_Segmentation(
             points=points_3d, max_iterations=500,
             distance_threshold=0.02, min_inliers_ratio=0.2
@@ -295,18 +296,15 @@ class PerceptionModule:
                 'num_inliers': int(np.sum(plane_mask))
             }
 
-        # --- F) Separate plane (table) from objects ---
         object_points = points_3d[~plane_mask]
         if len(object_points) < 10:
             return results
 
-        # --- G) [F13] PCA on RED-MASKED region only ---
-        # Build a per-pixel red mask from the HSV ranges directly.
+        # [F13] PCA on RED-MASKED pixels only
         hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
         red_mask_2d = np.zeros((height, width), dtype=np.uint8)
         for (lo, hi) in COLOR_RANGES_HSV['red']:
             red_mask_2d |= cv2.inRange(hsv, lo, hi)
-        # Small morphological clean-up (same as detect_objects_by_color)
         k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         red_mask_2d = cv2.morphologyEx(red_mask_2d, cv2.MORPH_CLOSE, k3)
         red_mask_2d = cv2.morphologyEx(red_mask_2d, cv2.MORPH_OPEN,  k3)
@@ -314,7 +312,6 @@ class PerceptionModule:
         red_pts = _extract_masked_points(depth_arr, red_mask_2d, width, height)
 
         if len(red_pts) >= 10:
-            # PCA only on red pixels — gives true cylinder centroid
             try:
                 center, vectors, dims = compute_pca(red_pts)
                 refined = refine_object_points(red_pts, center, vectors, dims)
@@ -328,7 +325,6 @@ class PerceptionModule:
             except ValueError:
                 pass
         else:
-            # Fallback: PCA on all non-plane points (original behaviour)
             try:
                 center, vectors, dims = compute_pca(object_points)
                 refined = refine_object_points(object_points, center, vectors, dims)
@@ -342,7 +338,6 @@ class PerceptionModule:
             except ValueError:
                 pass
 
-        # --- H) PCA per obstacle color ---
         for det in detections:
             if det['color'] in ['blue', 'pink', 'orange', 'yellow', 'black']:
                 x, y, w, h = det['bbox']
@@ -401,10 +396,9 @@ if __name__ == '__main__':
     c2, v2, d2 = compute_pca(refined)
     print(f"Final PCA -> center={c2.round(4)}, dims={d2.round(4)}")
 
-    # --- Test color detection ---
     test_img = np.zeros((240, 320, 3), dtype=np.uint8)
-    cv2.rectangle(test_img, (50, 50), (150, 150), (0, 0, 255), -1)   # pure red BGR
-    cv2.rectangle(test_img, (200, 100), (280, 180), (0, 165, 255), -1)  # orange BGR
+    cv2.rectangle(test_img, (50, 50), (150, 150), (0, 0, 255), -1)
+    cv2.rectangle(test_img, (200, 100), (280, 180), (0, 165, 255), -1)
     dets = detect_objects_by_color(test_img, min_area=100)
     print(f"\nColor detection: {len(dets)} objects found")
     for d in dets:

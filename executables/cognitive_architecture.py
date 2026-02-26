@@ -1,3 +1,4 @@
+
 """
 Module 10: Cognitive Architecture - SENSE-THINK-ACT Loop
 Integrates all 10 modules for autonomous navigate-to-grasp mission.
@@ -9,7 +10,8 @@ SENSE-THINK-ACT Cycle:
 
 FIXES in this revision
   [F1] fsm.tick() now called once per STA step – step-based timeouts work.
-  [F2] CAMERA_HEIGHT updated to 0.92 m (camera on torso, not gripper).
+  [F2] CAMERA_HEIGHT updated to 0.67 m (robot-1.urdf: base_spawn(0.1)
+       + torso_joint_z(0.3) + cam_z_offset(0.27) = 0.67 m).
   [F3] approach_standoff reset on every NAVIGATE re-entry, not only on
        FAILURE, so stale standoffs from previous runs are discarded.
   [F4] APPROACH_VISUAL rewritten: uses world-frame bearing to tracked
@@ -61,9 +63,9 @@ LEARNING_DEFAULTS = {'nav_kp': 1.0, 'nav_ki': 0.0, 'nav_kd': 0.1, 'angle_kp': 1.
 # ── Robot physical constants ─────────────────────────────────────────────
 WHEEL_RADIUS    = 0.1
 WHEEL_BASELINE  = 0.45
-# [F2] Camera is now on torso_link:
-#   base_spawn(0.1) + torso_joint_z(0.3) + torso_half(0.25) + cam_z(0.27) = 0.92 m
-CAMERA_HEIGHT   = 0.92
+# [F2] robot-1.urdf camera is on torso_link at xyz="0.12 0 0.27":
+#   base_spawn(0.1) + torso_joint_z(0.3) + cam_z(0.27) = 0.67 m
+CAMERA_HEIGHT   = 0.67
 CAMERA_FORWARD  = 0.12   # camera 0.12 m forward on torso (kept for PCA path only)
 DEPTH_NEAR      = 0.1
 DEPTH_FAR       = 10.0
@@ -81,7 +83,7 @@ MAX_TARGET_DEPTH = 3.5   # [F5] gate raised
 MIN_TARGET_DEPTH = 0.2
 MAX_JUMP_M       = 1.0   # EMA jump filter threshold
 
-# Camera tilt compensation (rpy="0 0.2 0" in URDF)
+# Camera tilt compensation (rpy="0 0.2 0" in robot-1.urdf)
 _CAM_TILT = 0.2   # radians downward
 
 
@@ -898,7 +900,7 @@ def main():
             pose = sensor_data['pose']
             print(f"[t={cog.step_counter/240:.0f}s] "
                   f"State={cog.fsm.state.name}  "
-                  f"Pose=({pose[0]:.2f},{pose[1]:.2f},{np.degrees(pose[2]):.0f}°)")
+                  f"Pose=({pose[0]:.2f},{pose[1]:.2f},{np.degrees(pose[2]):.0f}°))")
 
         cog.step_counter += 1
         p.stepSimulation()                      # DO NOT TOUCH

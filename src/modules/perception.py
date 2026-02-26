@@ -14,14 +14,25 @@ def depth_to_pointcloud(depth, rgb, proj_matrix, view_matrix,
     """
     Convert a PyBullet depth buffer + RGB image to a 3D point cloud
     with colour annotations.
+
+    proj_matrix may be passed as:
+      - a flat 16-element tuple/list (raw PyBullet output) -> reshaped here
+      - a (4,4) numpy array                                -> used directly
+
     Returns: points (N,3), colors (N,3)
     """
     depth = np.array(depth)
     rgb_arr = np.array(rgb).reshape(img_h, img_w, 4)[:, :, :3] / 255.0
 
-    # Unproject pixel coordinates
-    fx = proj_matrix[0]  # simplified; full unproject below
-    fy = proj_matrix[5]
+    # Normalise proj_matrix to a (4,4) array regardless of input format
+    pm = np.array(proj_matrix, dtype=np.float64)
+    if pm.ndim == 1:
+        # PyBullet returns a flat column-major 16-element tuple
+        pm = pm.reshape(4, 4).T  # transpose: PyBullet is column-major
+
+    # Standard OpenGL projection entries
+    fx = pm[0, 0]   # pm[row, col]
+    fy = pm[1, 1]
     cx, cy = img_w / 2.0, img_h / 2.0
 
     near, far = 0.1, 10.0
@@ -46,7 +57,7 @@ def detect_by_color(points, colors, target_color, tol=0.25):
     """
     Filter point cloud by RGB color proximity.
     target_color: [r, g, b] in [0,1]
-    tol: float — colour distance threshold (higher = wider detection).
+    tol: float - colour distance threshold (higher = wider detection).
          Can be tuned at runtime by VisionThresholdTuner (M9).
     Returns: filtered points (N,3)
     """

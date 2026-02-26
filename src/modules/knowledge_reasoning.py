@@ -12,6 +12,13 @@ except ImportError:
     print("[KnowledgeBase] WARNING: PySwip not available. Running in fallback mode.")
 
 import numpy as np
+import os
+
+# Write Prolog temp files to a fixed safe location (avoids \U/\u
+# Windows path escape issues inside SWI-Prolog string parser)
+_KB_TEMP_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), 'kb_rules.pl'
+)
 
 
 PROLOG_RULES = """
@@ -92,25 +99,17 @@ class KnowledgeBase:
             self.prolog = None
 
     def _load_rules(self):
-        for line in PROLOG_RULES.strip().split('\n'):
-            line = line.strip()
-            if line and not line.startswith('%'):
-                try:
-                    self.prolog.assertz(line.rstrip('.'))
-                except Exception:
-                    pass  # Some compound facts need consult
-        # Use consult via temp file for reliability
-        import tempfile, os
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.pl',
-                                         delete=False) as f:
+        # Write rules to a fixed path with forward slashes so SWI-Prolog
+        # on Windows doesn't misinterpret \U or \T as Unicode/escape sequences.
+        with open(_KB_TEMP_PATH, 'w') as f:
             f.write(PROLOG_RULES)
-            fname = f.name
+        # Convert to forward-slash path for Prolog
+        safe_path = _KB_TEMP_PATH.replace('\\', '/')
         try:
-            list(self.prolog.query(f'consult(\'{fname}\')'))
+            list(self.prolog.query(f"consult('{safe_path}')"))
         except Exception as e:
             print(f"[KB] Prolog consult warning: {e}")
-        finally:
-            os.unlink(fname)
+        # Note: we keep kb_rules.pl on disk (cheap, version-ignored via .gitignore)
 
     # ---- Assert dynamic facts ----
     def assert_obstacle_position(self, name, x, y):
@@ -195,7 +194,6 @@ class KnowledgeBase:
         Returns list of waypoints if safe, else None.
         """
         for name, (ox, oy) in self._obstacle_positions.items():
-            # Check minimum distance from line segment to obstacle center
             d = self._point_to_segment_dist(ox, oy, sx, sy, gx, gy)
             if d < (0.4 + clearance):
                 return None  # Path blocked, let motion planner handle detour

@@ -16,8 +16,9 @@ env/
 *.bullet
 *.urdf.cache
 
-# Learned parameters (generated at runtime, do not commit)
+# Learned parameters and KB temp (generated at runtime)
 executables/learned_params.json
+src/modules/kb_rules.pl
 
 # IDE
 .vscode/

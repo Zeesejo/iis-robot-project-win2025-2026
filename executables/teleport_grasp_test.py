@@ -12,16 +12,10 @@ FIX HISTORY:
         Z offset +0.075 for palm length inside grasp_object().
   F34 - resetJointState before stepSimulation
   F35 - resetJointState ALL joints to 0.0 only (non-zero -> explosion)
-  F36 - DISABLE GRAVITY during teleport+reset sequence.
-        build_world already ran physics; robot has contacts/velocity.
-        Sequence:
-          1. setGravity(0,0,0)              <- kills all forces
-          2. resetBasePositionAndOrientation <- teleport
-          3. resetJointState all to 0       <- instant joint reset
-          4. 60 steps gravity OFF           <- gentle contact settle
-          5. setGravity(0,0,-9.81)          <- re-enable
-          6. 180 steps gravity ON           <- real settle
-        Robot lands smoothly at Z~0.10 every time.
+  F36 - disable gravity during teleport+reset; re-enable after
+  F37 - restPoses shoulder=1.47 to bias IK toward horizontal-forward
+  F38 - STANDOFF_M increased to 0.80m so robot spawns further from
+        cylinder; gives arm room to extend forward without table collision.
 ======================================================================
 """
 
@@ -41,7 +35,7 @@ from src.modules.fsm import RobotFSM, RobotState
 from src.modules.knowledge_reasoning import get_knowledge_base
 
 # ---------------------------------------------------------------------------
-STANDOFF_M      = 0.55
+STANDOFF_M      = 0.80    # [F38] was 0.55 - more room for arm to extend
 GRASP_TIMEOUT_S = 30.0
 DT              = 1.0 / 240.0
 
@@ -97,27 +91,15 @@ def _link_pos(robot_id, link_idx):
 
 def _teleport_and_settle(robot_id, pos, orn_q, lift_joint, name_to_idx):
     """
-    [F36] Safe teleport sequence that prevents the robot from flying.
-
-    Problem: build_world already ran; robot has existing contacts/velocities.
-    resetBasePositionAndOrientation mid-simulation causes PyBullet to
-    resolve penetrations with large impulses on the next step -> robot flies.
-
-    Solution: disable gravity, teleport, reset all joints to 0, settle
-    gently without gravity first, then re-enable gravity.
+    [F36] Safe teleport: disable gravity, teleport, reset joints,
+    settle gently without gravity, re-enable gravity, settle with gravity.
     """
-    # Step 1: kill gravity so no forces act during teleport
     p.setGravity(0, 0, 0)
-
-    # Step 2: also zero ALL velocities by resetting base velocity
     p.resetBaseVelocity(robot_id,
                         linearVelocity=[0, 0, 0],
                         angularVelocity=[0, 0, 0])
-
-    # Step 3: teleport base
     p.resetBasePositionAndOrientation(robot_id, pos, orn_q)
 
-    # Step 4: reset ALL non-fixed joints to 0 (position AND velocity)
     for jname, idx in name_to_idx.items():
         jtype = p.getJointInfo(robot_id, idx)[2]
         if jtype != p.JOINT_FIXED:
@@ -125,8 +107,6 @@ def _teleport_and_settle(robot_id, pos, orn_q, lift_joint, name_to_idx):
                               targetValue=0.0,
                               targetVelocity=0.0)
 
-    # Step 5: 60 steps with gravity OFF - resolves any residual penetrations
-    # gently (no gravitational acceleration to amplify errors)
     _set_wheels(robot_id, 0)
     _set_lift(robot_id, lift_joint, 0.0)
     for _ in range(60):
@@ -135,10 +115,8 @@ def _teleport_and_settle(robot_id, pos, orn_q, lift_joint, name_to_idx):
         p.stepSimulation()
         time.sleep(DT)
 
-    # Step 6: re-enable gravity
     p.setGravity(0, 0, -9.81)
 
-    # Step 7: 180 steps with gravity ON - robot settles onto floor naturally
     for _ in range(180):
         _set_lift(robot_id, lift_joint, 0.0)
         _set_wheels(robot_id, 0)
@@ -148,8 +126,9 @@ def _teleport_and_settle(robot_id, pos, orn_q, lift_joint, name_to_idx):
 
 def main():
     print("=" * 60)
-    print("  TELEPORT GRASP TEST  [F36]")
+    print("  TELEPORT GRASP TEST  [F38]")
     print(f"  Cylinder Z = {_CYL_Z:.3f} m   Above Z = {_ABOVE_Z:.3f} m")
+    print(f"  Standoff   = {STANDOFF_M:.2f} m")
     print("=" * 60)
 
     robot_id, table_id, room_id, target_id = build_world(gui=True)
@@ -167,7 +146,7 @@ def main():
     tx, ty, tz = tgt_pos_pb
     print(f"[Test] Cylinder:      ({tx:.3f}, {ty:.3f}, {tz:.3f})")
 
-    # Robot position: STANDOFF_M between origin and cylinder
+    # Place robot STANDOFF_M between origin and cylinder (cyl->origin direction)
     angle_cyl_to_origin = math.atan2(-ty, -tx)
     robot_x = tx + STANDOFF_M * math.cos(angle_cyl_to_origin)
     robot_y = ty + STANDOFF_M * math.sin(angle_cyl_to_origin)
@@ -178,12 +157,10 @@ def main():
           f"yaw={math.degrees(face_yaw):.1f} deg")
     print(f"[Test] Dist to cyl:   {math.hypot(tx-robot_x, ty-robot_y):.3f} m")
 
-    # [F36] Safe teleport
     print("[Test] Teleporting (gravity-off settle)...")
     _teleport_and_settle(robot_id, [robot_x, robot_y, 0.1],
                          orn_q, lift_joint, name_to_idx)
 
-    # Verify
     bp, _ = p.getBasePositionAndOrientation(robot_id)
     wr_pos = _link_pos(robot_id, _WRIST_ROLL_LINK)
     gb_pos = _link_pos(robot_id, _GRIPPER_BASE_LINK)

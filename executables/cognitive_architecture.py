@@ -1,4 +1,3 @@
-
 """
 Module 10: Cognitive Architecture - SENSE-THINK-ACT Loop
 Integrates all 10 modules for autonomous navigate-to-grasp mission.
@@ -18,6 +17,12 @@ FIXES in this revision
        target (not raw camera bearing which is 0 when no fresh detection),
        stops cleanly when depth < 0.55 m, and clamps fwd speed tightly.
   [F5] Raised dist-to-table rejection gate to 3.5 m (was 3.0).
+  [F6] distance_for_fsm during APPROACH uses 2D world-frame distance to
+       target (not frozen camera depth) so GRASP transition fires at <0.55m.
+  [F7] approach_visual speed in act() uses np.hypot(world_tgt - pose)
+       so the robot slows down proportionally and does not ram the table.
+  [F8] _in_approach + _approach_depth_smooth reset when FSM leaves APPROACH
+       so stale state never carries over to the next attempt.
 """
 
 import pybullet as p
@@ -86,6 +91,13 @@ MAX_JUMP_M       = 1.0   # EMA jump filter threshold
 # Camera tilt compensation (rpy="0 0.2 0" in robot-1.urdf)
 _CAM_TILT = 0.2   # radians downward
 
+# ── Approach tuning ──────────────────────────────────────────────────────
+# [F6] FSM APPROACH→GRASP triggers when 2D world-frame distance < this
+GRASP_RANGE_M   = 0.55
+# [F7] During APPROACH, robot slows to near-zero at this world distance
+APPROACH_SLOW_M = 1.0   # start slowing below 1.0 m
+APPROACH_STOP_M = 0.55  # stop wheels at this distance
+
 
 class CognitiveArchitecture:
     """Main cognitive architecture: Sense-Think-Act loop."""
@@ -151,6 +163,10 @@ class CognitiveArchitecture:
         self.pca_target_pose        = None
 
         self._failure_reset_done = False
+
+        # [F8] APPROACH-specific state – reset whenever we leave APPROACH
+        self._in_approach           = False
+        self._approach_depth_smooth = float('inf')
 
         # Timing
         self.step_counter = 0
@@ -513,6 +529,13 @@ class CognitiveArchitecture:
                 and self._last_fsm_state != RobotState.NAVIGATE):
             self.approach_standoff = None
             self.current_waypoint  = None
+
+        # [F8] Reset approach state whenever we LEAVE APPROACH
+        if (self._last_fsm_state == RobotState.APPROACH
+                and current_state != RobotState.APPROACH):
+            self._in_approach           = False
+            self._approach_depth_smooth = float('inf')
+
         self._last_fsm_state = current_state
 
         if self.fsm.state != RobotState.FAILURE:
@@ -540,17 +563,21 @@ class CognitiveArchitecture:
                 print(f"[CogArch] Computed approach standoff: "
                       f"({self.approach_standoff[0]:.2f}, "
                       f"{self.approach_standoff[1]:.2f})")
-            cam_d = sensor_data.get('target_camera_depth', float('inf'))
-            if cam_d < MAX_TARGET_DEPTH and self.fsm.state in (
-                    RobotState.NAVIGATE, RobotState.APPROACH):
-                distance_for_fsm = cam_d
+
+            # [F6] Use 2D world-frame distance as the FSM distance signal
+            # during APPROACH so the GRASP transition fires correctly.
+            # During NAVIGATE, keep using standoff distance so the robot
+            # stops at the standoff point, not at the target itself.
+            if self.fsm.state == RobotState.APPROACH:
+                distance_for_fsm = distance_2d
             elif (self.approach_standoff is not None
                   and self.fsm.state == RobotState.NAVIGATE):
                 sdx = self.approach_standoff[0]-pose[0]
                 sdy = self.approach_standoff[1]-pose[1]
                 distance_for_fsm = np.hypot(sdx, sdy)
             else:
-                distance_for_fsm = distance_2d
+                cam_d = sensor_data.get('target_camera_depth', float('inf'))
+                distance_for_fsm = cam_d if cam_d < MAX_TARGET_DEPTH else distance_2d
         else:
             distance_2d = distance_for_fsm = float('inf')
 
@@ -604,19 +631,21 @@ class CognitiveArchitecture:
 
         # ── APPROACH ────────────────────────────────────────────────────────
         # [F4] Use world-frame target vector for bearing; tighter speed clamp.
+        # [F7] Speed now computed from 2D world-frame distance (not frozen cam depth).
         elif self.fsm.state == RobotState.APPROACH:
-            if not getattr(self, '_in_approach', False):
+            if not self._in_approach:
                 self._approach_depth_smooth = float('inf')
                 self._in_approach           = True
             if target_pos:
                 ctrl = {'mode': 'approach_visual',
-                        'target':         target_pos[:2],
-                        'pose':           pose,
-                        'lidar':          sensor_data['lidar'],
+                        'target':            target_pos[:2],
+                        'pose':              pose,
+                        'lidar':             sensor_data['lidar'],
                         'relaxed_avoidance': True,
-                        'camera_bearing': sensor_data.get('target_camera_bearing', 0.0),
-                        'camera_depth':   sensor_data.get('target_camera_depth', float('inf')),
-                        'world_target':   target_pos[:2]}
+                        'camera_bearing':    sensor_data.get('target_camera_bearing', 0.0),
+                        'camera_depth':      sensor_data.get('target_camera_depth', float('inf')),
+                        'world_target':      target_pos[:2],
+                        'world_dist_2d':     distance_2d}
 
         # ── GRASP ───────────────────────────────────────────────────────────
         elif self.fsm.state == RobotState.GRASP:
@@ -733,21 +762,28 @@ class CognitiveArchitecture:
             self._set_wheels(fv-av, fv+av)
 
         elif mode == 'approach_visual':
-            # [F4] World-frame bearing to target (not raw camera pixel bearing).
-            pose      = ctrl.get('pose')
-            world_tgt = ctrl.get('world_target') or ctrl.get('target')
-            lidar     = ctrl.get('lidar')
-            cam_depth = ctrl.get('camera_depth', float('inf'))
+            # [F7] Speed is now based on 2D world-frame distance to target,
+            # not on the frozen EMA camera depth.  This means the robot slows
+            # down proportionally as it closes in, regardless of whether a
+            # fresh depth pixel was seen this tick.
+            pose       = ctrl.get('pose')
+            world_tgt  = ctrl.get('world_target') or ctrl.get('target')
+            lidar      = ctrl.get('lidar')
+            cam_depth  = ctrl.get('camera_depth', float('inf'))
+            world_dist = ctrl.get('world_dist_2d', float('inf'))
 
-            # EMA smooth depth (only decreases fast, increases slow)
-            if not hasattr(self, '_approach_depth_smooth'):
-                self._approach_depth_smooth = cam_depth
-            if cam_depth < self._approach_depth_smooth:
-                self._approach_depth_smooth = cam_depth
+            # [F7] Use world_dist (2D) for speed control; fall back to
+            # cam_depth only if world position is unavailable.
+            if world_dist < float('inf'):
+                sd = world_dist
             else:
-                self._approach_depth_smooth = (0.7 * self._approach_depth_smooth
-                                               + 0.3 * cam_depth)
-            sd = self._approach_depth_smooth
+                # EMA smooth depth (only decreases fast, increases slow)
+                if cam_depth < self._approach_depth_smooth:
+                    self._approach_depth_smooth = cam_depth
+                else:
+                    self._approach_depth_smooth = (0.7 * self._approach_depth_smooth
+                                                   + 0.3 * cam_depth)
+                sd = self._approach_depth_smooth
 
             # World-frame heading error to target
             if world_tgt is not None and pose is not None:
@@ -759,13 +795,13 @@ class CognitiveArchitecture:
             else:
                 he = ctrl.get('camera_bearing', 0.0)
 
-            # Speed: proportional to depth, hard clamp
-            if sd > 1.5:
-                fv = np.clip(2.0 * (sd - 0.55), 0.3, 3.0)
-            elif sd > 0.55:
-                fv = np.clip(1.5 * (sd - 0.55), 0.1, 1.5)
+            # [F7] Speed: proportional to world distance, stop at APPROACH_STOP_M
+            if sd > APPROACH_SLOW_M:
+                fv = np.clip(2.0 * (sd - APPROACH_STOP_M), 0.3, 3.0)
+            elif sd > APPROACH_STOP_M:
+                fv = np.clip(1.5 * (sd - APPROACH_STOP_M), 0.05, 1.0)
             else:
-                fv = 0.0   # close enough, stop
+                fv = 0.0   # within grasp range – stop wheels
 
             av = 5.0 * he
 
@@ -780,7 +816,8 @@ class CognitiveArchitecture:
                         fv = 0.0
 
             if self.step_counter % 240 == 0:
-                print(f"[Act] APPROACH_VISUAL: depth={cam_depth:.2f}m, "
+                print(f"[Act] APPROACH_VISUAL: world_dist={sd:.2f}m, "
+                      f"cam_depth={cam_depth:.2f}m, "
                       f"bearing={np.degrees(he):.0f} deg, "
                       f"fwd={fv:.1f}, turn={av:.1f}")
             self._set_wheels(fv-av, fv+av)

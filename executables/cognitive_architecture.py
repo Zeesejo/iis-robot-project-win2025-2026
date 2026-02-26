@@ -8,7 +8,7 @@ SENSE-THINK-ACT Cycle:
     ACT:    Execute motion commands, control gripper
 
 FIXES in this revision
-  [F1]  fsm.tick() now called once per STA step – step-based timeouts work.
+  [F1]  fsm.tick() now called once per STA step - step-based timeouts work.
   [F2]  CAMERA_HEIGHT updated to 0.67 m.
   [F3]  approach_standoff reset on every NAVIGATE re-entry.
   [F4]  APPROACH_VISUAL rewritten: world-frame bearing, stops at depth<0.55m.
@@ -24,6 +24,12 @@ FIXES in this revision
         - MIN_FWD_APPROACH=0.5 enforced so friction never wins
         - Lidar emergency threshold lowered to 0.07 m (was 0.12)
         - Final-push guard: if world_dist<0.55 drive at MIN_FWD regardless
+  [F13] perception.py: tightened red HSV (H=0-8 + H=165-180, S>=140, V>=80),
+        PCA runs on red-masked pixels only.
+  [F14] Three-part improvement to SEARCH + standoff:
+        A) 360 spin-in-place at search start (panoramic sweep)
+        B) Standoff now placed on the TARGET'S side of the table
+        C) Standoff validity check (room bounds + obstacle clearance)
 """
 
 import pybullet as p
@@ -66,7 +72,7 @@ from src.modules.knowledge_reasoning import get_knowledge_base
 # M9: Learning [DISABLED]
 LEARNING_DEFAULTS = {'nav_kp': 1.0, 'nav_ki': 0.0, 'nav_kd': 0.1, 'angle_kp': 1.0}
 
-# ── Robot physical constants ─────────────────────────────────────────────
+# -- Robot physical constants ------------------------------------------------
 WHEEL_RADIUS    = 0.1
 WHEEL_BASELINE  = 0.45
 CAMERA_HEIGHT   = 0.67
@@ -74,7 +80,7 @@ CAMERA_FORWARD  = 0.12
 DEPTH_NEAR      = 0.1
 DEPTH_FAR       = 10.0
 
-# ── Perception tuning ────────────────────────────────────────────────────
+# -- Perception tuning -------------------------------------------------------
 _FOV_V   = 60.0
 _ASPECT  = 320.0 / 240.0
 _FOV_H   = 2 * np.degrees(np.arctan(np.tan(np.radians(_FOV_V / 2)) * _ASPECT))
@@ -90,18 +96,28 @@ MAX_JUMP_M       = 1.0
 # Camera tilt compensation
 _CAM_TILT = 0.2   # radians downward
 
-# ── Approach tuning ──────────────────────────────────────────────────────
-GRASP_RANGE_M      = 0.55   # FSM triggers GRASP when world_dist < this
-# [F12] Stop wheels only once the robot is this close.
-#       0.40 m is reachable without ramming the table.
+# -- Approach tuning ---------------------------------------------------------
+GRASP_RANGE_M      = 0.55
 APPROACH_STOP_M    = 0.40
-APPROACH_SLOW_M    = 1.0    # start slowing below this distance
-# [F12] Minimum wheel speed during APPROACH so static friction never wins.
+APPROACH_SLOW_M    = 1.0
 MIN_FWD_APPROACH   = 0.50
+STANDOFF_DIST_M    = 0.65   # metres from target to standoff point
 
-# ── Stuck detection ──────────────────────────────────────────────────────
+# -- Stuck detection ---------------------------------------------------------
 _STUCK_DIST_M   = 0.10
 _STUCK_TIMEOUT  = 4.0
+
+# -- [F14-A] 360 spin constants ----------------------------------------------
+_SPIN_ANGULAR_VEL = 3.0          # rad/s  (wheel differential)
+_SPIN_FULL_RAD    = 2 * math.pi  # one full revolution
+# Wall-clock seconds for one full spin: 2*pi / 3.0 * (WHEEL_BASELINE/2) ....
+# Easier: just count sim steps.  At 240 Hz and 3.0 rad/s differential:
+#   angular_vel_body = (right - left) / BASELINE = 2*3.0/0.45 = 13.3 rad/s
+#   steps for 2*pi = 2*pi / 13.3 * 240 ≈ 113 steps  -> use 150 for margin.
+_SPIN_STEPS       = 150          # steps to complete one full 360
+
+# -- Room safety bounds for standoff check -----------------------------------
+_ROOM_BOUND = 3.5   # metres from origin
 
 
 def _lidar_has_data(lidar):
@@ -170,13 +186,17 @@ class CognitiveArchitecture:
         self._stuck_pose  = None
         self._stuck_timer = 0
 
+        # [F14-A] 360 spin tracking
+        self._spin_steps_done = 0
+        self._spin_complete   = False
+
         self.step_counter = 0
         self.dt           = 1.0 / 240.0
 
         self._initialize_world_knowledge()
         self._initialize_motors()
 
-    # ─────────────────────────── initialisation ───────────────────────────
+    # ----------------------- initialisation --------------------------------
 
     def _initialize_motors(self):
         for i in self.wheel_joints:
@@ -245,7 +265,7 @@ class CognitiveArchitecture:
         elif 0.4 < r < 0.6 and 0.2 < g < 0.4:  return 'brown'
         return 'unknown'
 
-    # ─────────────────────────── helpers ────────────────────────────────────
+    # ----------------------- helpers --------------------------------------
 
     def _check_gripper_contact(self):
         contacts = p.getContactPoints(bodyA=self.robot_id, bodyB=self.target_id)
@@ -255,22 +275,109 @@ class CognitiveArchitecture:
             return True
         return False
 
+    # ── [F14-B/C] Improved standoff computation ──────────────────────────────
     def _compute_approach_standoff(self, target_pos, robot_pose):
-        standoff_dist = 0.65
-        if self.table_orientation is not None:
+        """
+        [F14-B] Place standoff on the side of the table nearest the TARGET
+        (the red cylinder), not nearest the robot.  This minimises the arm
+        reach required to grasp the cylinder.
+
+        [F14-C] Validate the standoff: it must be inside room bounds and
+        not within 0.35 m of any known obstacle.  If invalid, try the
+        opposite side.  Final fallback: original robot-side logic.
+        """
+        sd = STANDOFF_DIST_M
+
+        def _candidate(normal_2d):
+            """Return standoff candidate given an outward 2D unit normal."""
+            nx, ny = normal_2d
+            return [target_pos[0] + sd * nx, target_pos[1] + sd * ny]
+
+        def _valid(cand):
+            """True if candidate is inside room and not too close to obstacles."""
+            cx, cy = cand
+            if abs(cx) > _ROOM_BOUND or abs(cy) > _ROOM_BOUND:
+                return False
+            for obs in self.obstacles:
+                if np.hypot(cx - obs[0], cy - obs[1]) < 0.35:
+                    return False
+            return True
+
+        # --- [F14-B] Pick best normal based on cylinder position on table ----
+        best_normal = None
+        if self.table_position is not None and self.table_orientation is not None:
+            tx, ty, _ = self.table_position
+            yaw = p.getEulerFromQuaternion(self.table_orientation)[2]
+            cos_y, sin_y = math.cos(yaw), math.sin(yaw)
+
+            # Table local-frame axes (unit vectors in world frame)
+            # x-axis of table (half-length along it)
+            ax = [cos_y, sin_y]
+            # y-axis of table (half-width)
+            ay = [-sin_y, cos_y]
+
+            # Cylinder position in table local frame
+            dx_w = target_pos[0] - tx
+            dy_w = target_pos[1] - ty
+            loc_x = dx_w * cos_y  + dy_w * sin_y   # along table length
+            loc_y = dx_w * -sin_y + dy_w * cos_y   # along table width
+
+            # Table half-dims (fall back to defaults if unavailable)
+            hs = self.table_size
+            half_len = (hs[0] / 2) if hs else 0.75
+            half_wid = (hs[1] / 2) if hs else 0.40
+
+            # Normalised position inside table: positive means closer to
+            # positive edge, negative means closer to negative edge.
+            norm_x = loc_x / max(half_len, 0.01)   # in [-1, 1] roughly
+            norm_y = loc_y / max(half_wid, 0.01)
+
+            # The edge the cylinder is nearest to in the larger normalised axis
+            if abs(norm_x) >= abs(norm_y):
+                # Cylinder is closer to one of the two length-ends
+                sign   = 1 if norm_x > 0 else -1
+                normal = [sign * ax[0], sign * ax[1]]
+            else:
+                # Closer to one of the two width-sides
+                sign   = 1 if norm_y > 0 else -1
+                normal = [sign * ay[0], sign * ay[1]]
+
+            best_normal = normal
+            print(f"[F14-B] Cylinder local=({loc_x:.2f},{loc_y:.2f}) -> "
+                  f"approach normal=({normal[0]:.2f},{normal[1]:.2f})")
+
+        elif self.table_orientation is not None:
+            # Have orientation but no position: original two-edge heuristic
             yaw  = p.getEulerFromQuaternion(self.table_orientation)[2]
             dir1 = [-math.sin(yaw),  math.cos(yaw)]
             dir2 = [ math.sin(yaw), -math.cos(yaw)]
             dx   = robot_pose[0] - target_pos[0]
             dy   = robot_pose[1] - target_pos[1]
-            adir = dir1 if (dx*dir1[0]+dy*dir1[1]) > (dx*dir2[0]+dy*dir2[1]) else dir2
-            return [target_pos[0] + standoff_dist*adir[0],
-                    target_pos[1] + standoff_dist*adir[1]]
+            best_normal = (dir1 if (dx*dir1[0]+dy*dir1[1]) >
+                                    (dx*dir2[0]+dy*dir2[1]) else dir2)
+
+        if best_normal is not None:
+            # --- [F14-C] Validity check ---
+            cand = _candidate(best_normal)
+            if _valid(cand):
+                print(f"[F14-C] Standoff ({cand[0]:.2f},{cand[1]:.2f}) valid")
+                return cand
+
+            # Try opposite side
+            opp_normal = [-best_normal[0], -best_normal[1]]
+            opp_cand   = _candidate(opp_normal)
+            if _valid(opp_cand):
+                print(f"[F14-C] Primary standoff blocked, using opposite side "
+                      f"({opp_cand[0]:.2f},{opp_cand[1]:.2f})")
+                return opp_cand
+
+            print("[F14-C] Both sides blocked – falling back to robot-side")
+
+        # --- Final fallback: approach from robot's current direction --------
         dx, dy = target_pos[0]-robot_pose[0], target_pos[1]-robot_pose[1]
         d      = np.hypot(dx, dy)
         if d > 0.01:
-            return [target_pos[0] - standoff_dist*dx/d,
-                    target_pos[1] - standoff_dist*dy/d]
+            return [target_pos[0] - sd*dx/d, target_pos[1] - sd*dy/d]
         return list(target_pos[:2])
 
     def _distance_to_table(self, x, y):
@@ -316,7 +423,7 @@ class CognitiveArchitecture:
                 s = mf/oth; fwd *= s; av = 3.0*(1-s)*(1 if al>ar else -1)
         return fwd, av
 
-    # ────────────────────── camera → world projection ──────────────────────
+    # -------------------- camera -> world projection -----------------------
 
     def _pixel_depth_to_world(self, px, py, depth_m, robot_pose):
         nx = (px - CAM_CX) / CAM_FX
@@ -356,7 +463,7 @@ class CognitiveArchitecture:
         self.kb.add_position('target', *self.target_position)
         return True
 
-    # ════════════════════════════ SENSE ═══════════════════════════════
+    # ========================== SENSE =====================================
 
     def sense(self):
         pre          = get_sensor_data(self.robot_id,
@@ -459,7 +566,7 @@ class CognitiveArchitecture:
                     if dist_to_table > MAX_TARGET_DEPTH:
                         if self.step_counter % 60 == 0:
                             print(f"[M4] Rejected detection at "
-                                  f"({wp[0]:.2f},{wp[1]:.2f}) – "
+                                  f"({wp[0]:.2f},{wp[1]:.2f}) - "
                                   f"{dist_to_table:.2f}m from table")
                         continue
 
@@ -502,7 +609,7 @@ class CognitiveArchitecture:
             'perception':            self.last_perception_result,
         }
 
-    # ════════════════════════════ THINK ═══════════════════════════════
+    # ========================== THINK =====================================
 
     def think(self, sensor_data):
         pose = sensor_data['pose']
@@ -515,6 +622,13 @@ class CognitiveArchitecture:
             self._stuck_pose  = (pose[0], pose[1])
             self._stuck_timer = 0
 
+        # [F14-A] Reset spin counter when entering SEARCH from a non-SEARCH state
+        if (current_state == RobotState.SEARCH
+                and self._last_fsm_state != RobotState.SEARCH):
+            self._spin_steps_done = 0
+            self._spin_complete   = False
+            print("[F14-A] Entered SEARCH: starting 360 spin-in-place")
+
         if (self._last_fsm_state == RobotState.APPROACH
                 and current_state != RobotState.APPROACH):
             self._in_approach           = False
@@ -525,7 +639,7 @@ class CognitiveArchitecture:
         if self.fsm.state != RobotState.FAILURE:
             self._failure_reset_done = False
 
-        # ── [F10] Stuck detection (NAVIGATE only) ────────────────────────
+        # -- [F10] Stuck detection (NAVIGATE only) ---------------------------
         if current_state == RobotState.NAVIGATE:
             if self._stuck_pose is None:
                 self._stuck_pose  = (pose[0], pose[1])
@@ -541,7 +655,7 @@ class CognitiveArchitecture:
                     stuck_secs = self._stuck_timer * self.dt
                     if stuck_secs >= _STUCK_TIMEOUT:
                         print(f"[F10] STUCK detected at "
-                              f"({pose[0]:.2f}, {pose[1]:.2f}) – "
+                              f"({pose[0]:.2f}, {pose[1]:.2f}) - "
                               f"replanning from current pose")
                         self.approach_standoff = None
                         self.current_waypoint  = None
@@ -558,7 +672,7 @@ class CognitiveArchitecture:
             self._stuck_pose  = None
             self._stuck_timer = 0
 
-        # ──────────────────────────────────────────────────────────────────
+        # -------------------------------------------------------------------
 
         target_pos = self.kb.query_position('target')
         if sensor_data['target_detected']:
@@ -608,25 +722,38 @@ class CognitiveArchitecture:
 
         ctrl = {'mode': 'idle', 'target': None, 'gripper': 'open'}
 
-        # ── SEARCH ──────────────────────────────────────────────────────────
+        # -- SEARCH ----------------------------------------------------------
         if self.fsm.state == RobotState.SEARCH:
-            if self.table_position:
-                td = np.hypot(self.table_position[0]-pose[0],
-                              self.table_position[1]-pose[1])
-                if td < 2.0:
-                    ctrl = {'mode': 'search_orbit',
-                            'table_pos': self.table_position[:2],
-                            'pose': pose, 'orbit_radius': 2.0,
-                            'lidar': sensor_data['lidar']}
-                else:
-                    ctrl = {'mode': 'search_approach',
-                            'target': self.table_position[:2],
-                            'pose': pose, 'angular_vel': 2.0,
-                            'lidar': sensor_data['lidar']}
+            # [F14-A] Phase 1: spin 360 before doing anything else.
+            # During spin the camera sweeps the full room - if red is spotted
+            # the FSM will transition to NAVIGATE automatically (via fsm.update
+            # above) and we skip directly to NAVIGATE logic next tick.
+            if not self._spin_complete:
+                self._spin_steps_done += 1
+                if self._spin_steps_done >= _SPIN_STEPS:
+                    self._spin_complete = True
+                    print("[F14-A] 360 spin complete - proceeding to search approach")
+                ctrl = {'mode': 'search_spin_full',
+                        'angular_vel': _SPIN_ANGULAR_VEL}
             else:
-                ctrl = {'mode': 'search_rotate', 'angular_vel': 3.0}
+                # Phase 2: approach/orbit table as before
+                if self.table_position:
+                    td = np.hypot(self.table_position[0]-pose[0],
+                                  self.table_position[1]-pose[1])
+                    if td < 2.0:
+                        ctrl = {'mode': 'search_orbit',
+                                'table_pos': self.table_position[:2],
+                                'pose': pose, 'orbit_radius': 2.0,
+                                'lidar': sensor_data['lidar']}
+                    else:
+                        ctrl = {'mode': 'search_approach',
+                                'target': self.table_position[:2],
+                                'pose': pose, 'angular_vel': 2.0,
+                                'lidar': sensor_data['lidar']}
+                else:
+                    ctrl = {'mode': 'search_rotate', 'angular_vel': 3.0}
 
-        # ── NAVIGATE ────────────────────────────────────────────────────────
+        # -- NAVIGATE --------------------------------------------------------
         elif self.fsm.state == RobotState.NAVIGATE:
             cam_d       = sensor_data.get('target_camera_depth', float('inf'))
             use_relaxed = cam_d < 2.5 and sensor_data['target_detected']
@@ -644,7 +771,7 @@ class CognitiveArchitecture:
                     self.action_planner.advance_waypoint()
                     self.current_waypoint = self.action_planner.get_next_waypoint()
 
-        # ── APPROACH ────────────────────────────────────────────────────────
+        # -- APPROACH --------------------------------------------------------
         elif self.fsm.state == RobotState.APPROACH:
             if not self._in_approach:
                 self._approach_depth_smooth = float('inf')
@@ -660,7 +787,7 @@ class CognitiveArchitecture:
                         'world_target':      target_pos[:2],
                         'world_dist_2d':     distance_2d}
 
-        # ── GRASP ───────────────────────────────────────────────────────────
+        # -- GRASP -----------------------------------------------------------
         elif self.fsm.state == RobotState.GRASP:
             if target_pos:
                 gp    = self.grasp_planner.plan_grasp(target_pos)
@@ -674,15 +801,15 @@ class CognitiveArchitecture:
                         'orientation':  gp['orientation'],
                         'phase':        phase}
 
-        # ── LIFT ────────────────────────────────────────────────────────────
+        # -- LIFT ------------------------------------------------------------
         elif self.fsm.state == RobotState.LIFT:
             ctrl = {'mode': 'lift', 'lift_height': 0.2, 'gripper': 'close'}
 
-        # ── SUCCESS ─────────────────────────────────────────────────────────
+        # -- SUCCESS ---------------------------------------------------------
         elif self.fsm.state == RobotState.SUCCESS:
             ctrl = {'mode': 'success', 'gripper': 'close'}
 
-        # ── FAILURE ─────────────────────────────────────────────────────────
+        # -- FAILURE ---------------------------------------------------------
         elif self.fsm.state == RobotState.FAILURE:
             if not self._failure_reset_done:
                 self.approach_standoff        = None
@@ -691,13 +818,16 @@ class CognitiveArchitecture:
                 self.target_detection_count   = 0
                 self.pca_target_pose          = None
                 self.table_plane_model        = None
+                # Also reset spin so next SEARCH does a fresh 360
+                self._spin_steps_done         = 0
+                self._spin_complete           = False
                 self._failure_reset_done      = True
             ctrl = {'mode': 'failure', 'gripper': 'open',
                     'lidar': sensor_data['lidar']}
 
         return ctrl
 
-    # ════════════════════════════ ACT ═════════════════════════════════
+    # ========================== ACT =======================================
 
     def _stow_arm(self):
         for j in self.arm_joints:
@@ -717,7 +847,15 @@ class CognitiveArchitecture:
         if mode not in ('grasp', 'lift', 'success'):
             self._stow_arm()
 
-        if mode == 'search_rotate':
+        # [F14-A] New spin mode: spin in place counter-clockwise
+        if mode == 'search_spin_full':
+            av = ctrl.get('angular_vel', _SPIN_ANGULAR_VEL)
+            self._set_wheels(-av, av)
+            if self.step_counter % 60 == 0:
+                pct = min(100, int(100 * self._spin_steps_done / _SPIN_STEPS))
+                print(f"[F14-A] Spinning {pct}% of 360")
+
+        elif mode == 'search_rotate':
             av = ctrl.get('angular_vel', 3.0)
             self._set_wheels(-av, av)
 
@@ -781,10 +919,8 @@ class CognitiveArchitecture:
             cam_depth  = ctrl.get('camera_depth', float('inf'))
             world_dist = ctrl.get('world_dist_2d', float('inf'))
 
-            # ── distance signal: always prefer world_dist_2d ─────────────
             sd = world_dist if world_dist < float('inf') else cam_depth
 
-            # ── heading toward world-frame target ────────────────────────
             if world_tgt is not None and pose is not None:
                 dx_w = world_tgt[0] - pose[0]
                 dy_w = world_tgt[1] - pose[1]
@@ -794,39 +930,24 @@ class CognitiveArchitecture:
             else:
                 he = ctrl.get('camera_bearing', 0.0)
 
-            # ── [F12] speed profile ───────────────────────────────────────
-            # The old formula gave fwd ≈ 0.19 at 0.68 m, too weak for
-            # wheel friction.  New formula:
-            #   - above APPROACH_SLOW_M (1.0): fast cruise
-            #   - between APPROACH_SLOW_M and APPROACH_STOP_M (0.40):
-            #     linear ramp but NEVER below MIN_FWD_APPROACH (0.50)
-            #   - below APPROACH_STOP_M: wheels stop (we are close enough)
             if sd > APPROACH_SLOW_M:
                 fv = np.clip(3.0 * (sd - APPROACH_STOP_M), MIN_FWD_APPROACH, 3.0)
             elif sd > APPROACH_STOP_M:
-                # Linear in [APPROACH_STOP_M, APPROACH_SLOW_M] but floor at MIN_FWD
                 fv = max(MIN_FWD_APPROACH,
-                         np.clip(3.0 * (sd - APPROACH_STOP_M), 0.0, MIN_FWD_APPROACH * 2))
+                         np.clip(3.0 * (sd - APPROACH_STOP_M), 0.0,
+                                 MIN_FWD_APPROACH * 2))
             else:
                 fv = 0.0
 
-            # [F12] Final-push guard: if world_dist says we are inside the
-            # GRASP range but the FSM hasn't fired yet (race condition),
-            # keep nudging forward so the FSM distance threshold is met.
             if sd < GRASP_RANGE_M and fv == 0.0:
-                fv = MIN_FWD_APPROACH * 0.5   # gentle nudge
+                fv = MIN_FWD_APPROACH * 0.5
 
             av = 5.0 * he
 
-            # ── lidar collision guard ─────────────────────────────────────
             if sd > 1.0:
-                # Far: full avoidance
                 fv, at = self._lidar_avoidance(lidar, fv, relaxed=True, pose=pose)
                 av    += at
             else:
-                # Close: only emergency stop for true obstacles.
-                # [F12] Threshold lowered to 0.07 m so table legs (>0.10 m
-                # away) do NOT trigger a hard stop.
                 if _lidar_has_data(lidar):
                     mf = min(lidar[i % len(lidar)] for i in range(-2, 3))
                     if mf < 0.07:
@@ -900,19 +1021,19 @@ class CognitiveArchitecture:
                                             targetVelocity=0, force=1500)
 
 
-# ═════════════════════════════════ MAIN ══════════════════════════════════
+# ========================== MAIN ==========================================
 
 def main():
     print("="*60)
     print("  IIS Cognitive Architecture - Navigate-to-Grasp Mission")
     print("="*60)
     print("  M4:  Perception - PerceptionModule (full pipeline)")
-    print("       • detect_objects_by_color  (HSV)")
-    print("       • edge_contour_segmentation")
-    print("       • depth_to_point_cloud")
-    print("       • RANSAC_Segmentation      (table plane)")
-    print("       • compute_pca / refine_object_points (target pose)")
-    print("       • SiftFeatureExtractor     (SIFT KB)")
+    print("       * detect_objects_by_color  (HSV)")
+    print("       * edge_contour_segmentation")
+    print("       * depth_to_point_cloud")
+    print("       * RANSAC_Segmentation      (table plane)")
+    print("       * compute_pca / refine_object_points (target pose)")
+    print("       * SiftFeatureExtractor     (SIFT KB)")
     print("  M9:  Learning DISABLED - hardcoded defaults")
     print("="*60)
 
@@ -928,7 +1049,7 @@ def main():
         print(f"[Init] M8 capabilities: {cog.kb.robot_capabilities()}")
     except Exception:
         pass
-    print(f"[Init] M9 DISABLED – "
+    print(f"[Init] M9 DISABLED - "
           f"nav_kp={LEARNING_DEFAULTS['nav_kp']:.2f}  "
           f"angle_kp={LEARNING_DEFAULTS['angle_kp']:.2f}")
     print("[Init] Mission: navigate to table, grasp red cylinder\n")
@@ -946,7 +1067,7 @@ def main():
         if cog.fsm.state == RobotState.SUCCESS:
             if cog.fsm.get_time_in_state() > 3.0:
                 print("\n" + "="*60)
-                print("  MISSION COMPLETE – target grasped and lifted!")
+                print("  MISSION COMPLETE - target grasped and lifted!")
                 print("="*60)
                 break
 
@@ -954,7 +1075,7 @@ def main():
             pose = sensor_data['pose']
             print(f"[t={cog.step_counter/240:.0f}s] "
                   f"State={cog.fsm.state.name}  "
-                  f"Pose=({pose[0]:.2f},{pose[1]:.2f},{np.degrees(pose[2]):.0f}°))")
+                  f"Pose=({pose[0]:.2f},{pose[1]:.2f},{np.degrees(pose[2]):.0f}deg))")
 
         cog.step_counter += 1
         p.stepSimulation()                      # DO NOT TOUCH

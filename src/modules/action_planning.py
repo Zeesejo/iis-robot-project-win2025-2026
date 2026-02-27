@@ -1,325 +1,168 @@
 """
 Module 7: Action Planning
-High-level task sequencing and coordination for the robot mission.
-Works with the FSM to manage the Search -> Navigate -> Grasp sequence.
+High-level task sequencing and obstacle-aware waypoint generation.
 """
 
 import numpy as np
 import math
 
 
-# Room bounds (x_min, x_max, y_min, y_max) – walls are at ±5 m
-# Use a 0.5 m inset so waypoints never land inside a wall.
+# Room bounds (keep 0.5m inset from ±5 walls)
 ROOM_BOUNDS = (-4.5, 4.5, -4.5, 4.5)
 
 # Clearance radii
-_CLEARANCE_TABLE   = 1.2   # table is the big obstacle
-_CLEARANCE_SMALL   = .65   # other obstacles
+_CLEARANCE_TABLE = 1.2
+_CLEARANCE_SMALL = 0.65
 
-
-def _clearance_for(obs, table_pos=None):
-    """Return the clearance radius to use for a given obstacle position."""
-    if table_pos is not None:
-        if np.hypot(obs[0] - table_pos[0], obs[1] - table_pos[1]) < 0.5:
-            return _CLEARANCE_TABLE
-    return _CLEARANCE_SMALL
+_TABLE_AVOID_MARGIN = 0.35
+_TABLE_BYPASS_MARGIN = 0.60
 
 
 def _in_bounds(pt):
-    """True if point is inside room bounds."""
     return (ROOM_BOUNDS[0] <= pt[0] <= ROOM_BOUNDS[1] and
             ROOM_BOUNDS[2] <= pt[1] <= ROOM_BOUNDS[3])
 
 
 def _clamp(pt):
-    """Clamp a 2-D point to room bounds."""
     return [
         float(np.clip(pt[0], ROOM_BOUNDS[0], ROOM_BOUNDS[1])),
         float(np.clip(pt[1], ROOM_BOUNDS[2], ROOM_BOUNDS[3])),
     ]
 
-def _rotate_to_local(x, y, cx, cy, yaw):
-    dx, dy = x - cx, y - cy
-    c, s = np.cos(-yaw), np.sin(-yaw)
-    return (dx * c - dy * s, dx * s + dy * c)
 
-def _inside_inflated_table(pt, table_pos, table_size, table_yaw, inflate=0.25):
-    if table_pos is None or table_size is None:
-        return False
-    yaw = table_yaw if table_yaw is not None else 0.0
-    lx, ly = _rotate_to_local(pt[0], pt[1], table_pos[0], table_pos[1], yaw)
-    half_L = table_size[0] / 2.0 + inflate
-    half_W = table_size[1] / 2.0 + inflate
-    return (abs(lx) <= half_L) and (abs(ly) <= half_W)
+def _distance(a, b):
+    return math.hypot(a[0] - b[0], a[1] - b[1])
 
-def _rot2(yaw):
-    c, s = math.cos(yaw), math.sin(yaw)
-    return np.array([[c, -s],
-                     [s,  c]], dtype=np.float32)
-
-def _to_table_frame(pt, table_pos, table_yaw):
-    # world -> table local
-    R = _rot2(-table_yaw)
-    v = np.array([pt[0]-table_pos[0], pt[1]-table_pos[1]], dtype=np.float32)
-    return R @ v
-
-def _point_in_inflated_table(pt, table_pos, table_size, table_yaw, inflate):
-    # inflate expands half-extents by inflate
-    q = _to_table_frame(pt, table_pos, table_yaw)
-    hx = (table_size[0] * 0.5) + inflate
-    hy = (table_size[1] * 0.5) + inflate
-    return (abs(q[0]) <= hx) and (abs(q[1]) <= hy)
-
-def _segment_hits_inflated_table(p0, p1, table_pos, table_size, table_yaw, inflate, steps=30):
-    # simple sampling intersection test (fast + good enough here)
-    for i in range(steps + 1):
-        t = i / steps
-        pt = [p0[0] + t*(p1[0]-p0[0]), p0[1] + t*(p1[1]-p0[1])]
-        if _point_in_inflated_table(pt, table_pos, table_size, table_yaw, inflate):
-            return True
-    return False
 
 class ActionPlanner:
     """
-    High-level action planner that coordinates the robot's mission.
-    Plans sequences of actions based on current state and goals.
+    High-level waypoint planner with improved bypass logic.
     """
 
     def __init__(self):
         self.current_plan = []
-        self.plan_index   = 0
-        self.goal         = None
-        self.obstacles    = []
-        self._table_pos   = None   # cached so clearance is table-aware
+        self.plan_index = 0
+        self.goal = None
+        self.obstacles = []
+        self._table_pos = None
         self._table_size = None
-        self._table_yaw  = None
+        self._table_yaw = None
 
     # ------------------------------------------------------------------ #
 
-    def create_plan(self, start_pos, goal_pos, obstacles=None, table_pos=None, table_size=None, table_yaw=None):
-        """
-        Create a high-level action plan to reach the goal.
+    def create_plan(self, start_pos, goal_pos,
+                    obstacles=None,
+                    table_pos=None,
+                    table_size=None,
+                    table_yaw=None):
 
-        Args:
-            start_pos: Current robot position [x, y]
-            goal_pos:  Target position [x, y]
-            obstacles: List of obstacle positions [[x,y], ...]
-
-        Returns:
-            List of waypoints to follow
-        """
         if obstacles is None:
             obstacles = []
 
-        self.goal      = goal_pos
+        self.goal = goal_pos
         self.obstacles = obstacles
-
-        self._table_pos  = table_pos
+        self._table_pos = table_pos
         self._table_size = table_size
-        self._table_yaw  = table_yaw
+        self._table_yaw = table_yaw
 
-        plan = []
         if self._is_path_clear(start_pos, goal_pos):
-            plan.append(_clamp(goal_pos))
+            plan = [_clamp(goal_pos)]
         else:
-            waypoints = self._plan_around_obstacles(start_pos, goal_pos)
-            plan.extend(waypoints)
+            plan = self._plan_around_obstacles(start_pos, goal_pos)
 
         self.current_plan = plan
-        self.plan_index   = 0
+        self.plan_index = 0
         return plan
 
+    # ------------------------------------------------------------------ #
+
     def get_next_waypoint(self):
-        """Get the next waypoint in the current plan."""
         if self.plan_index < len(self.current_plan):
             return self.current_plan[self.plan_index]
         return None
 
     def advance_waypoint(self):
-        """Move to the next waypoint in the plan."""
         if self.plan_index < len(self.current_plan):
             self.plan_index += 1
             return True
         return False
 
     def is_plan_complete(self):
-        """Check if all waypoints have been reached."""
         return self.plan_index >= len(self.current_plan)
 
     # ------------------------------------------------------------------ #
 
     def _is_path_clear(self, start, goal):
-        # 1) table OBB check first
-        if self.table_pos is not None:
-            if _segment_hits_inflated_table(start, goal, self.table_pos, self.table_size, self.table_yaw,
-                                            inflate=self.table_clearance, steps=40):
-                return False
-
-        # 2) point obstacles as before
         if not self.obstacles:
             return True
 
-        steps = 12
+        steps = 20
         for i in range(steps + 1):
             t = i / steps
-            pt = [start[0] + t*(goal[0]-start[0]),
-                start[1] + t*(goal[1]-start[1])]
+            pt = [
+                start[0] + t * (goal[0] - start[0]),
+                start[1] + t * (goal[1] - start[1]),
+            ]
             for obs in self.obstacles:
-                if np.hypot(pt[0]-obs[0], pt[1]-obs[1]) < self.small_clearance:
+                if _distance(pt, obs) < _CLEARANCE_SMALL:
                     return False
         return True
 
-    def _plan_around_obstacles(self, start, goal):
-        """
-        Create waypoints to navigate around obstacles.
-
-        Strategy:
-        1. Find obstacle closest to the midpoint of the direct path.
-        2. Try BOTH perpendicular directions (left & right of the path).
-        3. Pick the direction whose bypass waypoint is inside room bounds;
-           if both are, pick the one farther from the wall.
-        4. If neither is in bounds, scale the offset down until it fits
-           (clamped fallback).
-        5. Append the original goal at the end.
-        """
-        waypoints = []
-
-        # If table blocks the direct path, create a bypass waypoint around the table
-        if self._table_pos is not None and self._table_size is not None:
-            # try 4 candidate bypass points around the table (inflated)
-            yaw = self._table_yaw if self._table_yaw is not None else 0.0
-            L, W = self._table_size[0], self._table_size[1]
-            inflate = 0.60  # how far outside table to go
-
-            # table local normals: +x, -x, +y, -y (local frame)
-            candidates_local = [
-                [ (L/2 + inflate), 0.0],
-                [-(L/2 + inflate), 0.0],
-                [0.0,  (W/2 + inflate)],
-                [0.0, -(W/2 + inflate)],
-            ]
-
-            c, s = np.cos(yaw), np.sin(yaw)
-            candidates = []
-            for lx, ly in candidates_local:
-                wx = self._table_pos[0] + lx * c - ly * s
-                wy = self._table_pos[1] + lx * s + ly * c
-                candidates.append([wx, wy])
-
-            # choose the candidate that is in bounds AND gives clear path start->cand and cand->goal
-            best = None
-            best_cost = float('inf')
-            for cand in candidates:
-                if not _in_bounds(cand):
-                    continue
-                if not self._is_path_clear(start, cand):
-                    continue
-                if not self._is_path_clear(cand, goal):
-                    continue
-                cost = np.hypot(cand[0]-start[0], cand[1]-start[1]) + np.hypot(goal[0]-cand[0], goal[1]-cand[1])
-                if cost < best_cost:
-                    best_cost = cost
-                    best = cand
-
-            if best is not None:
-                return [best, _clamp(goal)]
-
-        mid = [(start[0] + goal[0]) / 2.0,
-               (start[1] + goal[1]) / 2.0]
-
-        # Find obstacle closest to midpoint
-        closest_obs  = None
-        min_dist     = float('inf')
-        for obs in self.obstacles:
-            d = np.hypot(mid[0] - obs[0], mid[1] - obs[1])
-            if d < min_dist:
-                min_dist    = d
-                closest_obs = obs
-
-        if closest_obs:
-            clearance = _clearance_for(closest_obs, self._table_pos)
-            # Unit vector along the path
-            dx, dy   = goal[0] - start[0], goal[1] - start[1]
-            path_len = np.hypot(dx, dy)
-            if path_len > 1e-6:
-                dx /= path_len
-                dy /= path_len
-
-            # Two perpendicular unit directions
-            perp_left  = [-dy,  dx]   # rotate +90°
-            perp_right = [ dy, -dx]   # rotate -90°
-
-            wp_left  = [
-                closest_obs[0] + perp_left[0]  * clearance,
-                closest_obs[1] + perp_left[1]  * clearance,
-            ]
-            wp_right = [
-                closest_obs[0] + perp_right[0] * clearance,
-                closest_obs[1] + perp_right[1] * clearance,
-            ]
-
-            left_ok  = _in_bounds(wp_left)
-            right_ok = _in_bounds(wp_right)
-
-            if left_ok and right_ok:
-                # Both fine: prefer the one with more margin from the nearest wall
-                def _wall_margin(pt):
-                    return min(
-                        pt[0] - ROOM_BOUNDS[0],
-                        ROOM_BOUNDS[1] - pt[0],
-                        pt[1] - ROOM_BOUNDS[2],
-                        ROOM_BOUNDS[3] - pt[1],
-                    )
-                chosen = wp_left if _wall_margin(wp_left) >= _wall_margin(wp_right) else wp_right
-            elif left_ok:
-                chosen = wp_left
-            elif right_ok:
-                chosen = wp_right
-            else:
-                # Neither is in bounds – try the direction that points more
-                # toward the centre (0, 0) and clamp.
-                cx_l = -closest_obs[0] * perp_left[0]  + (-closest_obs[1]) * perp_left[1]
-                cx_r = -closest_obs[0] * perp_right[0] + (-closest_obs[1]) * perp_right[1]
-                raw  = wp_left if cx_l >= cx_r else wp_right
-                chosen = _clamp(raw)
-
-            if self.table_pos is not None:
-                if _point_in_inflated_table(chosen, self.table_pos, self.table_size, self.table_yaw,
-                                            inflate=self.table_clearance):
-                    # push it outward: move in direction away from table center in world
-                    dx = chosen[0] - self.table_pos[0]
-                    dy = chosen[1] - self.table_pos[1]
-                    d  = max(1e-3, math.hypot(dx, dy))
-                    chosen = [chosen[0] + (dx/d)*self.table_clearance,
-                            chosen[1] + (dy/d)*self.table_clearance]
-                    chosen = _clamp(chosen)
-            waypoints.append(chosen)
-
-        waypoints.append(_clamp(goal))
-        return waypoints
-
+    # ------------------------------------------------------------------ #
+    # FIXED WAYPOINT LOGIC
     # ------------------------------------------------------------------ #
 
-    def replan(self, current_pos, detected_obstacles):
-        """
-        Replan the path if new obstacles are detected.
+    def _plan_around_obstacles(self, start, goal):
 
-        Args:
-            current_pos:          Current robot position
-            detected_obstacles:   Newly detected obstacles
-        """
-        if self.goal is None:
-            return []
-        # De-duplicate before merging
-        for obs in detected_obstacles:
-            if not any(np.hypot(obs[0]-o[0], obs[1]-o[1]) < 0.3
-                       for o in self.obstacles):
-                self.obstacles.append(obs)
-        return self.create_plan(current_pos, self.goal, self.obstacles)
+        direction = np.array(goal) - np.array(start)
+        norm = np.linalg.norm(direction)
 
+        if norm < 1e-6:
+            return [_clamp(goal)]
 
-# ─────────────────────────── Grasp Planner ─────────────────────────────
+        direction = direction / norm
+        perp = np.array([-direction[1], direction[0]])
 
+        # generate left & right bypass candidates
+        wp_left = np.array(start) + direction * 1.0 + perp * _TABLE_BYPASS_MARGIN
+        wp_right = np.array(start) + direction * 1.0 - perp * _TABLE_BYPASS_MARGIN
+
+        candidates = []
+
+        for wp in [wp_left, wp_right]:
+            wp = _clamp(wp.tolist())
+
+            if not _in_bounds(wp):
+                continue
+
+            # Ensure both path segments are clear
+            if not self._is_path_clear(start, wp):
+                continue
+            if not self._is_path_clear(wp, goal):
+                continue
+
+            candidates.append(wp)
+
+        # If valid candidates exist → choose shortest total path
+        if candidates:
+
+            def cost(wp):
+                total = _distance(start, wp) + _distance(wp, goal)
+
+                # Penalize waypoint behind robot
+                forward_vec = np.array(goal) - np.array(start)
+                wp_vec = np.array(wp) - np.array(start)
+                if np.dot(wp_vec, forward_vec) < 0:
+                    total += 2.0  # strong penalty
+
+                return total
+
+            best = min(candidates, key=cost)
+            return [best, _clamp(goal)]
+
+        # fallback: just move slightly forward
+        fallback = _clamp((np.array(start) + direction * 0.8).tolist())
+        return [fallback, _clamp(goal)]
 class GraspPlanner:
     """
     Plans grasp attempts for the target object.

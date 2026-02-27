@@ -181,6 +181,8 @@ def _lidar_has_data(lidar):
 class CognitiveArchitecture:
 
     def __init__(self, robot_id, table_id, room_id, target_id):
+        from debug_plot import TopDownPlot
+        self.debug_plot = TopDownPlot()
         self.robot_id  = robot_id
         self.table_id  = table_id
         self.room_id   = room_id
@@ -213,6 +215,7 @@ class CognitiveArchitecture:
         self._detect_robot_joints()
 
         self.target_position           = None
+        self.last_target_pos = None
         self.target_position_smoothed  = None
         self.target_detection_count    = 0
         self.target_camera_bearing     = 0.0
@@ -253,6 +256,13 @@ class CognitiveArchitecture:
 
         self._initialize_world_knowledge()
         self._initialize_motors()
+
+
+        ## degug plot
+        self.debug_waypoint = None
+        self.debug_obstacles = []
+        self.debug_target = None
+        self.debug_table = None
 
     def _initialize_motors(self):
         for i in self.wheel_joints:
@@ -431,14 +441,89 @@ class CognitiveArchitecture:
     def _distance_to_table(self, x, y):
         if self.table_position is None:
             return float('inf')
+
+        # half sizes (fallback to old values)
+        if self.table_size is not None:
+            hx = 0.5 * float(self.table_size[0])
+            hy = 0.5 * float(self.table_size[1])
+        else:
+            hx, hy = 0.75, 0.40
+
         dx, dy = x - self.table_position[0], y - self.table_position[1]
+
         if self.table_orientation is not None:
             yaw = -p.getEulerFromQuaternion(self.table_orientation)[2]
-            lx  = dx*math.cos(yaw) - dy*math.sin(yaw)
-            ly  = dx*math.sin(yaw) + dy*math.cos(yaw)
+            c, s = math.cos(yaw), math.sin(yaw)
+            lx = dx*c - dy*s
+            ly = dx*s + dy*c
         else:
             lx, ly = dx, dy
-        return math.hypot(max(abs(lx)-0.75, 0.0), max(abs(ly)-0.40, 0.0))
+
+        # distance from point to rectangle (outside = >0, inside = 0)
+        ox = max(abs(lx) - hx, 0.0)
+        oy = max(abs(ly) - hy, 0.0)
+        return math.hypot(ox, oy)
+    
+    def _table_avoid_heading(self, x, y):
+        """
+        Returns a world-frame heading (radians) pointing away from the closest
+        point on the table rectangle to (x,y).
+        """
+        if self.table_position is None:
+            return None
+
+        # half sizes
+        if self.table_size is not None:
+            hx = 0.5 * float(self.table_size[0])
+            hy = 0.5 * float(self.table_size[1])
+        else:
+            hx, hy = 0.75, 0.40
+
+        tx, ty = self.table_position[0], self.table_position[1]
+
+        # transform point into table local frame
+        if self.table_orientation is not None:
+            yaw = p.getEulerFromQuaternion(self.table_orientation)[2]
+        else:
+            yaw = 0.0
+
+        dx, dy = x - tx, y - ty
+        c, s = math.cos(-yaw), math.sin(-yaw)
+        lx = dx*c - dy*s
+        ly = dx*s + dy*c
+
+        # closest point on rectangle to (lx,ly)
+        cx = float(np.clip(lx, -hx, hx))
+        cy = float(np.clip(ly, -hy, hy))
+
+        # vector from closest point on rectangle -> point
+        vx = lx - cx
+        vy = ly - cy
+
+        # If we're inside the rectangle, pick the nearest side normal.
+        if abs(vx) < 1e-6 and abs(vy) < 1e-6:
+            # distances to each side
+            d_left   = abs(lx - (-hx))
+            d_right  = abs(hx - lx)
+            d_bottom = abs(ly - (-hy))
+            d_top    = abs(hy - ly)
+
+            m = min(d_left, d_right, d_bottom, d_top)
+            if m == d_left:   vx, vy = -1.0, 0.0
+            elif m == d_right:vx, vy =  1.0, 0.0
+            elif m == d_bottom:vx, vy = 0.0, -1.0
+            else:             vx, vy = 0.0,  1.0
+
+        # normalize local repulsion vector
+        n = math.hypot(vx, vy)
+        vx, vy = vx/n, vy/n
+
+        # rotate repulsion vector back to world
+        c2, s2 = math.cos(yaw), math.sin(yaw)
+        wx = vx*c2 - vy*s2
+        wy = vx*s2 + vy*c2
+
+        return math.atan2(wy, wx)
 
     def _lidar_avoidance(self, lidar, fwd, relaxed=False, pose=None):
         if not _lidar_has_data(lidar):
@@ -493,6 +578,59 @@ class CognitiveArchitecture:
         )
         return view, cam_pos, cam_orn
 
+    def _compute_table_edge_grasp_pose(self, target_pos, pose):
+        """
+        Returns (x,y) base position in world frame to approach object
+        from nearest table edge.
+        """
+
+        if self.table_position is None or self.table_size is None:
+            return target_pos[:2]
+
+        tx, ty = self.table_position[:2]
+        yaw = 0.0
+        if self.table_orientation is not None:
+            yaw = p.getEulerFromQuaternion(self.table_orientation)[2]
+
+        # Transform target into table frame
+        dx = target_pos[0] - tx
+        dy = target_pos[1] - ty
+
+        c = math.cos(-yaw)
+        s = math.sin(-yaw)
+        lx = dx*c - dy*s
+        ly = dx*s + dy*c
+
+        half_x = self.table_size[0] / 2
+        half_y = self.table_size[1] / 2
+
+        # Choose closest edge
+        dist_left  = abs(lx + half_x)
+        dist_right = abs(lx - half_x)
+        dist_front = abs(ly - half_y)
+        dist_back  = abs(ly + half_y)
+
+        dists = [dist_left, dist_right, dist_front, dist_back]
+        side = np.argmin(dists)
+
+        standoff = 0.45  # robot clearance from edge
+
+        if side == 0:      # left
+            lx = -half_x - standoff
+        elif side == 1:    # right
+            lx = half_x + standoff
+        elif side == 2:    # front
+            ly = half_y + standoff
+        else:              # back
+            ly = -half_y - standoff
+
+        # Transform back to world frame
+        c = math.cos(yaw)
+        s = math.sin(yaw)
+        wx = tx + lx*c - ly*s
+        wy = ty + lx*s + ly*c
+
+        return [wx, wy]
     # ========================== SENSE =====================================
 
     def sense(self):
@@ -518,7 +656,8 @@ class CognitiveArchitecture:
                                  float(estimated_pose[0]),
                                  float(estimated_pose[1]), 0.0)
 
-        if rgb is not None and depth is not None and self.step_counter % 20 == 0:
+        if rgb is not None and depth is not None and self.step_counter % 10 == 0:
+            print("[Sense] Processing camera frame...")
             view, _, _ = self.compute_view_from_gripper()
             perc = self.perception.process_frame(rgb, depth, width=320, height=240, view_matrix=view)
             self.last_perception_result = perc
@@ -562,9 +701,32 @@ class CognitiveArchitecture:
                 seg_mask, edge_map = edge_contour_segmentation(bgr, min_contour_area=300)
                 print(f"[M4-Edge] seg_pixels={int(np.sum(seg_mask > 0))}, "
                       f"edge_pixels={int(np.sum(edge_map > 0))}")
+            
+            table_pos = self.table_position[:2] if self.table_position else None
+            table_size = self.table_size if self.table_size else None
+            table_yaw = p.getEulerFromQuaternion(self.table_orientation)[2] if self.table_orientation else 0.0
+
+            self.debug_plot.update(
+                pose=estimated_pose,
+                target=self.pca_target_pose,
+                table=table_pos,
+                table_size=table_size,
+                table_yaw=table_yaw,
+                obstacles=self.obstacles,
+                waypoint=self.debug_waypoint
+            )
 
         # [F43] Debounced touch detection via joint torque
         gripper_contact = self._check_gripper_contact(joint_states)
+
+        # debug est_pose vs true pose (works now)
+        # if self.step_counter % 20 == 0:
+        #     pos, orn = p.getBasePositionAndOrientation(self.robot_id)
+        #     yaw_true = p.getEulerFromQuaternion(orn)[2]
+        #     print(f"[Sense] Pose: x={pos[0]:.2f}, y={pos[1]:.2f}, yaw={math.degrees(yaw_true):.1f} deg, ")
+
+        #     print("[Sense] Estimated Pose: x={:.2f}, y={:.2f}, yaw={:.1f} deg".format(
+        #         estimated_pose[0], estimated_pose[1], math.degrees(estimated_pose[2])))
 
         return {
             'pose':                  estimated_pose,
@@ -586,6 +748,7 @@ class CognitiveArchitecture:
     def think(self, sensor_data):
         pose = sensor_data['pose']
         current_state = self.fsm.state
+        print(f"[FSM] Current state: {self.fsm.state}")
 
         # NAVIGATE entry reset
         if (current_state == RobotState.NAVIGATE
@@ -616,6 +779,9 @@ class CognitiveArchitecture:
         target_pos = self.kb.query_position('target')
         if sensor_data.get('target_detected', False):
             target_pos = sensor_data.get('target_position')
+        
+        if target_pos is not None:
+            self.last_target_pos = target_pos
 
         # --- stuck logic (NAVIGATE only) ---
         if current_state == RobotState.NAVIGATE:
@@ -643,17 +809,20 @@ class CognitiveArchitecture:
             self._stuck_timer = 0
 
         # --- distance for FSM ---
+        distance_for_fsm = float('inf')
+
         if target_pos is not None:
+            # default: distance to cylinder
             dx, dy = target_pos[0] - pose[0], target_pos[1] - pose[1]
-            distance_2d = float(np.hypot(dx, dy))
+            distance_cyl = float(np.hypot(dx, dy))
+            distance_for_fsm = distance_cyl
 
-            if self.approach_standoff is None:
-                self.approach_standoff = self._compute_approach_standoff(target_pos, pose)
-
-            distance_for_fsm = distance_2d
-        else:
-            distance_2d = float('inf')
-            distance_for_fsm = float('inf')
+            # IMPORTANT: during APPROACH, use distance to the same base_goal used by approach_visual
+            if self.fsm.state == RobotState.APPROACH:
+                base_goal = self._compute_table_edge_grasp_pose(target_pos, pose)  # same goal you use in ctrl
+                if base_goal is not None:
+                    dxg, dyg = base_goal[0] - pose[0], base_goal[1] - pose[1]
+                    distance_for_fsm = float(np.hypot(dxg, dyg))
 
         # --- FSM update ---
         self.fsm.update({
@@ -721,24 +890,88 @@ class CognitiveArchitecture:
                             self.current_waypoint[1]-pose[1]) < 0.3:
                     self.action_planner.advance_waypoint()
                     self.current_waypoint = self.action_planner.get_next_waypoint()
+            if self.step_counter % 60 == 0:
+                print(f"[Think] waypoint={self.current_waypoint} obs={len(self.obstacles)} relaxed={use_relaxed}, nav_goal={nav_goal}")
+            
+            self.debug_waypoint = self.current_waypoint
+            self.debug_obstacles = list(self.obstacles) if self.obstacles else []
+            self.debug_target = target_pos[:2] if target_pos else None
+            self.debug_table = self.table_position[:2] if self.table_position else None
 
         elif self.fsm.state == RobotState.APPROACH:
             if not self._in_approach:
                 self._approach_depth_smooth = float('inf')
-                self._in_approach           = True
+                self._in_approach = True
 
-            if target_pos:
-                ctrl = {'mode': 'approach_visual',
-                        'target':            target_pos[:2],
-                        'pose':              pose,
-                        'lidar':             sensor_data['lidar'],
-                        'relaxed_avoidance': True,
-                        'camera_bearing':    sensor_data.get('target_camera_bearing', 0.0),
-                        'camera_depth':      sensor_data.get('target_camera_depth', float('inf')),
-                        'world_target':      target_pos[:2],
-                        'world_dist_2d':     distance_2d}
+            # NEW: fallback chain so we never go idle in APPROACH
+            use_pos = target_pos
+            if use_pos is None:
+                use_pos = self.last_target_pos
+            if use_pos is None:
+                use_pos = self.fsm.target_position  # FSM remembers last seen target (from SEARCH)
 
-        # GRASP / LIFT / SUCCESS / FAILURE stay same as your current code...
+            if use_pos is not None:
+                base_goal = self._compute_table_edge_grasp_pose(use_pos, pose)
+                ctrl = {
+                    'mode': 'approach_visual',
+                    'target': base_goal,
+                    'world_target': base_goal,
+                    'pose': pose,
+                    'lidar': sensor_data['lidar'],
+                    'camera_bearing': sensor_data.get('target_camera_bearing', 0.0),
+                    'camera_depth': sensor_data.get('target_camera_depth', float('inf')),
+                    'world_dist_2d': np.hypot(base_goal[0]-pose[0], base_goal[1]-pose[1])
+                }
+            else:
+                # If we truly have no target guess, do a slow rotate instead of freezing
+                ctrl = {'mode': 'search_rotate', 'angular_vel': 1.5}
+        
+        elif self.fsm.state == RobotState.GRASP:
+            gt    = self.fsm.get_time_in_state()
+            phase = ('stow'          if gt < 1.0  else
+                     'reach_above'   if gt < 3.0  else
+                     'reach_target'  if gt < 6.0  else
+                     'close_gripper')
+
+            kb_pos = self.kb.query_position('target')
+            if target_pos is not None:
+                tgt_xy = target_pos[:2]
+            elif kb_pos is not None:
+                tgt_xy = kb_pos[:2]
+            else:
+                tgt_xy = self.table_position[:2] if self.table_position else [0, 0]
+
+            ik_z      = (_GRASP_ABOVE_WORLD_Z if phase in ('stow', 'reach_above')
+                         else _GRASP_WORLD_Z)
+            grasp_pos = [tgt_xy[0], tgt_xy[1], ik_z]
+
+            if self.step_counter % 120 == 0:
+                print(f"[Act] GRASP phase={phase}  "
+                      f"ik=({tgt_xy[0]:.3f},{tgt_xy[1]:.3f},{ik_z:.3f})")
+
+            ctrl = {'mode': 'grasp', 'grasp_pos': grasp_pos, 'phase': phase,
+                    'pose': pose}
+
+        elif self.fsm.state == RobotState.LIFT:
+            ctrl = {'mode': 'lift', 'lift_height': 0.2, 'gripper': 'close'}
+
+        elif self.fsm.state == RobotState.SUCCESS:
+            ctrl = {'mode': 'success', 'gripper': 'close'}
+
+        elif self.fsm.state == RobotState.FAILURE:
+            if not self._failure_reset_done:
+                self.approach_standoff        = None
+                self.current_waypoint         = None
+                self.target_position_smoothed = None
+                self.target_detection_count   = 0
+                self.pca_target_pose          = None
+                self.table_plane_model        = None
+                self._spin_steps_done         = 0
+                self._spin_complete           = False
+                self._failure_reset_done      = True
+            ctrl = {'mode': 'failure', 'gripper': 'open',
+                    'lidar': sensor_data['lidar']}
+
         return ctrl
 
     # ========================== ACT =======================================
@@ -761,6 +994,8 @@ class CognitiveArchitecture:
 
     def act(self, ctrl):
         mode = ctrl.get('mode', 'idle')
+        if self.step_counter % 10 == 0:
+            print(f"[Act] Mode: {mode}")
         if mode not in ('grasp', 'lift', 'success'):
             self._stow_arm()
 
@@ -816,35 +1051,57 @@ class CognitiveArchitecture:
         elif mode in ('navigate', 'approach'):
             tgt, pose = ctrl['target'], ctrl['pose']
             lidar     = ctrl.get('lidar')
-            dx, dy    = tgt[0]-pose[0], tgt[1]-pose[1]
-            dist      = np.hypot(dx, dy)
-            he        = math.atan2(dy, dx) - pose[2]
-            he        = math.atan2(math.sin(he), math.cos(he))
-            kpd       = 5.0 if mode == 'navigate' else 4.0
-            fv        = np.clip(kpd*dist, 0, 8.0)
-            av        = 6.0*he
-            relaxed   = ctrl.get('relaxed_avoidance', False)
-            fv, at    = self._lidar_avoidance(lidar, fv, relaxed=relaxed, pose=pose)
-            av       += at
-            if mode == 'navigate' and self.table_position is not None:
-                td = self._distance_to_table(pose[0], pose[1])  # distance to table boundary
-                # Stop if we're basically at the table boundary
-                if td < 0.12:
+
+            dx, dy = tgt[0] - pose[0], tgt[1] - pose[1]
+            dist   = np.hypot(dx, dy)
+
+            desired = math.atan2(dy, dx)
+            he = math.atan2(math.sin(desired - pose[2]), math.cos(desired - pose[2]))
+
+            # base speeds
+            kpd = 5.0 if mode == 'navigate' else 4.0
+            fv  = float(np.clip(kpd * dist, 0.0, 8.0))
+            av  = 6.0 * he
+
+            # lidar avoidance term
+            relaxed = ctrl.get('relaxed_avoidance', False)
+            fv, at  = self._lidar_avoidance(lidar, fv, relaxed=relaxed, pose=pose)
+            av     += at
+
+            # ---- table safety/avoidance ----
+            if self.table_position is not None:
+                td = self._distance_to_table(pose[0], pose[1])
+
+                STOP_TD  = 0.30     # tune
+                STEER_TD = 0.80     # tune
+
+                if td < STOP_TD:
                     self._set_wheels(0.0, 0.0)
-                    if self.step_counter % 60 == 0:
-                        print(f"[Safety] STOP near table boundary td={td:.2f}")
                     return
-                # Strong steer-away when close
-                if td < 0.35:
-                    away = math.atan2(pose[1]-self.table_position[1],
-                                    pose[0]-self.table_position[0])
-                    hdiff = math.atan2(math.sin(away-pose[2]), math.cos(away-pose[2]))
-                    av += 3.5 * hdiff
-                    fv = min(fv, 2.0)
-            if self.step_counter % 240 == 0:
-                print(f"[Act] {mode.upper()}: dist={dist:.2f}m, "
-                      f"heading={np.degrees(he):.0f}deg")
-            self._set_wheels(fv-av, fv+av)
+
+                if td < STEER_TD:
+                    avoid_heading = self._table_avoid_heading(pose[0], pose[1])
+                    if avoid_heading is not None:
+                        hdiff = math.atan2(math.sin(avoid_heading - pose[2]),
+                                        math.cos(avoid_heading - pose[2]))
+
+                        s = (STEER_TD - td) / (STEER_TD - STOP_TD)   # 0..1
+                        s = float(np.clip(s, 0.0, 1.0))
+
+                        av += (2.0 * s) * hdiff
+                        fv = min(fv, 2.5 + 2.0*(1.0 - s))
+
+            # ---- clamp final commands to prevent burst/spin ----
+            AV_MAX = 6.0
+            av = float(np.clip(av, -AV_MAX, AV_MAX))
+
+            left  = float(np.clip(fv - av, -10.0, 10.0))
+            right = float(np.clip(fv + av, -10.0, 10.0))
+
+            if self.step_counter % 20 == 0:
+                print(f"[Act] {mode.upper()}: dist={dist:.2f}m, heading={np.degrees(he):.0f}deg")
+
+            self._set_wheels(left, right)
 
         elif mode == 'approach_visual':
             pose       = ctrl.get('pose')
@@ -864,17 +1121,23 @@ class CognitiveArchitecture:
                     print(f"[F29] Hard stop: world_dist={world_dist:.2f}m")
                 return
 
-            if (cam_depth < MAX_TARGET_DEPTH and
-                    (world_dist > cam_depth * 1.5 or world_dist > 2.5)):
-                sd = cam_depth
-            elif world_dist < float('inf'):
-                sd = world_dist
+            # --- Choose distance scalar (sd) primarily from world distance ---
+            # World distance is consistent; camera depth can be noisy / laggy.
+            if world_dist < float('inf'):
+                sd = float(world_dist)
+            elif cam_depth < MAX_TARGET_DEPTH:
+                sd = float(cam_depth)
             else:
-                sd = cam_depth
+                sd = float('inf')
 
-            _MAX_BEARING_FAR  = math.radians(25.0)
-            _MAX_BEARING_NEAR = math.radians(60.0)
-            bearing_limit = _MAX_BEARING_NEAR if sd < 1.0 else _MAX_BEARING_FAR
+            # --- Bearing/heading error ---
+            # Slightly less conservative clamp when far, more when near.
+            if sd > 1.5:
+                bearing_limit = math.radians(35.0)
+            elif sd > 1.0:
+                bearing_limit = math.radians(30.0)
+            else:
+                bearing_limit = math.radians(60.0)
 
             if world_tgt is not None and pose is not None:
                 dx_w = world_tgt[0] - pose[0]
@@ -883,32 +1146,50 @@ class CognitiveArchitecture:
                 he = math.atan2(math.sin(desired_heading - pose[2]),
                                 math.cos(desired_heading - pose[2]))
             else:
-                he = ctrl.get('camera_bearing', 0.0)
+                he = float(ctrl.get('camera_bearing', 0.0))
 
             he = float(np.clip(he, -bearing_limit, bearing_limit))
 
-            if sd > APPROACH_SLOW_M:
-                fv = np.clip(4.0 * (sd - APPROACH_STOP_M), MIN_FWD_APPROACH, 5.0)
+            # --- Faster forward profile (piecewise) ---
+            # Keeps the near zone controlled, but lets you close distance fast.
+            if sd > 1.2:
+                fv = float(np.clip(5.5 * (sd - APPROACH_STOP_M), 0.8, 8.0))
+            elif sd > 0.7:
+                fv = float(np.clip(4.5 * (sd - APPROACH_STOP_M), 0.7, 6.0))
             elif sd > APPROACH_STOP_M:
-                fv = max(MIN_FWD_APPROACH,
-                         np.clip(4.0*(sd-APPROACH_STOP_M), 0.0, MIN_FWD_APPROACH*2))
+                fv = float(np.clip(3.5 * (sd - APPROACH_STOP_M), 0.5, 3.0))
             else:
                 fv = 0.0
 
-            av = 6.0 * he
+            # --- Distance-dependent turning gain ---
+            k_heading = 4.0 if sd > 1.0 else 6.0
+            av = float(k_heading * he)
+
+            # --- Lidar avoidance (keep your existing behavior) ---
             if sd > 1.0:
                 fv, at = self._lidar_avoidance(lidar, fv, relaxed=True, pose=pose)
-                av    += at
+                av += at
             else:
                 if _lidar_has_data(lidar):
                     mf = min(lidar[i % len(lidar)] for i in range(-2, 3))
                     if mf < 0.15:
                         fv = 0.0
 
-            if self.step_counter % 240 == 0:
-                print(f"[Act] APPROACH_VISUAL: sd={sd:.2f}m, "
-                      f"cam={cam_depth:.2f}m, bearing={np.degrees(he):.0f}deg")
-            self._set_wheels(fv-av, fv+av)
+            # --- Prevent turn from killing forward motion (no wheel reversal) ---
+            # If av is too large relative to fv, one wheel goes negative and you "stall/rotate".
+            max_av = max(2.5, 0.8 * abs(fv))
+            av = float(np.clip(av, -max_av, max_av))
+
+            # --- Final wheel commands ---
+            left  = fv - av
+            right = fv + av
+
+            if self.step_counter % 30 == 0:
+                print(f"[Act] APPROACH_VISUAL: sd={sd:.2f}m world={world_dist:.2f} cam={cam_depth:.2f} "
+                    f"he={np.degrees(he):.0f}deg fv={fv:.2f} av={av:.2f} "
+                    f"L={left:.2f} R={right:.2f}")
+
+            self._set_wheels(left, right)
 
         elif mode == 'grasp':
             self._set_wheels(0, 0)

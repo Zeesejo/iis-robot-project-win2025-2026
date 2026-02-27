@@ -134,9 +134,28 @@ class ParticleFilter:
         d_min = np.clip(d_min, 0.0, half * math.sqrt(2))
 
         # Gaussian likelihood: compare expected vs. measured
-        err   = d_min - lidar_data[None, :]          # (P, R)
-        log_w = -0.5 * np.sum(err ** 2, axis=1) / (_SIGMA_LIDAR ** 2)
+        meas = lidar_data[None, :]          # (P,R) via broadcast
+        exp  = d_min                        # (P,R)
 
+        # Outlier gating: if measurement is significantly shorter than expected,
+        # it's probably an obstacle (table/cube), not a wall.
+        # margin should be > lidar noise; tune 0.20–0.40
+        margin = 0.25
+        inlier = meas >= (exp - margin)
+
+        # Gaussian for inliers
+        err = exp - meas
+        log_p_gauss = -0.5 * (err ** 2) / (_SIGMA_LIDAR ** 2)
+
+        # Uniform-ish likelihood for outliers (constant log-prob)
+        # choose something not -inf so particles survive
+        log_p_out = math.log(1e-2)  # tune 1e-3 .. 1e-1
+
+        # Mixture: inliers use Gaussian, outliers use constant
+        log_p = np.where(inlier, log_p_gauss, log_p_out)
+
+        # Sum over rays
+        log_w = np.sum(log_p, axis=1)
         # Numerically stable weight update
         log_w -= log_w.max()
         self.weights = np.exp(log_w)
@@ -200,8 +219,11 @@ def state_estimate(sensors, control_inputs):
     # Convert wheel angular velocities (rad/s) -> [v (m/s), omega (rad/s)]
     v     = (wheel_left + wheel_right) / 2.0 * WHEEL_RADIUS
     omega = (wheel_right - wheel_left) / WHEEL_BASELINE * WHEEL_RADIUS
+    imu = sensors.get('imu', {})
+    gyro = imu.get('gyroscope_data', [0.0, 0.0, 0.0])
+    omega_gyro = float(gyro[2])
 
-    pf.predict(np.array([v, omega]))
+    pf.predict(np.array([v, omega_gyro]))
     pf.measurement_update(sensors)
     pf.resample()
 

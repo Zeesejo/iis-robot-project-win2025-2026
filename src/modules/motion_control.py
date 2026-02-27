@@ -37,7 +37,7 @@ import math
 MAX_REACH = 0.55
 
 # IK end-effector = link 15 = wrist_roll_link (child of wrist_roll_joint).
-_IK_EE_LINK = 15
+_IK_EE_LINK = 14
 
 # Z offset from wrist_roll_link to palm centre.
 # gripper_base_joint xyz='0 0 0.05'
@@ -235,10 +235,6 @@ def grasp_object(robot_id, target_pos, target_orient,
         _IK_EE_LINK,
         [ik_x, ik_y, ik_wz],
         targetOrientation=target_orient,
-        lowerLimits=lower_limits,
-        upperLimits=upper_limits,
-        jointRanges=joint_ranges,
-        restPoses=rest_poses,
         maxNumIterations=500,
         residualThreshold=0.001
     )

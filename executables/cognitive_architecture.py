@@ -518,7 +518,7 @@ class CognitiveArchitecture:
                                  float(estimated_pose[0]),
                                  float(estimated_pose[1]), 0.0)
 
-        if rgb is not None and depth is not None and self.step_counter % 10 == 0:
+        if rgb is not None and depth is not None and self.step_counter % 20 == 0:
             view, _, _ = self.compute_view_from_gripper()
             perc = self.perception.process_frame(rgb, depth, width=320, height=240, view_matrix=view)
             self.last_perception_result = perc
@@ -650,12 +650,7 @@ class CognitiveArchitecture:
             if self.approach_standoff is None:
                 self.approach_standoff = self._compute_approach_standoff(target_pos, pose)
 
-            if self.fsm.state == RobotState.NAVIGATE and self.approach_standoff is not None:
-                sdx = self.approach_standoff[0] - pose[0]
-                sdy = self.approach_standoff[1] - pose[1]
-                distance_for_fsm = float(np.hypot(sdx, sdy))
-            else:
-                distance_for_fsm = distance_2d
+            distance_for_fsm = distance_2d
         else:
             distance_2d = float('inf')
             distance_for_fsm = float('inf')
@@ -754,6 +749,9 @@ class CognitiveArchitecture:
                                     targetPosition=0.0, force=50, maxVelocity=2.0)
 
     def _set_wheels(self, left, right):
+        MAX_W = 8.0
+        left  = float(np.clip(left,  -MAX_W, MAX_W))
+        right = float(np.clip(right, -MAX_W, MAX_W))
         for i in [0, 2]:
             p.setJointMotorControl2(self.robot_id, i, p.VELOCITY_CONTROL,
                                     targetVelocity=left,  force=5000)
@@ -828,6 +826,21 @@ class CognitiveArchitecture:
             relaxed   = ctrl.get('relaxed_avoidance', False)
             fv, at    = self._lidar_avoidance(lidar, fv, relaxed=relaxed, pose=pose)
             av       += at
+            if mode == 'navigate' and self.table_position is not None:
+                td = self._distance_to_table(pose[0], pose[1])  # distance to table boundary
+                # Stop if we're basically at the table boundary
+                if td < 0.12:
+                    self._set_wheels(0.0, 0.0)
+                    if self.step_counter % 60 == 0:
+                        print(f"[Safety] STOP near table boundary td={td:.2f}")
+                    return
+                # Strong steer-away when close
+                if td < 0.35:
+                    away = math.atan2(pose[1]-self.table_position[1],
+                                    pose[0]-self.table_position[0])
+                    hdiff = math.atan2(math.sin(away-pose[2]), math.cos(away-pose[2]))
+                    av += 3.5 * hdiff
+                    fv = min(fv, 2.0)
             if self.step_counter % 240 == 0:
                 print(f"[Act] {mode.upper()}: dist={dist:.2f}m, "
                       f"heading={np.degrees(he):.0f}deg")

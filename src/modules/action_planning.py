@@ -5,14 +5,16 @@ Works with the FSM to manage the Search -> Navigate -> Grasp sequence.
 """
 
 import numpy as np
+import math
+
 
 # Room bounds (x_min, x_max, y_min, y_max) – walls are at ±5 m
 # Use a 0.5 m inset so waypoints never land inside a wall.
 ROOM_BOUNDS = (-4.5, 4.5, -4.5, 4.5)
 
 # Clearance radii
-_CLEARANCE_TABLE   = 2.0   # table is the big obstacle
-_CLEARANCE_SMALL   = 1.0   # other obstacles
+_CLEARANCE_TABLE   = 1.2   # table is the big obstacle
+_CLEARANCE_SMALL   = .65   # other obstacles
 
 
 def _clearance_for(obs, table_pos=None):
@@ -49,6 +51,33 @@ def _inside_inflated_table(pt, table_pos, table_size, table_yaw, inflate=0.25):
     half_L = table_size[0] / 2.0 + inflate
     half_W = table_size[1] / 2.0 + inflate
     return (abs(lx) <= half_L) and (abs(ly) <= half_W)
+
+def _rot2(yaw):
+    c, s = math.cos(yaw), math.sin(yaw)
+    return np.array([[c, -s],
+                     [s,  c]], dtype=np.float32)
+
+def _to_table_frame(pt, table_pos, table_yaw):
+    # world -> table local
+    R = _rot2(-table_yaw)
+    v = np.array([pt[0]-table_pos[0], pt[1]-table_pos[1]], dtype=np.float32)
+    return R @ v
+
+def _point_in_inflated_table(pt, table_pos, table_size, table_yaw, inflate):
+    # inflate expands half-extents by inflate
+    q = _to_table_frame(pt, table_pos, table_yaw)
+    hx = (table_size[0] * 0.5) + inflate
+    hy = (table_size[1] * 0.5) + inflate
+    return (abs(q[0]) <= hx) and (abs(q[1]) <= hy)
+
+def _segment_hits_inflated_table(p0, p1, table_pos, table_size, table_yaw, inflate, steps=30):
+    # simple sampling intersection test (fast + good enough here)
+    for i in range(steps + 1):
+        t = i / steps
+        pt = [p0[0] + t*(p1[0]-p0[0]), p0[1] + t*(p1[1]-p0[1])]
+        if _point_in_inflated_table(pt, table_pos, table_size, table_yaw, inflate):
+            return True
+    return False
 
 class ActionPlanner:
     """
@@ -120,22 +149,23 @@ class ActionPlanner:
     # ------------------------------------------------------------------ #
 
     def _is_path_clear(self, start, goal):
-    # Check table rectangle first
-        steps = 25
-        for i in range(steps + 1):
-            t = i / steps
-            pt = [
-                start[0] + t * (goal[0] - start[0]),
-                start[1] + t * (goal[1] - start[1]),
-            ]
-
-            # table rectangle collision
-            if _inside_inflated_table(pt, self._table_pos, self._table_size, self._table_yaw, inflate=0.30):
+        # 1) table OBB check first
+        if self.table_pos is not None:
+            if _segment_hits_inflated_table(start, goal, self.table_pos, self.table_size, self.table_yaw,
+                                            inflate=self.table_clearance, steps=40):
                 return False
 
-            # small obstacles (circles)
+        # 2) point obstacles as before
+        if not self.obstacles:
+            return True
+
+        steps = 12
+        for i in range(steps + 1):
+            t = i / steps
+            pt = [start[0] + t*(goal[0]-start[0]),
+                start[1] + t*(goal[1]-start[1])]
             for obs in self.obstacles:
-                if np.hypot(pt[0] - obs[0], pt[1] - obs[1]) < _CLEARANCE_SMALL:
+                if np.hypot(pt[0]-obs[0], pt[1]-obs[1]) < self.small_clearance:
                     return False
         return True
 
@@ -253,6 +283,16 @@ class ActionPlanner:
                 raw  = wp_left if cx_l >= cx_r else wp_right
                 chosen = _clamp(raw)
 
+            if self.table_pos is not None:
+                if _point_in_inflated_table(chosen, self.table_pos, self.table_size, self.table_yaw,
+                                            inflate=self.table_clearance):
+                    # push it outward: move in direction away from table center in world
+                    dx = chosen[0] - self.table_pos[0]
+                    dy = chosen[1] - self.table_pos[1]
+                    d  = max(1e-3, math.hypot(dx, dy))
+                    chosen = [chosen[0] + (dx/d)*self.table_clearance,
+                            chosen[1] + (dy/d)*self.table_clearance]
+                    chosen = _clamp(chosen)
             waypoints.append(chosen)
 
         waypoints.append(_clamp(goal))

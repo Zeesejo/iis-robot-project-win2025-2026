@@ -294,7 +294,7 @@ if __name__ == "__main__":
     p.setGravity(0, 0, -9.81)
     p.setAdditionalSearchPath(pybullet_data.getDataPath())
     p.loadURDF("plane.urdf")
-    robot_id = p.loadURDF("../robot/robot-1.urdf", basePosition=[0, 0, 0.05])
+    robot_id = p.loadURDF("../robot/robot.urdf", basePosition=[0, 0, 0.05])
     goal      = [2.0, 2.0]
     test_pose = [0.0, 0.0, 0.0]
     for _ in range(2400):

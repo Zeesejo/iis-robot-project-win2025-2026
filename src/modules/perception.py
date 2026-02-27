@@ -306,7 +306,7 @@ class PerceptionModule:
 
             if len(red_pts) < 5:
                 continue
-            # try:
+            
             center, vectors, dims = compute_pca(red_pts)
             refined = refine_cylinder_points(red_pts, center, vectors, dims)
             if len(refined) >= 5:
@@ -317,18 +317,16 @@ class PerceptionModule:
             center_out = center
             if view_matrix is not None:
                 center_out = cam_to_world(center, view_matrix)
+            depth_m = float(-center[2])
 
             red_target_pose = {
                 'center':     center_out.tolist(),
                 'axes':       vectors.tolist(),
                 'dimensions': dims.tolist(),
+                'depth_m':      depth_m,
+                'center_cam': center.tolist()
             }
-            print(f"[M4-PCA] Target (red cylinder) "
-                f"centerW=({center_out[0]:.3f},{center_out[1]:.3f},{center_out[2]:.3f}) "
-                f"centerC=({center[0]:.3f},{center[1]:.3f},{center[2]:.3f}) "
-                f"dims=({dims[0]:.3f},{dims[1]:.3f},{dims[2]:.3f})")
-            # except ValueError as e:
-            #     print(f"[M4-PCA] Target PCA failed: {e}")
+
         results['target_pose'] = red_target_pose
         obstacle_poses = []
         for det in detections:
@@ -342,33 +340,31 @@ class PerceptionModule:
             obs_pts  = obs_pts[np.abs(obs_pts[:, 2] - median_z) < 0.35]
             if len(obs_pts) < 10:
                 continue
-            try:
-                oc, ov, od = compute_pca(obs_pts)
-                refined_obs = refine_box_points(obs_pts, oc, ov, od)
-                if len(refined_obs) >= 10:
-                    oc, ov, od = compute_pca(refined_obs)
-                if np.max(od) > 0.8:
-                    continue
-
-                oc_out = oc
-                if view_matrix is not None:
-                    oc_out = cam_to_world(oc, view_matrix)
-
-                pose = {
-                    'color':      det['color'],
-                    'center':     oc_out.tolist(),
-                    'axes':       ov.tolist(),
-                    'dimensions': od.tolist(),
-                }
-                obstacle_poses.append(pose)
-                if not self._scene_map_locked:
-                    print(f"[M4-PCA] Obstacle ({det['color']}) "
-                          f"center=({oc[0]:.3f},{oc[1]:.3f},{oc[2]:.3f}) "
-                          f"dims=({od[0]:.3f},{od[1]:.3f},{od[2]:.3f})")
-                    if det['color'] not in self.scene_map['obstacles']:
-                        self.scene_map['obstacles'][det['color']] = pose
-            except ValueError:
+            # try:
+            oc, ov, od = compute_pca(obs_pts)
+            refined_obs = refine_box_points(obs_pts, oc, ov, od)
+            if len(refined_obs) >= 10:
+                oc, ov, od = compute_pca(refined_obs)
+            if np.max(od) > 0.8:
                 continue
+
+            oc_out = oc
+            if view_matrix is not None:
+                oc_out = cam_to_world(oc, view_matrix)
+
+            pose = {
+                'color':      det['color'],
+                'center':     oc_out.tolist(),
+                'axes':       ov.tolist(),
+                'dimensions': od.tolist(),
+            }
+            obstacle_poses.append(pose)
+            if not self._scene_map_locked:
+                print(f"[M4-PCA] Obstacle ({det['color']}) "
+                        f"center=({oc[0]:.3f},{oc[1]:.3f},{oc[2]:.3f}) "
+                        f"dims=({od[0]:.3f},{od[1]:.3f},{od[2]:.3f})")
+                if det['color'] not in self.scene_map['obstacles']:
+                    self.scene_map['obstacles'][det['color']] = pose
         results['obstacle_poses'] = obstacle_poses
         if (not self._scene_map_locked and
                 len(self.scene_map['obstacles']) >= 3):

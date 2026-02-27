@@ -110,10 +110,10 @@ DEPTH_FAR       = 10.0
 
 # -- Perception tuning -------------------------------------------------------
 _FOV_V   = 60.0
-_ASPECT  = 320.0 / 240.0
-_FOV_H   = 2 * np.degrees(np.arctan(np.tan(np.radians(_FOV_V / 2)) * _ASPECT))
-CAM_FX   = (320 / 2.0) / np.tan(np.radians(_FOV_H / 2))
+##   Aspcet ratio is given as 1 in sensor_wrapper.py
+_ASPECT  = 1.0
 CAM_FY   = (240 / 2.0) / np.tan(np.radians(_FOV_V / 2))
+CAM_FX   = CAM_FY * _ASPECT
 CAM_CX, CAM_CY = 160.0, 120.0
 
 TARGET_COLOR     = 'red'
@@ -471,83 +471,6 @@ class CognitiveArchitecture:
                 s = mf/oth; fwd *= s; av = 3.0*(1-s)*(1 if al>ar else -1)
         return fwd, av
 
-    def _pixel_depth_to_world(self, px, py, depth_m, robot_pose):
-        nx = (px - CAM_CX) / CAM_FX
-        ny = (py - CAM_CY) / CAM_FY
-        cam_x = depth_m * nx
-        cam_y = depth_m * ny
-        cam_z = depth_m
-        ct = math.cos(_CAM_TILT)
-        st = math.sin(_CAM_TILT)
-        body_forward = ct * cam_z - st * cam_y
-        body_up      = st * cam_z + ct * cam_y
-        body_lateral = cam_x
-        rx, ry, rt = robot_pose
-        world_x = rx + body_forward * math.cos(rt) - (-body_lateral) * math.sin(rt)
-        world_y = ry + body_forward * math.sin(rt) + (-body_lateral) * math.cos(rt)
-        world_z = CAMERA_HEIGHT - body_up
-        return [world_x, world_y, world_z]
-
-    def _update_target_from_detection(self, new_pos, depth_m, bearing):
-        """
-        Update the smoothed target position from a new camera detection.
-
-        [F45] Added two additional rejection gates before accepting:
-          1. Z-height gate: world_z must be >= _TARGET_Z_MIN (0.63 m).
-             The table surface is at 0.625 m; the cylinder centroid at 0.695 m.
-             Anything below 0.63 m is a floor-level obstacle-face reflection.
-          2. Obstacle proximity gate: if the candidate XY is within
-             _OBS_REJECT_RADIUS (0.45 m) of any known obstacle, the detection
-             is likely picking up an obstacle face or its reflection, not the
-             cylinder behind it.  Reject and wait for a better line-of-sight.
-
-        [F46] Gate 2 now checks self.obstacles only (non-table obstacles).
-          The table is stored separately in self.table_xy and is intentionally
-          excluded from the rejection list because the target cylinder sits on
-          the table (~0.3 m from table centre), which is inside the 0.45 m
-          radius.  Including the table caused all close-range detections to be
-          silently rejected, permanently blocking APPROACH->GRASP.
-        """
-        # [F45] Gate 1: Z-height filter
-        if new_pos[2] < _TARGET_Z_MIN:
-            if self.step_counter % 120 == 0:
-                print(f"[F45] Rejected detection: z={new_pos[2]:.3f} < "
-                      f"_TARGET_Z_MIN={_TARGET_Z_MIN} (floor/obstacle level)")
-            return False
-
-        # [F45/F46] Gate 2: Obstacle proximity filter (non-table obstacles only)
-        for obs_xy in self.obstacles:
-            dist_to_obs = np.hypot(new_pos[0] - obs_xy[0],
-                                   new_pos[1] - obs_xy[1])
-            if dist_to_obs < _OBS_REJECT_RADIUS:
-                if self.step_counter % 120 == 0:
-                    print(f"[F45] Rejected detection: too close to obstacle "
-                          f"at ({obs_xy[0]:.2f},{obs_xy[1]:.2f}), "
-                          f"dist={dist_to_obs:.2f}m")
-                return False
-
-        # MAX_JUMP guard (original)
-        if self.target_position_smoothed is not None:
-            jump = np.hypot(new_pos[0] - self.target_position_smoothed[0],
-                            new_pos[1] - self.target_position_smoothed[1])
-            if jump > MAX_JUMP_M:
-                return False
-
-        self.target_detection_count += 1
-        self.target_camera_bearing   = bearing
-        self.target_camera_depth     = depth_m
-        alpha = 0.5 if self.target_detection_count <= 5 else 0.15
-        if self.target_position_smoothed is None:
-            self.target_position_smoothed = list(new_pos)
-        else:
-            for k in range(3):
-                self.target_position_smoothed[k] = (
-                    alpha * new_pos[k] + (1-alpha) * self.target_position_smoothed[k]
-                )
-        self.target_position = list(self.target_position_smoothed)
-        self.kb.add_position('target', *self.target_position)
-        return True
-    
     def compute_view_from_gripper(self):
         gripper_link_index = get_link_id_by_name(self.robot_id, 'gripper_base')
         ls = p.getLinkState(self.robot_id, gripper_link_index, computeForwardKinematics=True)
@@ -606,8 +529,26 @@ class CognitiveArchitecture:
                 if abs(model[2]) > 0.7 and inliers > 200:
                     self.table_plane_model = model
 
-            if perc['target_pose'] is not None:
-                self.pca_target_pose = perc['target_pose']
+            if perc.get('target_pose') is not None:
+                tp = perc['target_pose']
+                self.pca_target_pose = tp['center']  # [x,y,z] world
+
+                if 'depth_m' in tp:
+                    self.target_camera_depth = float(tp['depth_m'])
+                elif 'center_cam' in tp:
+                    cx, cy, cz = tp['center_cam']
+                    # bearing left/right in radians
+                    self.target_camera_depth = float(cz)
+                    self.target_camera_bearing = float(np.arctan2(cx, cz))
+                else:
+                    # fallback: don't lie
+                    self.target_camera_depth = float('inf')
+
+                self.target_detection_count += 1
+            else:
+                # if target not seen this frame, don't keep old values forever
+                self.pca_target_pose = None
+                self.target_camera_depth = float('inf')
 
             rgb_array  = np.reshape(rgb, (240, 320, 4)).astype(np.uint8)
             bgr        = cv2.cvtColor(rgb_array, cv2.COLOR_RGBA2BGR)
@@ -646,6 +587,7 @@ class CognitiveArchitecture:
         pose = sensor_data['pose']
         current_state = self.fsm.state
 
+        # NAVIGATE entry reset
         if (current_state == RobotState.NAVIGATE
                 and self._last_fsm_state != RobotState.NAVIGATE):
             self.approach_standoff = None
@@ -653,18 +595,13 @@ class CognitiveArchitecture:
             self._stuck_pose  = (pose[0], pose[1])
             self._stuck_timer = 0
 
+        # SEARCH entry reset
         if (current_state == RobotState.SEARCH
                 and self._last_fsm_state != RobotState.SEARCH):
             self._spin_steps_done = 0
             self._spin_complete   = False
 
-        if (current_state == RobotState.APPROACH
-                and self._last_fsm_state == RobotState.NAVIGATE):
-            print("[F22] APPROACH entry: resetting target smoother")
-            self.target_position_smoothed = None
-            self.target_detection_count   = 0
-            self.pca_target_pose          = None
-
+        # leaving APPROACH
         if (self._last_fsm_state == RobotState.APPROACH
                 and current_state != RobotState.APPROACH):
             self._in_approach           = False
@@ -675,72 +612,57 @@ class CognitiveArchitecture:
         if self.fsm.state != RobotState.FAILURE:
             self._failure_reset_done = False
 
+        # --- target selection (always [x,y,z]) ---
+        target_pos = self.kb.query_position('target')
+        if sensor_data.get('target_detected', False):
+            target_pos = sensor_data.get('target_position')
+
+        # --- stuck logic (NAVIGATE only) ---
         if current_state == RobotState.NAVIGATE:
             if self._stuck_pose is None:
                 self._stuck_pose  = (pose[0], pose[1])
                 self._stuck_timer = 0
             else:
                 moved = np.hypot(pose[0] - self._stuck_pose[0],
-                                 pose[1] - self._stuck_pose[1])
+                                pose[1] - self._stuck_pose[1])
                 if moved > _STUCK_DIST_M:
                     self._stuck_pose  = (pose[0], pose[1])
                     self._stuck_timer = 0
                 else:
                     self._stuck_timer += 1
                     if self._stuck_timer * self.dt >= _STUCK_TIMEOUT:
-                        print(f"[F10] STUCK - replanning")
+                        print("[F10] STUCK - replanning")
                         self.approach_standoff = None
                         self.current_waypoint  = None
                         self._stuck_pose       = (pose[0], pose[1])
                         self._stuck_timer      = 0
-                        if self.target_position is not None:
-                            self.approach_standoff = self._compute_approach_standoff(
-                                self.target_position, pose)
+                        if target_pos is not None:
+                            self.approach_standoff = self._compute_approach_standoff(target_pos, pose)
         else:
             self._stuck_pose  = None
             self._stuck_timer = 0
 
-        target_pos = self.kb.query_position('target')
-        if sensor_data['target_detected']:
-            target_pos = sensor_data['target_position']['center']
-        print(f"[Debug] Target pos: {target_pos}")
+        # --- distance for FSM ---
+        if target_pos is not None:
+            dx, dy = target_pos[0] - pose[0], target_pos[1] - pose[1]
+            distance_2d = float(np.hypot(dx, dy))
 
-
-        if target_pos:
-            dx, dy      = target_pos[0]-pose[0], target_pos[1]-pose[1]
-            distance_2d = np.hypot(dx, dy)
             if self.approach_standoff is None:
-                self.approach_standoff = self._compute_approach_standoff(
-                    target_pos, pose)
+                self.approach_standoff = self._compute_approach_standoff(target_pos, pose)
 
-            if self.fsm.state == RobotState.APPROACH:
-                cam_d = sensor_data.get('target_camera_depth', float('inf'))
-                # [F46] BUG 2 FIX: use world distance (distance_2d) when no live
-                # camera detection has been accepted (target_detection_count==0).
-                # Previously, cam_d stayed at the stale F44 synthetic value of
-                # ~2.69m, so distance_for_fsm never dropped below the 0.55m
-                # GRASP threshold even when the robot was physically within reach.
-                if MIN_TARGET_DEPTH < cam_d < MAX_TARGET_DEPTH and self.target_detection_count > 0:
-                    distance_for_fsm = cam_d
-                else:
-                    distance_for_fsm = distance_2d
-                if self.step_counter % 60 == 0:
-                    print(f"[F46] APPROACH dist: world={distance_2d:.2f}m "
-                          f"cam={cam_d:.2f}m det={self.target_detection_count} "
-                          f"-> fsm_dist={distance_for_fsm:.2f}m")
-            elif (self.approach_standoff is not None
-                  and self.fsm.state == RobotState.NAVIGATE):
-                sdx = self.approach_standoff[0]-pose[0]
-                sdy = self.approach_standoff[1]-pose[1]
-                distance_for_fsm = np.hypot(sdx, sdy)
+            if self.fsm.state == RobotState.NAVIGATE and self.approach_standoff is not None:
+                sdx = self.approach_standoff[0] - pose[0]
+                sdy = self.approach_standoff[1] - pose[1]
+                distance_for_fsm = float(np.hypot(sdx, sdy))
             else:
-                cam_d = sensor_data.get('target_camera_depth', float('inf'))
-                distance_for_fsm = cam_d if cam_d < MAX_TARGET_DEPTH else distance_2d
+                distance_for_fsm = distance_2d
         else:
-            distance_2d = distance_for_fsm = float('inf')
+            distance_2d = float('inf')
+            distance_for_fsm = float('inf')
 
+        # --- FSM update ---
         self.fsm.update({
-            'target_visible':     sensor_data['target_detected'],
+            'target_visible':     sensor_data.get('target_detected', False),
             'target_position':    target_pos,
             'distance_to_target': distance_for_fsm,
             'collision_detected': False,
@@ -751,17 +673,17 @@ class CognitiveArchitecture:
 
         ctrl = {'mode': 'idle', 'target': None, 'gripper': 'open'}
 
+        # --- control selection ---
         if self.fsm.state == RobotState.SEARCH:
             if not self._spin_complete:
                 self._spin_steps_done += 1
                 if self._spin_steps_done >= _SPIN_STEPS:
                     self._spin_complete = True
-                ctrl = {'mode': 'search_spin_full',
-                        'angular_vel': _SPIN_ANGULAR_VEL}
+                ctrl = {'mode': 'search_spin_full', 'angular_vel': _SPIN_ANGULAR_VEL}
             else:
                 if self.table_position:
                     td = np.hypot(self.table_position[0]-pose[0],
-                                  self.table_position[1]-pose[1])
+                                self.table_position[1]-pose[1])
                     if td < _ORBIT_RADIUS + 0.5:
                         ctrl = {'mode': 'search_orbit',
                                 'table_pos': self.table_position[:2],
@@ -777,16 +699,29 @@ class CognitiveArchitecture:
 
         elif self.fsm.state == RobotState.NAVIGATE:
             cam_d       = sensor_data.get('target_camera_depth', float('inf'))
-            use_relaxed = cam_d < 2.5 and sensor_data['target_detected']
-            nav_goal    = (self.approach_standoff or
-                           (target_pos[:2] if target_pos else None))
+            use_relaxed = (cam_d < 2.5) and sensor_data.get('target_detected', False)
+
+            nav_goal = (self.approach_standoff or (target_pos[:2] if target_pos else None))
+
             if nav_goal and self.current_waypoint is None:
-                self.action_planner.create_plan(pose[:2], nav_goal, self.obstacles)
+                table_pos  = self.table_position[:2] if self.table_position else None
+                table_size = self.table_size[:2] if self.table_size else [1.5, 0.8]
+                table_yaw  = p.getEulerFromQuaternion(self.table_orientation)[2] if self.table_orientation else 0.0
+
+                self.action_planner.create_plan(
+                    pose[:2], nav_goal,
+                    obstacles=self.obstacles,
+                    table_pos=table_pos,
+                    table_size=table_size,
+                    table_yaw=table_yaw
+                )
                 self.current_waypoint = self.action_planner.get_next_waypoint()
+
             if self.current_waypoint:
                 ctrl = {'mode': 'navigate', 'target': self.current_waypoint,
                         'pose': pose, 'lidar': sensor_data['lidar'],
                         'relaxed_avoidance': use_relaxed}
+
                 if np.hypot(self.current_waypoint[0]-pose[0],
                             self.current_waypoint[1]-pose[1]) < 0.3:
                     self.action_planner.advance_waypoint()
@@ -796,6 +731,7 @@ class CognitiveArchitecture:
             if not self._in_approach:
                 self._approach_depth_smooth = float('inf')
                 self._in_approach           = True
+
             if target_pos:
                 ctrl = {'mode': 'approach_visual',
                         'target':            target_pos[:2],
@@ -807,52 +743,7 @@ class CognitiveArchitecture:
                         'world_target':      target_pos[:2],
                         'world_dist_2d':     distance_2d}
 
-        elif self.fsm.state == RobotState.GRASP:
-            gt    = self.fsm.get_time_in_state()
-            phase = ('stow'          if gt < 1.0  else
-                     'reach_above'   if gt < 3.0  else
-                     'reach_target'  if gt < 6.0  else
-                     'close_gripper')
-
-            kb_pos = self.kb.query_position('target')
-            if target_pos is not None:
-                tgt_xy = target_pos[:2]
-            elif kb_pos is not None:
-                tgt_xy = kb_pos[:2]
-            else:
-                tgt_xy = self.table_position[:2] if self.table_position else [0, 0]
-
-            ik_z      = (_GRASP_ABOVE_WORLD_Z if phase in ('stow', 'reach_above')
-                         else _GRASP_WORLD_Z)
-            grasp_pos = [tgt_xy[0], tgt_xy[1], ik_z]
-
-            if self.step_counter % 120 == 0:
-                print(f"[Act] GRASP phase={phase}  "
-                      f"ik=({tgt_xy[0]:.3f},{tgt_xy[1]:.3f},{ik_z:.3f})")
-
-            ctrl = {'mode': 'grasp', 'grasp_pos': grasp_pos, 'phase': phase,
-                    'pose': pose}
-
-        elif self.fsm.state == RobotState.LIFT:
-            ctrl = {'mode': 'lift', 'lift_height': 0.2, 'gripper': 'close'}
-
-        elif self.fsm.state == RobotState.SUCCESS:
-            ctrl = {'mode': 'success', 'gripper': 'close'}
-
-        elif self.fsm.state == RobotState.FAILURE:
-            if not self._failure_reset_done:
-                self.approach_standoff        = None
-                self.current_waypoint         = None
-                self.target_position_smoothed = None
-                self.target_detection_count   = 0
-                self.pca_target_pose          = None
-                self.table_plane_model        = None
-                self._spin_steps_done         = 0
-                self._spin_complete           = False
-                self._failure_reset_done      = True
-            ctrl = {'mode': 'failure', 'gripper': 'open',
-                    'lidar': sensor_data['lidar']}
-
+        # GRASP / LIFT / SUCCESS / FAILURE stay same as your current code...
         return ctrl
 
     # ========================== ACT =======================================

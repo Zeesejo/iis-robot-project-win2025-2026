@@ -36,6 +36,19 @@ def _clamp(pt):
         float(np.clip(pt[1], ROOM_BOUNDS[2], ROOM_BOUNDS[3])),
     ]
 
+def _rotate_to_local(x, y, cx, cy, yaw):
+    dx, dy = x - cx, y - cy
+    c, s = np.cos(-yaw), np.sin(-yaw)
+    return (dx * c - dy * s, dx * s + dy * c)
+
+def _inside_inflated_table(pt, table_pos, table_size, table_yaw, inflate=0.25):
+    if table_pos is None or table_size is None:
+        return False
+    yaw = table_yaw if table_yaw is not None else 0.0
+    lx, ly = _rotate_to_local(pt[0], pt[1], table_pos[0], table_pos[1], yaw)
+    half_L = table_size[0] / 2.0 + inflate
+    half_W = table_size[1] / 2.0 + inflate
+    return (abs(lx) <= half_L) and (abs(ly) <= half_W)
 
 class ActionPlanner:
     """
@@ -49,10 +62,12 @@ class ActionPlanner:
         self.goal         = None
         self.obstacles    = []
         self._table_pos   = None   # cached so clearance is table-aware
+        self._table_size = None
+        self._table_yaw  = None
 
     # ------------------------------------------------------------------ #
 
-    def create_plan(self, start_pos, goal_pos, obstacles=None):
+    def create_plan(self, start_pos, goal_pos, obstacles=None, table_pos=None, table_size=None, table_yaw=None):
         """
         Create a high-level action plan to reach the goal.
 
@@ -70,12 +85,9 @@ class ActionPlanner:
         self.goal      = goal_pos
         self.obstacles = obstacles
 
-        # Guess which obstacle is the table (largest clearance needed)
-        # – heuristic: obstacle farthest from origin is likely the table.
-        if obstacles:
-            self._table_pos = max(obstacles, key=lambda o: np.hypot(o[0], o[1]))
-        else:
-            self._table_pos = None
+        self._table_pos  = table_pos
+        self._table_size = table_size
+        self._table_yaw  = table_yaw
 
         plan = []
         if self._is_path_clear(start_pos, goal_pos):
@@ -108,23 +120,22 @@ class ActionPlanner:
     # ------------------------------------------------------------------ #
 
     def _is_path_clear(self, start, goal):
-        """
-        Check if direct path from start to goal is clear of obstacles.
-        Uses per-obstacle clearance radii.
-        """
-        if not self.obstacles:
-            return True
-
-        steps = 10
+    # Check table rectangle first
+        steps = 25
         for i in range(steps + 1):
-            t  = i / steps
+            t = i / steps
             pt = [
                 start[0] + t * (goal[0] - start[0]),
                 start[1] + t * (goal[1] - start[1]),
             ]
+
+            # table rectangle collision
+            if _inside_inflated_table(pt, self._table_pos, self._table_size, self._table_yaw, inflate=0.30):
+                return False
+
+            # small obstacles (circles)
             for obs in self.obstacles:
-                clearance = _clearance_for(obs, self._table_pos)
-                if np.hypot(pt[0] - obs[0], pt[1] - obs[1]) < clearance:
+                if np.hypot(pt[0] - obs[0], pt[1] - obs[1]) < _CLEARANCE_SMALL:
                     return False
         return True
 
@@ -142,6 +153,46 @@ class ActionPlanner:
         5. Append the original goal at the end.
         """
         waypoints = []
+
+        # If table blocks the direct path, create a bypass waypoint around the table
+        if self._table_pos is not None and self._table_size is not None:
+            # try 4 candidate bypass points around the table (inflated)
+            yaw = self._table_yaw if self._table_yaw is not None else 0.0
+            L, W = self._table_size[0], self._table_size[1]
+            inflate = 0.60  # how far outside table to go
+
+            # table local normals: +x, -x, +y, -y (local frame)
+            candidates_local = [
+                [ (L/2 + inflate), 0.0],
+                [-(L/2 + inflate), 0.0],
+                [0.0,  (W/2 + inflate)],
+                [0.0, -(W/2 + inflate)],
+            ]
+
+            c, s = np.cos(yaw), np.sin(yaw)
+            candidates = []
+            for lx, ly in candidates_local:
+                wx = self._table_pos[0] + lx * c - ly * s
+                wy = self._table_pos[1] + lx * s + ly * c
+                candidates.append([wx, wy])
+
+            # choose the candidate that is in bounds AND gives clear path start->cand and cand->goal
+            best = None
+            best_cost = float('inf')
+            for cand in candidates:
+                if not _in_bounds(cand):
+                    continue
+                if not self._is_path_clear(start, cand):
+                    continue
+                if not self._is_path_clear(cand, goal):
+                    continue
+                cost = np.hypot(cand[0]-start[0], cand[1]-start[1]) + np.hypot(goal[0]-cand[0], goal[1]-cand[1])
+                if cost < best_cost:
+                    best_cost = cost
+                    best = cand
+
+            if best is not None:
+                return [best, _clamp(goal)]
 
         mid = [(start[0] + goal[0]) / 2.0,
                (start[1] + goal[1]) / 2.0]

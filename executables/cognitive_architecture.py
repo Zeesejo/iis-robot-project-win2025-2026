@@ -81,14 +81,9 @@ class _PerceptionLogger:
             self._last = now
 
 
-# ===================== NAV CAMERA (uses getLinkState — compliant) =====================
+# ===================== NAV CAMERA =====================
 
 def get_nav_camera_image(robot_id, lidar_link):
-    """
-    Forward-looking nav camera derived from the LIDAR link world state.
-    Uses p.getLinkState (permitted). Does NOT use the forbidden
-    p.getBasePositionAndOrientation().
-    """
     link_state = p.getLinkState(robot_id, lidar_link)
     pos = np.array(link_state[0])
     orn = link_state[1]
@@ -123,48 +118,56 @@ def cam_point_to_world(cam_point, cam_pos_world, forward_vec):
             + cam_point[1] * cam_up).tolist()
 
 
+# ===================== APPROACH GOAL: stop in FRONT of table =====================
+
+def _approach_goal(robot_x, robot_y, target_x, target_y, stand_off=0.9):
+    """
+    Instead of navigating to the exact table/target centre (which puts
+    the robot nose-into-table and makes the camera overshoot the top),
+    compute a goal point that is stand_off metres away from the target
+    in the direction the robot is currently approaching from.
+    """
+    dx = target_x - robot_x
+    dy = target_y - robot_y
+    dist = np.hypot(dx, dy)
+    if dist < 1e-3:
+        return target_x, target_y
+    # Unit vector FROM target TOWARD robot
+    ux = -dx / dist
+    uy = -dy / dist
+    return target_x + ux * stand_off, target_y + uy * stand_off
+
+
 # ===================== PATH PLANNING HELPER =====================
 
-def _build_path(est_x, est_y, goal, obstacle_map_for_pf, kb):
+def _build_path(est_x, est_y, goal, obstacle_map_for_astar, kb,
+                stand_off=0.9):
     """
-    Plan an A* path from current estimated position to goal.
-    Strips the start waypoint (robot is already there).
-    Returns list of (x, y) waypoints, index reset to 0.
+    Plan an A* path from current estimated position to a stand-off point
+    in front of the goal (so robot stops before hitting the table).
     """
+    gx, gy = _approach_goal(est_x, est_y, goal[0], goal[1], stand_off)
     obs_for_path = [
         {'position': [ox, oy, 0], 'size': 0.4}
-        for ox, oy in obstacle_map_for_pf
+        for ox, oy in obstacle_map_for_astar
     ]
-    path = plan_path_prolog(
-        est_x, est_y, goal[0], goal[1], obs_for_path, kb)
-    # Drop the first waypoint — it is the robot's current position.
-    # Keeping it causes immediate arrival detection and confuses wp indexing.
+    path = plan_path_prolog(est_x, est_y, gx, gy, obs_for_path, kb)
     if len(path) > 1:
         path = path[1:]
-    print(f"[CogArch] Path planned: {len(path)} waypoints to {goal}")
+    print(f"[CogArch] Path planned: {len(path)} waypoints to approach {goal}")
     return path
 
 
 # ===================== BOUNDARY WALLS AS VIRTUAL OBSTACLES =====================
 
 def _wall_obstacles(room_half=4.8, wall_thickness=0.6, n_segments=8):
-    """
-    Return a list of obstacle dicts representing the 4 room boundary walls
-    so A* treats them as impassable.
-    room_half: half-size of the navigable area (room is 10x10, walls at ±5,
-               keep robot 0.2 m inside -> ±4.8)
-    """
     walls = []
     segment_size = (2 * room_half) / n_segments
     for i in range(n_segments):
         t = -room_half + (i + 0.5) * segment_size
-        # North wall  (y = +room_half)
         walls.append({'position': [t,  room_half, 0], 'size': wall_thickness})
-        # South wall  (y = -room_half)
         walls.append({'position': [t, -room_half, 0], 'size': wall_thickness})
-        # East wall   (x = +room_half)
         walls.append({'position': [ room_half, t, 0], 'size': wall_thickness})
-        # West wall   (x = -room_half)
         walls.append({'position': [-room_half, t, 0], 'size': wall_thickness})
     return walls
 
@@ -241,14 +244,32 @@ def main():
         dtype=np.float64
     ).reshape(4, 4).T
 
-    # ---- Obstacle map for A* (scene obstacles + boundary walls) ----
+    # ---- Obstacle map for A* (scene obstacles + table body + boundary walls) ----
     obstacle_map_for_pf = [(o['position'][0], o['position'][1])
                            for o in scene_map['obstacles']]
+
+    # Add the table itself as a large obstacle so A* routes in FRONT of it
+    table_xy = scene_map['table']['position'][:2]
+    table_obs = [{'position': [table_xy[0], table_xy[1], 0], 'size': 1.6}]
+
     # Virtual wall obstacles so A* never routes through room boundaries
     _wall_obs = _wall_obstacles(room_half=4.8, wall_thickness=0.6, n_segments=8)
     _wall_xy  = [(w['position'][0], w['position'][1]) for w in _wall_obs]
-    # PF only uses real obstacles; A* uses real + walls
-    obstacle_map_for_astar = obstacle_map_for_pf + _wall_xy
+
+    # PF only uses real scene obstacles (no table, no walls)
+    # A* uses real obstacles + table body + walls
+    obstacle_map_for_astar = (
+        obstacle_map_for_pf
+        + [(table_xy[0], table_xy[1])]
+        + _wall_xy
+    )
+    # Full obstacle list for path planning calls (with size info)
+    def _obs_list_for_path():
+        result = [{'position': [ox, oy, 0], 'size': 0.4}
+                  for ox, oy in obstacle_map_for_pf]
+        result += table_obs
+        result += [{'position': [wx, wy, 0], 'size': 0.6} for wx, wy in _wall_xy]
+        return result
 
     # ---- State variables ----
     state_est           = (init_pos[0], init_pos[1], init_theta)
@@ -256,27 +277,20 @@ def main():
     search_rotation     = init_theta
     current_waypoints   = []
     waypoint_idx        = 0
-    nav_goal            = None      # the current navigation goal (x, y)
+    nav_goal            = None      # the current navigation goal (x, y) — table/target centre
     grasp_target_pos    = None
+    grasp_target_locked = False     # once set, don't overwrite from nav cam
     lift_z              = 0.9
     step_count          = 0
     path_planned        = False
 
-    # -------------------------------------------------------------------
-    # Collision cooldown:
-    # After entering RECOVER we suppress new collision events for
-    # COLLISION_COOLDOWN steps so the robot has time to back up.
-    # This prevents the RECOVER->NAVIGATE->collision->RECOVER loop that
-    # was burning the entire simulation budget.
-    # -------------------------------------------------------------------
-    COLLISION_COOLDOWN   = 120   # ~0.5 s at 240 Hz (increased from 60)
+    COLLISION_COOLDOWN   = 120
     collision_cooldown   = 0
-
-    # RECOVER step counter — tracks steps spent in RECOVER state
-    # so we know when to leave it (replaces FSM internal _state_steps
-    # which was being reset every transition).
     recover_steps        = 0
-    RECOVER_EXIT_STEPS   = 240   # back up for 1 s then re-plan once
+    RECOVER_EXIT_STEPS   = 240
+
+    # How far in front of the table the robot stops during navigation
+    NAV_STAND_OFF        = 0.9   # metres
 
     PF_UPDATE_EVERY      = 3
     CAM_EVERY_N_STEPS    = 10
@@ -302,7 +316,6 @@ def main():
         cam_tick = (step_count % CAM_EVERY_N_STEPS == 0)
         pf_tick  = (step_count % PF_UPDATE_EVERY   == 0)
 
-        # Decrement collision cooldown each step
         if collision_cooldown > 0:
             collision_cooldown -= 1
 
@@ -328,15 +341,14 @@ def main():
         mission_event = 'tick'
         mission_data  = {}
 
-        # Collision via LIDAR — only when cooldown has expired AND not
-        # already in RECOVER (let RECOVER run its full backup duration)
+        # Collision — only outside RECOVER and when cooldown expired
         if (min(lidar) < 0.25
                 and collision_cooldown == 0
                 and fsm.state != State.RECOVER):
             collision_count += 1
             mission_event = 'collision'
 
-        # Track steps spent inside RECOVER
+        # Track steps in RECOVER
         if fsm.state == State.RECOVER:
             recover_steps += 1
         else:
@@ -351,7 +363,7 @@ def main():
             except Exception as exc:
                 perc_logger.log(exc)
 
-        # Perception on cached nav frame (SEARCH / NAVIGATE only)
+        # Perception — only in SEARCH / NAVIGATE and only if grasp not locked
         if (_nav_depth is not None
                 and mission_event == 'tick'
                 and fsm.state in (State.SEARCH, State.NAVIGATE)):
@@ -362,21 +374,35 @@ def main():
                     target_pts = detect_target(points, colors, tol=vision_tol)
                     table_pts  = detect_table(points, colors, tol=vision_tol)
 
-                    if len(target_pts) > 20:
+                    if len(target_pts) > 20 and not grasp_target_locked:
+                        # Only update grasp position while we have a clear view
+                        # (far enough from table). Once close, lock the last
+                        # good estimate so camera-clipping doesn’t wipe it.
+                        dist_to_goal = (
+                            np.hypot(est_x - nav_goal[0], est_y - nav_goal[1])
+                            if nav_goal else 999
+                        )
                         gp, _ = estimate_grasp_pose(target_pts)
                         if gp is not None:
                             w = cam_point_to_world(gp, _nav_cam_pos, _nav_forward)
                             w[2] = 0.685
                             kb.assert_target_estimate(*w)
                             grasp_target_pos = w
+                            # Lock once we’re close enough — camera starts
+                            # clipping the tabletop inside ~1.5 m
+                            if dist_to_goal < 1.5:
+                                grasp_target_locked = True
+                                print(f"[CogArch] Target locked at {w[:2]}")
+                            else:
+                                print(f"[CogArch] Target spotted at {w[:2]}")
                             nav_goal      = w[:2]
                             mission_event = 'target_found'
                             mission_data  = {'target_pos': w[:2]}
                             path_planned  = False
-                            print(f"[CogArch] Target spotted at {w[:2]}")
 
                     elif (len(table_pts) > 50
-                          and fsm.state == State.SEARCH):
+                          and fsm.state == State.SEARCH
+                          and not grasp_target_locked):
                         _, tc = fit_table_plane(points, colors, tol=vision_tol)
                         if tc is not None:
                             wt = cam_point_to_world(tc, _nav_cam_pos, _nav_forward)
@@ -389,7 +415,7 @@ def main():
             except Exception as exc:
                 perc_logger.log(exc)
 
-        # Wrist camera: ALIGN / GRASP
+        # Wrist camera: ALIGN / GRASP — fine-tune grasp position
         if (fsm.state in (State.ALIGN, State.GRASP)
                 and cam_tick
                 and _wrist_depth is not None
@@ -414,7 +440,7 @@ def main():
                             wg = cam_point_to_world(
                                 gp, np.array(cam_pos), np.array(fwd))
                             wg[2] = 0.685
-                            grasp_target_pos = wg
+                            grasp_target_pos = wg   # wrist cam always updates
                             kb.assert_target_estimate(*wg)
             except Exception as exc:
                 perc_logger.log(exc)
@@ -444,7 +470,7 @@ def main():
                 waypoint_idx += 1
                 if waypoint_idx >= len(current_waypoints):
                     mission_event = 'at_table'
-                    print("[CogArch] Reached table area.")
+                    print("[CogArch] Reached approach position.")
                 else:
                     mission_event = 'waypoint_reached'
                     print(f"[CogArch] Waypoint {waypoint_idx}/{len(current_waypoints)} reached.")
@@ -454,7 +480,7 @@ def main():
             table_pos = kb.get_table_position()
             if (table_pos
                     and np.hypot(est_x - table_pos[0],
-                                 est_y - table_pos[1]) < 0.8):
+                                 est_y - table_pos[1]) < 1.2):  # slightly larger since we stop 0.9m away
                 mission_event = 'arm_aligned'
 
         # GRASP check
@@ -471,49 +497,40 @@ def main():
             if p.getLinkState(robot_id, ee_index)[0][2] > lift_z - 0.05:
                 mission_event = 'lift_success'
 
-        # RECOVER timeout: after RECOVER_EXIT_STEPS steps in RECOVER,
-        # force-transition back to NAVIGATE and re-plan.
-        # This replaces the broken FSM internal timer which was being
-        # reset on every collision->RECOVER transition.
+        # RECOVER timeout
         if fsm.state == State.RECOVER and recover_steps >= RECOVER_EXIT_STEPS:
-            mission_event = 'recover_done'   # custom event handled below
+            mission_event = 'recover_done'
 
         # Progress log every 5 s
         if step_count % LOG_EVERY_STEPS == 0:
             print(f"[CogArch] t={step_count//240}s | state={fsm.state} "
                   f"| pos=({est_x:.2f},{est_y:.2f}) θ={np.degrees(est_theta):.1f}° "
                   f"| wp {waypoint_idx}/{len(current_waypoints)} "
-                  f"| lidar_min={min(lidar):.2f}")
+                  f"| lidar_min={min(lidar):.2f} "
+                  f"| locked={grasp_target_locked}")
 
         # ---- Drive FSM ----
-        # Handle the custom recover_done event outside the FSM so we can
-        # re-plan with wall-aware obstacle map before resuming NAVIGATE.
         if mission_event == 'recover_done':
-            # Manually force FSM to NAVIGATE
             fsm.state = State.NAVIGATE
             fsm._state_steps = 0
             recover_steps = 0
             collision_cooldown = COLLISION_COOLDOWN
-            # Re-plan from current position with full obstacle + wall map
             if nav_goal is not None:
-                # Nudge start point away from wall to help A* find a clear node
                 nudge_x = np.clip(est_x, -4.5, 4.5)
                 nudge_y = np.clip(est_y, -4.5, 4.5)
-                obs_for_path = [
-                    {'position': [ox, oy, 0], 'size': 0.4}
-                    for ox, oy in obstacle_map_for_astar
-                ]
                 path = plan_path_prolog(
-                    nudge_x, nudge_y, nav_goal[0], nav_goal[1],
-                    obs_for_path, kb)
+                    nudge_x, nudge_y,
+                    *_approach_goal(nudge_x, nudge_y,
+                                    nav_goal[0], nav_goal[1],
+                                    NAV_STAND_OFF),
+                    _obs_list_for_path(), kb)
                 if len(path) > 1:
                     path = path[1:]
                 fsm.set_waypoints(path)
                 current_waypoints = path
                 waypoint_idx = 0
                 path_planned = True
-                print(f"[CogArch] Re-planned after recovery: "
-                      f"{len(path)} waypoints")
+                print(f"[CogArch] Re-planned after recovery: {len(path)} waypoints")
             fsm_state = fsm.state
             cmd = {'cmd': 'continue_nav'}
             action = 'continue_nav'
@@ -527,18 +544,17 @@ def main():
             nav_ctrl.rotate_to(search_rotation, est_theta)
 
         elif action == 'plan_path' and not path_planned:
-            # nav_goal is set when the FSM fires table_found / target_found
             goal = nav_goal or fsm.table_position
             if goal is not None:
-                obs_for_path = [
-                    {'position': [ox, oy, 0], 'size': 0.4}
-                    for ox, oy in obstacle_map_for_astar
-                ]
+                gx, gy = _approach_goal(est_x, est_y,
+                                        goal[0], goal[1],
+                                        NAV_STAND_OFF)
                 path = plan_path_prolog(
-                    est_x, est_y, goal[0], goal[1], obs_for_path, kb)
+                    est_x, est_y, gx, gy,
+                    _obs_list_for_path(), kb)
                 if len(path) > 1:
                     path = path[1:]
-                print(f"[CogArch] Path planned: {len(path)} waypoints to {goal}")
+                print(f"[CogArch] Path planned: {len(path)} waypoints to approach {goal}")
                 fsm.set_waypoints(path)
                 current_waypoints = path
                 waypoint_idx = 0
@@ -554,9 +570,6 @@ def main():
                 nav_ctrl.drive_to(wx, wy, est_x, est_y, est_theta)
 
         elif action == 'backup':
-            # Back up and let RECOVER run for RECOVER_EXIT_STEPS.
-            # The re-plan is now handled by the recover_done handler above
-            # (NOT here) so we only re-plan once per recovery, not every step.
             p.setJointMotorControl2(robot_id, left_joint,
                                      p.VELOCITY_CONTROL,
                                      targetVelocity=-2.0, force=10.0)
@@ -573,7 +586,6 @@ def main():
                     grasp_target_pos[2] + 0.15
                 ])
             else:
-                # Keep driving toward table while waiting for target sight
                 if current_waypoints and waypoint_idx < len(current_waypoints):
                     wx, wy = current_waypoints[waypoint_idx]
                     nav_ctrl.drive_to(wx, wy, est_x, est_y, est_theta)

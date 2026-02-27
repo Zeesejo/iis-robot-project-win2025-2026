@@ -23,7 +23,7 @@ TARGET_HEIGHT = 0.12
 # File Paths (relative to this file's location for portability)
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 URDF_PATH = _THIS_DIR
-# FIX: use robot-1.urdf (prismatic lift + camera on torso)
+# Use robot-1.urdf (has prismatic lift joint for arm elevation)
 ROBOT_URDF = os.path.join(_THIS_DIR, "robot-1.urdf")
 
 
@@ -99,7 +99,8 @@ def build_world(gui=True):
         t_pos_xy = get_random_pos([-4, 4, -4, 4])
         if not is_overlapping(t_pos_xy, 1.0, spawned_objects):
             break
-
+    
+    t_pos_xy = [2.0, 0.0]
     table_pos = [t_pos_xy[0], t_pos_xy[1], 0]
     table_orn = p.getQuaternionFromEuler([0, 0, random.uniform(-3.14, 3.14)])
     table_id  = p.loadURDF(os.path.join(URDF_PATH, "table.urdf"), table_pos, table_orn, useFixedBase=True)

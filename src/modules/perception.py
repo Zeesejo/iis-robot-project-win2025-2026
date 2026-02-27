@@ -10,12 +10,12 @@ SCENE_OBJECTS = {
     'black_obs':  {'rgb': [0.0, 0.0, 0.0], 'type': 'cube',     'dims': [0.4, 0.4, 0.4]},
 }
 COLOR_RANGES_HSV = {
-    'red':    [(np.array([0,   150, 100]), np.array([10,  255, 255])),
-               (np.array([170, 150, 100]), np.array([180, 255, 255]))],
+    'red':    [(np.array([0,   100, 60]), np.array([10,  255, 255])),
+               (np.array([170, 100, 60]), np.array([180, 255, 255]))],
     'brown':  [(np.array([10,  80,  30]),  np.array([25,  180, 180]))],
     'blue':   [(np.array([100, 150, 80]),  np.array([130, 255, 255]))],
     'pink':   [(np.array([140, 60,  120]), np.array([170, 255, 255]))],
-    'orange': [(np.array([8,   220, 180]), np.array([14,  255, 255]))],
+    'orange': [(np.array([8,   150, 150]), np.array([20,  255, 255]))],
     'yellow': [(np.array([25,  150, 120]), np.array([35,  255, 255]))],
     'black':  [(np.array([0,   0,   0]),   np.array([180, 60,  40]))],
 }

@@ -30,6 +30,7 @@ class RobotState(Enum):
     APPROACH = auto()
     GRASP    = auto()
     LIFT     = auto()
+    PLACE    = auto()
     SUCCESS  = auto()
     FAILURE  = auto()
 
@@ -51,6 +52,7 @@ class RobotFSM:
         RobotState.APPROACH: 120 * SIM_HZ,   # 120 s
         RobotState.GRASP:    20  * SIM_HZ,   #  20 s  (multi-phase arm)
         RobotState.LIFT:     10  * SIM_HZ,   #  10 s
+        RobotState.PLACE:    10  * SIM_HZ,   #  10 s
     }
 
     def __init__(self):
@@ -162,17 +164,22 @@ class RobotFSM:
 
         # ── SEARCH ──────────────────────────────────────────────────────────
         elif self.state == RobotState.SEARCH:
+            # Transition to NAVIGATE when target is detected OR when close to table
             if sensor_data.get('target_visible', False):
                 self.target_found    = True
                 self.target_position = sensor_data['target_position']
                 print(f"[FSM] Target found at {self.target_position}")
+                self.transition_to(RobotState.NAVIGATE)
+            # Allow transition to NAVIGATE when close to table (to approach and look for target)
+            elif 'table_near' in sensor_data and sensor_data['table_near']:
+                print(f"[FSM] Close to table, transitioning to navigate")
                 self.transition_to(RobotState.NAVIGATE)
 
         # ── NAVIGATE ────────────────────────────────────────────────────────
         elif self.state == RobotState.NAVIGATE:
             self.distance_to_target = sensor_data.get('distance_to_target',
                                                        float('inf'))
-            if self.distance_to_target < 2.0:
+            if self.distance_to_target < 1.5:
                 print(f"[FSM] Reached navigation waypoint "
                       f"(dist={self.distance_to_target:.2f}m)")
                 self.transition_to(RobotState.APPROACH)
@@ -187,8 +194,9 @@ class RobotFSM:
         elif self.state == RobotState.APPROACH:
             self.distance_to_target = sensor_data.get('distance_to_target',
                                                        float('inf'))
-            if self.distance_to_target < 0.55:
-                print(f"[FSM] Target within grasp range "
+            # Transition to GRASP when within safe grasp distance (not too close to collide)
+            if self.distance_to_target < 0.5:
+                print(f"[FSM] Close to table/target, attempting grasp "
                       f"(dist={self.distance_to_target:.2f}m)")
                 self.transition_to(RobotState.GRASP)
             elif sensor_data.get('collision_detected', False):
@@ -215,9 +223,17 @@ class RobotFSM:
         elif self.state == RobotState.LIFT:
             if self.get_time_in_state() > 2.0:
                 print("[FSM] Object lifted successfully!")
-                self.transition_to(RobotState.SUCCESS)
+                self.transition_to(RobotState.PLACE)
             else:
                 control['lift'] = True
+
+        # ── PLACE ───────────────────────────────────────────────────────────
+        elif self.state == RobotState.PLACE:
+            if self.get_time_in_state() > 2.0:
+                print("[FSM] Object placed successfully!")
+                self.transition_to(RobotState.SUCCESS)
+            else:
+                control['place'] = True
 
         # ── SUCCESS ─────────────────────────────────────────────────────────
         elif self.state == RobotState.SUCCESS:

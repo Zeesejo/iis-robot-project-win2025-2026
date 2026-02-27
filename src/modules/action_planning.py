@@ -236,32 +236,67 @@ class GraspPlanner:
     """
 
     def __init__(self):
-        self.grasp_offset = [0, 0, 0.15]
+        self.grasp_offset = [0, 0, 0.20]  # Increased from 0.15 to 0.20 for safer approach
         self.grasp_height = 0.05
+        # Cylinder dimensions from task spec: r=0.04m, h=0.12m
+        self.cylinder_radius = 0.04
+        self.cylinder_height = 0.12
 
     def plan_grasp(self, object_pos, object_type='cylinder'):
         """
         Plan a grasp for the target object.
 
         Args:
-            object_pos:  Position [x, y, z] of object
+            object_pos:  Position [x, y, z] of object (center position)
             object_type: Type of object ('cylinder', 'cube', etc.)
 
         Returns:
             Dict with 'approach_pos' and 'grasp_pos'
         """
         import numpy as _np
+        
+        # Calculate grasp position
+        # The object_pos is the center of the cylinder (z is at center height)
+        # Cylinder sits on table at z=0.625, cylinder height=0.12, so center=0.685
+        # We need to grasp from the side at the middle height of the cylinder
+        
+        # Use the detected object position height
+        # If detected height seems wrong, use the known cylinder center height
+        detected_z = object_pos[2]
+        
+        # The cylinder center is at TABLE_SURFACE_Z (0.625) + CYLINDER_HEIGHT/2 (0.06) = 0.685
+        # But the gripper needs to go below center to get a good grasp
+        # Gripper fingers are at gripper_base + some offset
+        # We'll position the gripper slightly below the cylinder center
+        grasp_z = max(detected_z - 0.02, 0.65)  # Slightly below center, min 0.65m (above table)
+        
+        # Approach position: higher up to avoid table collision
+        # The table surface is at z=0.625, so we need to approach from above
+        approach_z = grasp_z + 0.15  # 15cm above grasp point
+        
         grasp_plan = {}
+        # Approach position: above the grasp position
         grasp_plan['approach_pos'] = [
             object_pos[0],
             object_pos[1],
-            object_pos[2] + self.grasp_offset[2],
+            approach_z,
         ]
+        # Grasp position: at the middle height of the cylinder for picking it up
         grasp_plan['grasp_pos'] = [
             object_pos[0],
             object_pos[1],
-            object_pos[2],
+            grasp_z,  # Slightly below center for stable grasp
         ]
+        # Place position: above the original position to place the cylinder back on the table
+        # Lift it up slightly above the original position, then release
+        place_z = max(detected_z + 0.15, 0.75)  # Lift 15cm above, min 0.75m
+        grasp_plan['place_pos'] = [
+            object_pos[0],
+            object_pos[1],
+            place_z,  # Above the original position to release
+        ]
+        # Orientation: gripper parallel to ground (horizontal grasp)
+        # Gripper should be horizontal to grasp the cylinder from the side
         grasp_plan['orientation'] = [0, _np.pi / 2, 0]
         return grasp_plan
 

@@ -25,6 +25,11 @@ FIXES in this revision
   [F15] A) Red HSV S>=100/V>=60 for long-range detection.
         B) Orbit direction picks the side that faces origin (robot start),
            radius reduced 2.0->1.5 m for better small-cylinder visibility.
+  [F16] FIX #1: NAVIGATE uses _compute_approach_standoff() instead of
+        hardcoded +0.5 X offset so approach is correct for any table rotation.
+  [F17] FIX #2: Grasp IK target converted from world-frame to robot-local
+        frame so arm can actually reach the cylinder.
+  [F18] FIX #4: _perception_interval raised 10->30 to reduce CPU stall.
 """
 
 import pybullet as p
@@ -122,7 +127,9 @@ class CognitiveArchitecture:
         self.sensor_camera_id, self.sensor_lidar_id = get_sensor_id(self.robot_id)
         #M4 — PerceptionModule (RANSAC + PCA + colour detection)
         self.perception = PerceptionModule()
-        self._perception_interval = 10 # run full pipeline every 10 sim steps
+        # [F18] FIX #4: Raised from 10 to 30 to reduce per-frame CPU cost.
+        # Full PCA+RANSAC pipeline every ~125 ms is still plenty for this task.
+        self._perception_interval = 30
 
         self.fsm            = RobotFSM()
         self.action_planner = get_action_planner()
@@ -434,7 +441,7 @@ class CognitiveArchitecture:
         Returns sensor_data dict for use in THINK phase.
         M4 integration:
           - Every _perception_interval steps, run PerceptionModule.process_frame()
-            which executes: colour detection → RANSAC (table plane) → PCA (poses)
+            which executes: colour detection -> RANSAC (table plane) -> PCA (poses)
           - Target 3-D position is taken from the PCA centre of the red ROI
             (not a single-pixel depth sample)
           - Obstacle poses from PCA are pushed back into KB and self.obstacles
@@ -474,7 +481,7 @@ class CognitiveArchitecture:
                                 float(estimated_pose[0]), 
                                 float(estimated_pose[1]), 0.0)
         
-        # M4: Full perception pipeline — colour detection + RANSAC + PCA
+        # M4: Full perception pipeline - colour detection + RANSAC + PCA
         if rgb is not None and depth is not None \
                 and self.step_counter % self._perception_interval == 0:
 
@@ -536,8 +543,8 @@ class CognitiveArchitecture:
                         self.target_position = list(self.target_position_smoothed)
                         self.kb.add_position('target', *self.target_position)
                         print(f"[M4-PCA] TARGET world=({world_x:.2f},{world_y:.2f},{world_z:.2f}) "
-                            f"depth={cam_z:.2f}m bearing={math.degrees(self.target_camera_bearing):.1f}°")
-            # Fallback: PCA failed but colour visible — update bearing from bbox only
+                            f"depth={cam_z:.2f}m bearing={math.degrees(self.target_camera_bearing):.1f}deg")
+            # Fallback: PCA failed but colour visible - update bearing from bbox only
             elif perc['detections']:
                 red_dets = [d for d in perc['detections'] if d['color'] == 'red']
                 if red_dets:
@@ -548,7 +555,7 @@ class CognitiveArchitecture:
                     fx = fy * (320 / 240)
                     self.target_camera_bearing = math.atan2(px - 160.0, fx)
 
-            # --- 4. Obstacle poses from PCA → KB + obstacle map update ---
+            # --- 4. Obstacle poses from PCA -> KB + obstacle map update ---
             for obs in perc['obstacle_poses']:
                 cam_x, cam_y, cam_z = obs['center']
                 if cam_z < DEPTH_NEAR or cam_z > DEPTH_FAR:
@@ -729,42 +736,28 @@ class CognitiveArchitecture:
                 print(f"[Think] NAVIGATE: target_pos={target_pos is not None}, "
                       f"approach_standoff={self.approach_standoff}")
             
-            
             cam_d       = sensor_data.get('target_camera_depth', float('inf'))
             use_relaxed = cam_d < 2.5 and sensor_data['target_detected']
-            
-            # CRITICAL FIX: Immediately go to table when available, then find cylinder
-            # The robot should go to the table first, then detect and grasp the cylinder
-            if self.table_position:
-                table_dist = np.hypot(self.table_position[0]-pose[0], self.table_position[1]-pose[1])
-                
-                # Phase 1: Go directly to table (don't wait for target detection)
-                # Go to a position near the table where we can see the cylinder
-                if table_dist > 1.2:
-                    # Navigate directly to table with offset for visibility
-                    # Position slightly in front of table center
-                    nav_goal = [
-                        self.table_position[0] + 0.5,  # Slight offset from table center
-                        self.table_position[1],
-                    ]
+
+            # [F16] FIX #1: Use _compute_approach_standoff() so the nav goal is
+            # always on the correct face of the table regardless of its yaw.
+            # Old code used a hardcoded +0.5 X offset which only worked when the
+            # table happened to face +X.
+            if self.approach_standoff is None:
+                ref = target_pos if target_pos else self.table_position
+                if ref is not None:
+                    self.approach_standoff = self._compute_approach_standoff(ref, pose)
                     if self.step_counter % 240 == 0:
-                        print(f"[Think] NAVIGATE: Going directly to TABLE (dist={table_dist:.2f}m)")
-                
-                # Phase 2: At/near table - transition to APPROACH to find and grasp cylinder
-                else:
-                    # We're close to table, now find and grasp the cylinder
-                    if self.step_counter % 240 == 0:
-                        print(f"[Think] NAVIGATE: Arrived at table (dist={table_dist:.2f}m), transitioning to APPROACH")
-                    # Force transition to APPROACH to execute grasp
-                    self.fsm.transition_to(RobotState.APPROACH)
-                    nav_goal = None  # Will be set in APPROACH state
-            elif target_pos:
-                # No table info - go directly to target
+                        print(f"[F16] Computed standoff: {self.approach_standoff}")
+
+            nav_goal = self.approach_standoff
+
+            # Fallback: if standoff computation failed, head directly to table
+            if nav_goal is None and self.table_position is not None:
+                nav_goal = self.table_position[:2]
+            elif nav_goal is None and target_pos is not None:
                 nav_goal = target_pos[:2]
-            else:
-                # Nothing - can't navigate
-                nav_goal = None
-             
+
             if nav_goal and self.current_waypoint is None:
                 self.action_planner.create_plan(pose[:2], nav_goal, self.obstacles)
                 self.current_waypoint = self.action_planner.get_next_waypoint()
@@ -773,7 +766,7 @@ class CognitiveArchitecture:
                         'pose': pose, 'lidar': sensor_data['lidar'],
                         'relaxed_avoidance': use_relaxed}
                 if np.hypot(self.current_waypoint[0]-pose[0],
-                            self.current_waypoint[1]-pose[1]) < 0.2:  # Reduced from 0.3
+                            self.current_waypoint[1]-pose[1]) < 0.2:
                     self.action_planner.advance_waypoint()
                     self.current_waypoint = self.action_planner.get_next_waypoint()
 
@@ -803,7 +796,7 @@ class CognitiveArchitecture:
                         approach_target = [pose[0] + 0.3 * math.cos(cam_bearing + pose[2]),
                                            pose[1] + 0.3 * math.sin(cam_bearing + pose[2])]
                     if self.step_counter % 120 == 0:
-                        print(f"[Think] APPROACH: Target detected via camera, bearing={np.degrees(cam_bearing):.1f}°")
+                        print(f"[Think] APPROACH: Target detected via camera, bearing={np.degrees(cam_bearing):.1f}deg")
                 else:
                     # Target not visible - slowly rotate to find it
                     if self.step_counter % 120 == 0:
@@ -869,10 +862,6 @@ class CognitiveArchitecture:
                 gp    = self.grasp_planner.plan_grasp(grasp_target)
                 gt    = self.fsm.get_time_in_state()
                 
-                # More generous timing for each phase to ensure proper execution
-                # Phase 1: reach_above - move arm above object (0-3 seconds)
-                # Phase 2: reach_target - move down to grasp position (3-7 seconds)  
-                # Phase 3: close_gripper - close gripper and verify grasp (7+ seconds)
                 phase = ('reach_above'  if gt < 3.0 else
                          'reach_target' if gt < 7.0 else
                          'close_gripper')
@@ -881,7 +870,8 @@ class CognitiveArchitecture:
                         'approach_pos': gp['approach_pos'],
                         'grasp_pos':    gp['grasp_pos'],
                         'orientation':  gp['orientation'],
-                        'phase':        phase}
+                        'phase':        phase,
+                        'robot_pose':   pose}  # [F17] pass pose for local-frame IK
                 if self.step_counter % 60 == 0:
                     print(f"[Think] GRASP: phase={phase}, time={gt:.1f}s, target={grasp_target[:2]}")
             else:
@@ -929,15 +919,38 @@ class CognitiveArchitecture:
             p.setJointMotorControl2(self.robot_id, j, p.POSITION_CONTROL,
                                     targetPosition=0.0, force=500, maxVelocity=2.0)
 
-    def _execute_arm_ik(self, target_pos, target_orn):
+    def _execute_arm_ik(self, target_world_pos, target_orn, robot_pose=None):
         """
         Execute inverse kinematics to move arm to target position.
+
+        [F17] FIX #2: Convert world-frame target into robot-local frame before
+        calling PyBullet IK.  The old code passed raw world coordinates
+        (e.g. [2.3, -1.1, 0.685]) which are meaningless to PyBullet's IK
+        solver because IK expects a position relative to the robot base.
+        We subtract the robot's XY position and rotate by -theta so IK
+        receives a body-frame position it can actually reach.
+
         Returns True if IK solution found, False otherwise.
         """
         if not self.arm_joints:
             print("[IK] No arm joints configured")
             return False
-        
+
+        # --- [F17] World -> robot-local frame conversion --------------------
+        if robot_pose is not None:
+            rx, ry, rtheta = robot_pose[0], robot_pose[1], robot_pose[2]
+            dx = target_world_pos[0] - rx
+            dy = target_world_pos[1] - ry
+            dz = target_world_pos[2]   # Z stays the same (world-up)
+            cos_t = math.cos(-rtheta)
+            sin_t = math.sin(-rtheta)
+            local_x = cos_t * dx - sin_t * dy
+            local_y = sin_t * dx + cos_t * dy
+            ik_target = [local_x, local_y, dz]
+        else:
+            ik_target = list(target_world_pos)
+        # --------------------------------------------------------------------
+
         # Find gripper base link index for IK
         gripper_link_idx = -1
         for i in range(p.getNumJoints(self.robot_id)):
@@ -951,11 +964,11 @@ class CognitiveArchitecture:
             gripper_link_idx = self.arm_joints[-1]
         
         try:
-            # Calculate IK solution
+            # Calculate IK solution using robot-local target
             ik_solution = p.calculateInverseKinematics(
                 self.robot_id,
                 gripper_link_idx,
-                target_pos,
+                ik_target,
                 targetOrientation=target_orn,
                 maxNumIterations=100,
                 residualThreshold=0.001
@@ -1067,8 +1080,8 @@ class CognitiveArchitecture:
             dist   = np.hypot(dx, dy)
             he     = math.atan2(dy, dx) - pose[2]
             he     = math.atan2(math.sin(he), math.cos(he))
-            fv     = min(5.0, 3.0*dist)  # Increased from 3.0/2.0
-            av     = 5.0*he  # Increased from 4.0
+            fv     = min(5.0, 3.0*dist)
+            av     = 5.0*he
             fv, at = self._lidar_avoidance(lidar, fv, pose=pose)
             av    += at
             if self.step_counter % 240 == 0:
@@ -1082,19 +1095,11 @@ class CognitiveArchitecture:
             lidar     = ctrl.get('lidar')
             dx, dy    = pose[0]-tp[0], pose[1]-tp[1]
             cur_r     = np.hypot(dx, dy)
-            ang_ft    = math.atan2(dy, dx)   # angle from table to robot
+            ang_ft    = math.atan2(dy, dx)
 
-            # [F15-B] Choose orbit direction so the robot sweeps the face of
-            # the table that is visible from the origin (robot start point).
-            # The face toward origin has angle = atan2(-tp[1], -tp[0]).
-            # We pick the tangent direction (CW or CCW) that moves the robot
-            # toward that face rather than away from it.
-            origin_angle = math.atan2(-tp[1], -tp[0])  # dir from table to origin
-            # CCW tangent at robot's current angle:
+            origin_angle = math.atan2(-tp[1], -tp[0])
             ccw_tangent = ang_ft + math.pi / 2
-            # CW tangent:
             cw_tangent  = ang_ft - math.pi / 2
-            # Pick whichever tangent direction is closer to origin_angle
             def _ang_diff(a, b):
                 return math.atan2(math.sin(a - b), math.cos(a - b))
             use_ccw = abs(_ang_diff(ccw_tangent, origin_angle)) < \
@@ -1105,8 +1110,8 @@ class CognitiveArchitecture:
             desired = tangent + 0.5 * rerr
             he      = math.atan2(math.sin(desired - pose[2]),
                                  math.cos(desired - pose[2]))
-            fv      = 3.0  # Increased from 2.0
-            av      = 5.0 * he  # Increased from 4.0
+            fv      = 3.0
+            av      = 5.0 * he
             fv, at  = self._lidar_avoidance(lidar, fv, pose=pose)
             av     += at
             if self.step_counter % 240 == 0:
@@ -1151,7 +1156,6 @@ class CognitiveArchitecture:
             else:
                 he = ctrl.get('camera_bearing', 0.0)
 
-            # More aggressive approach - get closer to the target
             if sd > APPROACH_SLOW_M:
                 fv = np.clip(5.0 * (sd - APPROACH_STOP_M), MIN_FWD_APPROACH, 5.0)
             elif sd > APPROACH_STOP_M:
@@ -1160,7 +1164,6 @@ class CognitiveArchitecture:
             else:
                 fv = 0.0
 
-            # If very close, stop and let FSM transition to GRASP
             if sd < 0.5:
                 fv = 0.0
 
@@ -1185,102 +1188,63 @@ class CognitiveArchitecture:
 
         elif mode == 'grasp':
             self._set_wheels(0, 0)
-            phase = ctrl.get('phase', 'close_gripper')
-            ap    = ctrl['approach_pos']
-            gpos  = ctrl['grasp_pos']
-            orn   = p.getQuaternionFromEuler(ctrl['orientation'])
-            
-            # Execute proper grasp sequence with timing
-            # Phase 1: Move to approach position (above object)
-            # Phase 2: Move down to grasp position
-            # Phase 3: Close gripper to grasp
-            # Phase 4: Lift slightly to verify grasp
-            
+            phase       = ctrl.get('phase', 'close_gripper')
+            ap          = ctrl['approach_pos']
+            gpos        = ctrl['grasp_pos']
+            orn         = p.getQuaternionFromEuler(ctrl['orientation'])
+            robot_pose  = ctrl.get('robot_pose')  # [F17] needed for local-frame IK
+
             if phase == 'reach_above':
-                # Move arm to approach position (above the object)
-                target_pos = ap
-                # Use IK to move to approach position
-                ik_success = self._execute_arm_ik(target_pos, orn)
+                ik_success = self._execute_arm_ik(ap, orn, robot_pose)
                 if self.step_counter % 120 == 0:
-                    print(f"[Act] GRASP: Moving to approach position {target_pos}")
-                    
+                    print(f"[Act] GRASP reach_above -> local IK target computed from world {ap}")
+
             elif phase == 'reach_target':
-                # Move arm down to grasp position (at object level)
-                target_pos = gpos
-                ik_success = self._execute_arm_ik(target_pos, orn)
+                ik_success = self._execute_arm_ik(gpos, orn, robot_pose)
                 if self.step_counter % 120 == 0:
-                    print(f"[Act] GRASP: Moving to grasp position {target_pos}")
-                    
+                    print(f"[Act] GRASP reach_target -> local IK target computed from world {gpos}")
+
             elif phase == 'close_gripper':
-                # Close gripper to grasp the object
                 self._set_wheels(0, 0)
-                
-                # First move to grasp position
-                ik_success = self._execute_arm_ik(gpos, orn)
-                
-                # Close gripper fingers - move toward center to grasp
+                ik_success = self._execute_arm_ik(gpos, orn, robot_pose)
                 self._close_gripper()
-                
-                # Brief pause to ensure gripper closes
                 if self.step_counter % 60 == 0:
                     print(f"[Act] GRASP: Closing gripper to grasp object")
-            
-            # Store grasp success for FSM
+
             self._last_grasp_attempt = True
 
         elif mode == 'lift':
             self._set_wheels(0, 0)
-            
-            # Keep gripper closed while lifting
             self._close_gripper()
-            
-            # Move arm joints to lift position (raise the arm while keeping gripper closed)
-            # First, hold the gripper closed at the current position, then move the arm up
             if self.lift_joint_idx is not None:
-                # Use lift joint to raise the arm
                 p.setJointMotorControl2(self.robot_id, self.lift_joint_idx,
                                         p.POSITION_CONTROL,
                                         targetPosition=0.3, force=100,
                                         maxVelocity=0.5)
-            
-            # Also move arm joints slightly to help lift - keep them at current position
             for j in self.arm_joints:
-                # Get current position and hold it (helps maintain grasp)
                 current_pos = p.getJointState(self.robot_id, j)[0]
                 p.setJointMotorControl2(self.robot_id, j, p.POSITION_CONTROL,
                                         targetPosition=current_pos, force=200,
                                         maxVelocity=0.3)
-            
             if self.step_counter % 120 == 0:
                 print("[Act] LIFT: raising object with gripper closed")
 
         elif mode == 'place':
             self._set_wheels(0, 0)
-            
-            # Keep gripper closed while moving to place position
             self._close_gripper()
-            
-            # Move arm to place position (above the original position)
             place_pos = ctrl.get('place_pos')
             orientation = ctrl.get('orientation', [0, 1.57, 0])
             orn = p.getQuaternionFromEuler(orientation)
-            
             if place_pos:
-                # Move to place position (slightly above original)
                 self._execute_arm_ik(place_pos, orn)
-                
                 if self.step_counter % 120 == 0:
                     print(f"[Act] PLACE: Moving to place position {place_pos}")
-                
-                # After a brief pause, open gripper to release
                 time_in_state = self.fsm.get_time_in_state()
                 if time_in_state > 0.5:
-                    # Open gripper to release the object back on the table
                     self._open_gripper()
                     if self.step_counter % 60 == 0:
                         print("[Act] PLACE: Opening gripper to release object back on table")
             else:
-                # No place position - just open gripper
                 self._open_gripper()
 
         elif mode in ('idle', 'success', 'failure'):

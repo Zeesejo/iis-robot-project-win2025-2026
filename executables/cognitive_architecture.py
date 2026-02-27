@@ -79,7 +79,6 @@ def get_nav_camera_image(robot_id, lidar_link):
 
 
 def cam_to_world(cp, cam_pos, fwd):
-    """Map a camera-frame point to world frame."""
     fwd   = np.array(fwd)
     right = np.cross(fwd, [0, 0, 1])
     n     = np.linalg.norm(right)
@@ -97,7 +96,10 @@ def approach_goal(rx, ry, tx, ty, stand_off=0.6):
     return tx - dx/d * stand_off, ty - dy/d * stand_off
 
 
-def wall_obstacles(room_half=3.8, thickness=0.8, n=6):
+def wall_obstacles(room_half=5.0, thickness=0.5, n=8):
+    """Virtual wall blockers so A* stays inside the room.
+    room_half=5.0 is safely larger than any spawn/table position.
+    """
     walls, seg = [], 2 * room_half / n
     for i in range(n):
         t = -room_half + (i + 0.5) * seg
@@ -118,11 +120,12 @@ def stop_wheels(robot_id, left_joint, right_joint):
 
 
 def plan_to_table(est_x, est_y, table_xy, obs_list, kb, stand_off=0.6):
-    """Plan a path from current pos to stand_off metres from the table."""
+    """Plan an A* path from current pos to stand_off metres from the table."""
     gx, gy = approach_goal(est_x, est_y, table_xy[0], table_xy[1], stand_off)
-    path = plan_path_prolog(est_x, est_y, gx, gy, obs_list, kb)
+    path   = plan_path_prolog(est_x, est_y, gx, gy, obs_list, kb)
+    # Drop the start node (robot is already there)
     if len(path) > 1:
-        path = path[1:]   # drop start node
+        path = path[1:]
     return path
 
 
@@ -174,7 +177,6 @@ def main():
     arm_ctrl = ArmController(robot_id, ee_index, arm_joints)
 
     fsm = MissionFSM()
-    # BUG1-FIX: always use KB exact table position as navigation goal
     kb_table_xy = list(scene_map['table']['position'][:2])
     fsm.table_position = kb_table_xy
 
@@ -187,9 +189,10 @@ def main():
 
     # Obstacle lists for A*
     obs_pf    = [(o['position'][0], o['position'][1]) for o in scene_map['obstacles']]
-    # BUG5-FIX: table obstacle size 0.9 so approach point (0.6 standoff) is reachable
+    # Table as a 0.9 m blocker so approach point at 0.6 m standoff is reachable
     table_obs = [{'position': [kb_table_xy[0], kb_table_xy[1], 0], 'size': 0.9}]
-    _walls    = wall_obstacles(room_half=3.8, thickness=0.8, n=6)
+    # Walls at room_half=5.0 so robot spawn near walls is never inside a blocker
+    _walls    = wall_obstacles(room_half=5.0, thickness=0.5, n=8)
 
     def obs_for_path():
         r  = [{'position': [ox, oy, 0], 'size': 0.55} for ox, oy in obs_pf]
@@ -200,10 +203,10 @@ def main():
     # ---- Constants ----
     COLLISION_DIST      = 0.15
     COLLISION_COOLDOWN  = 240
-    WP_ARRIVE           = 0.55
-    WP_TIMEOUT          = 240 * 12   # 12 s per waypoint
-    STAND_OFF           = 0.6        # BUG2-FIX: 0.6 m standoff (was 0.85)
-    ALIGN_CLOSE_ENOUGH  = 1.0        # must be within 1.0 m of table to GRASP
+    WP_ARRIVE           = 0.50
+    WP_TIMEOUT          = 240 * 15   # 15 s per waypoint
+    STAND_OFF           = 0.6
+    ALIGN_CLOSE_ENOUGH  = 1.0
     PF_EVERY            = 3
     CAM_EVERY           = 10
     LOG_EVERY           = 240 * 5
@@ -211,8 +214,8 @@ def main():
     RECOVER_DRIVE_BACK  = 120
     RECOVER_HOLD        = 60
     RECOVER_TOTAL       = RECOVER_DRIVE_BACK + RECOVER_HOLD
-    GRASP_SUCCESS_DIST  = 0.15       # BUG12-FIX: was 0.08
-    LIFT_Z              = 0.72       # BUG11-FIX: just above table surface
+    GRASP_SUCCESS_DIST  = 0.15
+    LIFT_Z              = 0.72
     LIFT_SUCCESS_MARGIN = 0.12
 
     # ---- Runtime state ----
@@ -221,18 +224,18 @@ def main():
     current_waypoints   = []
     waypoint_idx        = 0
     waypoint_steps      = 0
-    # BUG1-FIX: nav_goal always points to KB table, never raw camera
     nav_goal            = kb_table_xy[:]
     grasp_target_pos    = None
     grasp_target_locked = False
     step_count          = 0
     path_planned        = False
     collision_cooldown  = 0
-    # BUG8-FIX: recover_steps only reset on RECOVER entry, not every non-RECOVER step
     recover_steps       = 0
     in_recover_prev     = False
     search_steps        = 0
     align_too_far_steps = 0
+    # BUG-B-FIX: flag so post-recover replan fires only once, not every tick
+    recover_replan_done = False
 
     _nav_rgb = _nav_depth = _nav_cam_pos = _nav_fwd = _nav_view = None
     _w_rgb   = _w_depth   = None
@@ -262,15 +265,16 @@ def main():
             pf.update(lidar, obs_pf)
             pf.resample()
 
-        # Ground-truth position for control
         gt_pos, gt_orn = p.getBasePositionAndOrientation(robot_id)
         est_x, est_y   = gt_pos[0], gt_pos[1]
         est_theta       = p.getEulerFromQuaternion(gt_orn)[2]
 
-        # BUG8-FIX: track recover entry to reset counter once on entry
+        # ---- Track RECOVER entry/exit ----
         in_recover_now = (fsm.state == State.RECOVER)
         if in_recover_now and not in_recover_prev:
-            recover_steps = 0   # reset only on entry
+            # Just entered RECOVER
+            recover_steps       = 0
+            recover_replan_done = False
         if in_recover_now:
             recover_steps += 1
         in_recover_prev = in_recover_now
@@ -279,7 +283,7 @@ def main():
         mission_event = 'tick'
         mission_data  = {}
 
-        # Collision: only in NAVIGATE, only when very close, with cooldown
+        # Collision detection
         if (min(lidar) < COLLISION_DIST
                 and collision_cooldown == 0
                 and fsm.state == State.NAVIGATE):
@@ -287,7 +291,7 @@ def main():
             collision_cooldown = COLLISION_COOLDOWN
             mission_event      = 'collision'
 
-        # Camera: update nav-camera every CAM_EVERY steps
+        # Nav camera update
         if cam_tick:
             try:
                 _nav_rgb, _nav_depth, _nav_cam_pos, _nav_fwd, _nav_view = \
@@ -296,8 +300,6 @@ def main():
                 perc_logger.log(e)
 
         # ---- Perception: SEARCH / NAVIGATE ----
-        # BUG7-FIX: table_found uses KB position, not noisy cam_to_world
-        # Camera detection only refines grasp_target_pos (for arm IK)
         if (_nav_depth is not None
                 and mission_event == 'tick'
                 and fsm.state in (State.SEARCH, State.NAVIGATE)):
@@ -308,7 +310,6 @@ def main():
                     tgt_pts   = detect_target(pts, cols, tol=vision_tol)
                     table_pts = detect_table(pts, cols, tol=vision_tol)
 
-                    # Target object detected -> refine grasp_target_pos only
                     if len(tgt_pts) > 20 and not grasp_target_locked:
                         gp, _ = estimate_grasp_pose(tgt_pts)
                         if gp is not None:
@@ -325,18 +326,14 @@ def main():
                                 print(f"[CogArch] Target LOCKED {w[:2]}")
                             else:
                                 print(f"[CogArch] Target spotted {w[:2]}")
-                        # BUG1-FIX: nav_goal stays as KB table, not camera estimate
-                        # Only fire target_found if we haven't started navigating yet
                         if fsm.state == State.SEARCH:
                             mission_event = 'target_found'
                             mission_data  = {'target_pos': kb_table_xy}
                             path_planned  = False
 
-                    # Table detected in SEARCH -> use KB position for navigation
                     elif (len(table_pts) > 50
                           and fsm.state == State.SEARCH
                           and not grasp_target_locked):
-                        # BUG7-FIX: ignore noisy cam estimate, use KB exact position
                         mission_event = 'table_found'
                         mission_data  = {'table_pos': kb_table_xy}
                         path_planned  = False
@@ -372,7 +369,7 @@ def main():
             except Exception as e:
                 perc_logger.log(e)
 
-        # ---- SEARCH timeout -> KB table fallback ----
+        # ---- SEARCH timeout ----
         if fsm.state == State.SEARCH and mission_event == 'tick':
             search_steps += 1
             if search_steps >= SEARCH_TIMEOUT:
@@ -384,7 +381,7 @@ def main():
         elif fsm.state != State.SEARCH:
             search_steps = 0
 
-        # ---- Waypoint arrival check ----
+        # ---- Waypoint arrival ----
         if (fsm.state == State.NAVIGATE
                 and current_waypoints
                 and waypoint_idx < len(current_waypoints)
@@ -404,36 +401,29 @@ def main():
                 else:
                     mission_event = 'waypoint_reached'
 
-        # ---- BUG3-FIX: ALIGN state ----
-        # If too far from table, go back to NAVIGATE with fresh plan
-        # If close enough, fire arm_aligned and set grasp target
+        # ---- ALIGN: check proximity, re-nav if too far ----
         if fsm.state == State.ALIGN and mission_event == 'tick':
             dist_to_table = np.hypot(
                 est_x - kb_table_xy[0], est_y - kb_table_xy[1]
             )
             if dist_to_table > ALIGN_CLOSE_ENOUGH:
-                # Too far — re-navigate to table
                 align_too_far_steps += 1
-                if align_too_far_steps >= 10:  # debounce 10 steps
+                if align_too_far_steps >= 10:
                     align_too_far_steps = 0
                     print(f"[CogArch] ALIGN too far ({dist_to_table:.2f}m) -> re-nav")
                     path = plan_to_table(
                         est_x, est_y, kb_table_xy, obs_for_path(), kb, STAND_OFF
                     )
+                    print(f"[CogArch] Re-nav path: {len(path)} wps")
                     fsm.set_waypoints(path)
                     current_waypoints = path
                     waypoint_idx      = 0
                     waypoint_steps    = 0
                     path_planned      = True
-                    # Force FSM back to NAVIGATE
                     fsm.state         = State.NAVIGATE
                     fsm._state_steps  = 0
-                    # BUG10-FIX: reset path_planned=False so next plan_path fires
-                    path_planned      = True  # already planned above
-                    mission_event     = 'tick'
                     cmd               = {'cmd': 'continue_nav'}
             else:
-                # Close enough — prepare grasp target and fire arm_aligned
                 align_too_far_steps = 0
                 if grasp_target_pos is None:
                     grasp_target_pos = [kb_table_xy[0], kb_table_xy[1], 0.685]
@@ -447,23 +437,23 @@ def main():
                 and grasp_target_pos
                 and mission_event == 'tick'):
             ee = np.array(p.getLinkState(robot_id, ee_index)[0])
-            # BUG12-FIX: raised threshold to 0.15 m
             if np.linalg.norm(ee - np.array(grasp_target_pos)) < GRASP_SUCCESS_DIST:
                 mission_event = 'grasp_success'
 
         # ---- LIFT success check ----
         if fsm.state == State.LIFT and mission_event == 'tick':
-            # BUG11-FIX: lift_z=0.72, success margin=0.12
             if p.getLinkState(robot_id, ee_index)[0][2] > LIFT_Z - LIFT_SUCCESS_MARGIN:
                 mission_event = 'lift_success'
 
-        # ---- RECOVER timeout ----
-        if fsm.state == State.RECOVER and recover_steps >= RECOVER_TOTAL:
-            fsm.state        = State.NAVIGATE
-            fsm._state_steps = 0
-            # BUG10-FIX: reset path_planned so fresh plan is made on NAVIGATE entry
-            path_planned     = False
-            collision_cooldown = COLLISION_COOLDOWN
+        # ---- RECOVER timeout -> re-plan once then back to NAVIGATE ----
+        # BUG-B-FIX: guard with recover_replan_done so this fires exactly once
+        if (fsm.state == State.RECOVER
+                and recover_steps >= RECOVER_TOTAL
+                and not recover_replan_done):
+            recover_replan_done  = True
+            fsm.state            = State.NAVIGATE
+            fsm._state_steps     = 0
+            collision_cooldown   = COLLISION_COOLDOWN
             path = plan_to_table(
                 est_x, est_y, kb_table_xy, obs_for_path(), kb, STAND_OFF
             )
@@ -496,9 +486,8 @@ def main():
                   f"lidar={min(lidar):.2f} "
                   f"locked={grasp_target_locked}")
 
-        # ===== DRIVE FSM =====
-        # BUG9-FIX: only call fsm.transition when there is a real event
-        # In NAVIGATE/RECOVER with tick: just act without burning FSM step count
+        # ===== FSM DISPATCH =====
+        # Only tick FSM on real events; avoid burning step counters on idle ticks
         if mission_event != 'tick':
             fsm_state, cmd = fsm.transition(mission_event, mission_data)
         elif fsm.state in (State.NAVIGATE, State.RECOVER):
@@ -515,7 +504,6 @@ def main():
             nav_ctrl.rotate_to(search_rotation, est_theta)
 
         elif action == 'plan_path' and not path_planned:
-            # BUG1+BUG2-FIX: always navigate to KB table, with 0.6 m stand-off
             path = plan_to_table(
                 est_x, est_y, kb_table_xy, obs_for_path(), kb, STAND_OFF
             )
@@ -562,7 +550,6 @@ def main():
         elif action == 'lift_object':
             stop_wheels(robot_id, left_joint, right_joint)
             if grasp_target_pos:
-                # BUG11-FIX: lift to 0.72 m (just above table)
                 arm_ctrl.move_to_position([
                     grasp_target_pos[0],
                     grasp_target_pos[1],
@@ -572,7 +559,7 @@ def main():
         elif action in ('stop', 'idle', 'hold'):
             stop_wheels(robot_id, left_joint, right_joint)
 
-        # RECOVER: drive backward then hold
+        # RECOVER: backup then hold
         if fsm.state == State.RECOVER:
             if recover_steps <= RECOVER_DRIVE_BACK:
                 p.setJointMotorControl2(robot_id, left_joint,

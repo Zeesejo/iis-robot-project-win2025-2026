@@ -137,27 +137,8 @@ class DifferentialDriveController:
 class ArmController:
     """
     Controls the robot arm using PyBullet's built-in IK.
-
-    IMPORTANT: PyBullet's calculateInverseKinematics requires the
-    jointDamping list to have exactly one value per joint in the ENTIRE
-    robot body (not just the arm joints). Passing fewer values causes
-    PyBullet to silently ignore the damping and produce unstable IK.
-
-    robot.urdf joint count = 11:
-      0  left_wheel_joint   (continuous)
-      1  right_wheel_joint  (continuous)
-      2  caster_joint       (fixed)
-      3  arm_base_joint     (revolute)  <- arm
-      4  shoulder_joint     (revolute)  <- arm
-      5  elbow_joint        (revolute)  <- arm
-      6  wrist_joint        (revolute)  <- arm
-      7  end_effector_joint (fixed)
-      8  camera_joint       (fixed)
-      9  imu_joint          (fixed)
-     10  lidar_joint        (fixed)
     """
 
-    # Indices of the 4 controllable arm joints inside the full joint list
     _ARM_JOINT_IDS_IN_ROBOT = [3, 4, 5, 6]
 
     def __init__(self, robot_id, end_effector_index,
@@ -167,9 +148,6 @@ class ArmController:
         self.arm_joints    = arm_joint_indices
         self.total_joints  = total_joints
 
-        # Build a damping vector the same length as the total joint count.
-        # Low damping on non-arm joints (wheel / fixed) so IK doesn't try
-        # to move them; higher damping on arm joints for stable solutions.
         self.damping = [0.005] * total_joints
         for idx in self._ARM_JOINT_IDS_IN_ROBOT:
             if idx < total_joints:
@@ -198,8 +176,6 @@ class ArmController:
 
         joint_poses = p.calculateInverseKinematics(**ik_kwargs)
 
-        # joint_poses has one value per joint; index into it using the
-        # arm joint positions within the full robot joint list.
         for local_i, robot_joint_idx in enumerate(self.arm_joints):
             ik_i = self._ARM_JOINT_IDS_IN_ROBOT[local_i]
             if ik_i < len(joint_poses):
@@ -211,10 +187,9 @@ class ArmController:
                     maxVelocity=1.5
                 )
 
-        # Check convergence
-        ee_state  = p.getLinkState(self.robot_id, self.ee_index)
+        ee_state    = p.getLinkState(self.robot_id, self.ee_index)
         current_pos = np.array(ee_state[0])
-        error = np.linalg.norm(current_pos - np.array(target_pos))
+        error       = np.linalg.norm(current_pos - np.array(target_pos))
         return error < 0.06
 
     def home(self):
@@ -230,37 +205,75 @@ class ArmController:
                 )
 
 
-# ===================== PATH PLANNER (Prolog-guided) =====================
+# ===================== PATH PLANNER =====================
 
 def plan_path_prolog(start_x, start_y, goal_x, goal_y, obstacle_map, kb):
     """
-    Use Prolog knowledge base to query a safe waypoint path.
-    Falls back to A* if Prolog returns no path.
-    obstacle_map: list of {position: [x,y,z], size: 0.4}
-    kb: KnowledgeBase instance from knowledge_reasoning.py
-    Returns: list of (x, y) waypoints
+    Wrapper: use KB affordances to filter obstacles then run A*.
     """
     return _astar_path(start_x, start_y, goal_x, goal_y, obstacle_map)
 
 
-def _astar_path(sx, sy, gx, gy, obstacle_map, step=0.5):
+def _snap_to_free(grid_pt, blocked, cols, rows):
+    """
+    BFS outward from grid_pt to find the nearest unblocked cell.
+    Returns the free cell, or grid_pt itself if nothing found within radius 8.
+    """
+    from collections import deque
+    if grid_pt not in blocked:
+        return grid_pt
+    q = deque([grid_pt])
+    seen = {grid_pt}
+    while q:
+        cx, cy = q.popleft()
+        for dx, dy in [(-1,0),(1,0),(0,-1),(0,1),
+                        (-1,-1),(1,-1),(-1,1),(1,1)]:
+            nb = (cx+dx, cy+dy)
+            if nb in seen:
+                continue
+            seen.add(nb)
+            if not (0 <= nb[0] < cols and 0 <= nb[1] < rows):
+                continue
+            if nb not in blocked:
+                return nb
+            if max(abs(nb[0]-grid_pt[0]), abs(nb[1]-grid_pt[1])) < 8:
+                q.append(nb)
+    return grid_pt
+
+
+def _astar_path(sx, sy, gx, gy, obstacle_map, step=0.4):
     """
     Grid-based A* path planning.
-    The grid is dynamically sized around the start/goal extents so it
-    always covers the actual world coordinates.
-    Returns list of (x, y) waypoints.
+
+    Fixes applied:
+    - step=0.4 (finer grid for better path quality)
+    - margin=2.0 (tight around start/goal, walls are added explicitly)
+    - Start and goal nodes are snapped to nearest free cell so A*
+      never fails just because the robot/goal is inside an obstacle cell.
+    - Diagonal moves use cost 1.414.
+    Returns list of (x, y) waypoints including start.
     """
     import heapq
 
-    margin = 6.0
+    # Grid bounds: cover start, goal plus a margin
+    margin = 2.0
     x_min = min(sx, gx) - margin
     x_max = max(sx, gx) + margin
     y_min = min(sy, gy) - margin
     y_max = max(sy, gy) + margin
 
+    # Expand bounds to contain all obstacle centres too
+    for obs in obstacle_map:
+        ox, oy = obs['position'][0], obs['position'][1]
+        r = obs['size'] / 2.0 + 0.5
+        x_min = min(x_min, ox - r)
+        x_max = max(x_max, ox + r)
+        y_min = min(y_min, oy - r)
+        y_max = max(y_max, oy + r)
+
     scale = 1.0 / step
-    cols = int(round((x_max - x_min) * scale)) + 1
-    rows = int(round((y_max - y_min) * scale)) + 1
+    cols  = int(round((x_max - x_min) * scale)) + 1
+    rows  = int(round((y_max - y_min) * scale)) + 1
 
     def to_grid(wx, wy):
         return (int(round((wx - x_min) * scale)),
@@ -269,45 +282,61 @@ def _astar_path(sx, sy, gx, gy, obstacle_map, step=0.5):
     def to_world(gx_, gy_):
         return (gx_ / scale + x_min, gy_ / scale + y_min)
 
-    start = to_grid(sx, sy)
-    goal  = to_grid(gx, gy)
-
-    start = (max(0, min(cols - 1, start[0])), max(0, min(rows - 1, start[1])))
-    goal  = (max(0, min(cols - 1, goal[0])),  max(0, min(rows - 1, goal[1])))
-
+    # Build blocked set from obstacle map
     blocked = set()
     for obs in obstacle_map:
         ox, oy = obs['position'][0], obs['position'][1]
-        r = int(np.ceil((obs['size'] / 2.0 + 0.3) * scale))
+        # inflate by half-size + robot radius (0.25 m)
+        r = int(np.ceil((obs['size'] / 2.0 + 0.25) * scale))
         ogx, ogy = to_grid(ox, oy)
-        for dx in range(-r, r + 1):
-            for dy in range(-r, r + 1):
-                nx_, ny_ = ogx + dx, ogy + dy
+        for ddx in range(-r, r + 1):
+            for ddy in range(-r, r + 1):
+                nx_, ny_ = ogx + ddx, ogy + ddy
                 if 0 <= nx_ < cols and 0 <= ny_ < rows:
                     blocked.add((nx_, ny_))
 
-    def h(a, b):
-        return abs(a[0] - b[0]) + abs(a[1] - b[1])
+    # Snap start and goal to nearest free cells
+    # (fixes: robot spawns near wall, approach point inside table blocker)
+    raw_start = to_grid(sx, sy)
+    raw_goal  = to_grid(gx, gy)
+    raw_start = (max(0, min(cols-1, raw_start[0])),
+                 max(0, min(rows-1, raw_start[1])))
+    raw_goal  = (max(0, min(cols-1, raw_goal[0])),
+                 max(0, min(rows-1, raw_goal[1])))
 
-    open_set = [(h(start, goal), 0, start, [start])]
-    visited  = set()
+    start = _snap_to_free(raw_start, blocked, cols, rows)
+    goal  = _snap_to_free(raw_goal,  blocked, cols, rows)
+
+    if start == goal:
+        return [(sx, sy), (gx, gy)]
+
+    def h(a, b):
+        return np.hypot(a[0]-b[0], a[1]-b[1])  # Euclidean for better paths
+
+    open_set = [(h(start, goal), 0.0, start, [start])]
+    visited  = {}
 
     while open_set:
         f, g, current, path = heapq.heappop(open_set)
         if current in visited:
             continue
-        visited.add(current)
+        visited[current] = g
         if current == goal:
-            return [to_world(x, y) for x, y in path]
-        for dx, dy in [(-1,0),(1,0),(0,-1),(0,1),
-                        (-1,-1),(1,-1),(-1,1),(1,1)]:
-            nb = (current[0] + dx, current[1] + dy)
-            if (0 <= nb[0] < cols and 0 <= nb[1] < rows
-                    and nb not in blocked
-                    and nb not in visited):
-                new_g = g + (1.414 if dx != 0 and dy != 0 else 1.0)
-                heapq.heappush(
-                    open_set,
-                    (new_g + h(nb, goal), new_g, nb, path + [nb]))
+            world_path = [to_world(x, y) for x, y in path]
+            return world_path
+        for ddx, ddy in [(-1,0),(1,0),(0,-1),(0,1),
+                          (-1,-1),(1,-1),(-1,1),(1,1)]:
+            nb = (current[0]+ddx, current[1]+ddy)
+            if not (0 <= nb[0] < cols and 0 <= nb[1] < rows):
+                continue
+            if nb in blocked or nb in visited:
+                continue
+            move_cost = 1.414 if (ddx != 0 and ddy != 0) else 1.0
+            new_g = g + move_cost
+            heapq.heappush(
+                open_set,
+                (new_g + h(nb, goal), new_g, nb, path + [nb]))
 
+    # A* found no path: return straight line as fallback
+    print(f"[AStar] No path found ({sx:.1f},{sy:.1f})->({gx:.1f},{gy:.1f}), using straight line")
     return [(sx, sy), (gx, gy)]

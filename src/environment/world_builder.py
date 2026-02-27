@@ -23,7 +23,7 @@ TARGET_HEIGHT = 0.12
 # File Paths (relative to this file's location for portability)
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 URDF_PATH = _THIS_DIR
-# FIX: use robot-1.urdf (prismatic lift + camera on torso)
+# Use robot-1.urdf (has prismatic lift joint for arm elevation)
 ROBOT_URDF = os.path.join(_THIS_DIR, "robot-1.urdf")
 
 

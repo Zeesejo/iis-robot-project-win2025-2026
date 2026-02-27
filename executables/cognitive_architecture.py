@@ -66,31 +66,39 @@ CAM_FY   = (240 / 2.0) / np.tan(np.radians(_FOV_V / 2))
 CAM_CX, CAM_CY = 160.0, 120.0
 
 TARGET_COLOR     = 'red'
-MAX_TARGET_DEPTH = 3.5
+MAX_TARGET_DEPTH = 4.0
 MIN_TARGET_DEPTH = 0.2
 MAX_JUMP_M       = 1.0
 _CAM_TILT        = 0.2
 
 # -- Approach tuning ---------------------------------------------------------
-GRASP_RANGE_M    = 0.55
-APPROACH_STOP_M  = 0.40
-APPROACH_SLOW_M  = 1.0
-MIN_FWD_APPROACH = 0.50
-STANDOFF_DIST_M  = 0.65
+GRASP_RANGE_M    = 0.35
+APPROACH_STOP_M  = 0.25
+APPROACH_SLOW_M  = 0.6
+MIN_FWD_APPROACH = 0.30
+STANDOFF_DIST_M  = 0.80  # Keep closer distance for better grasping
 
 # -- Stuck detection ---------------------------------------------------------
 _STUCK_DIST_M  = 0.10
-_STUCK_TIMEOUT = 4.0
+_STUCK_TIMEOUT = 2.0  # Reduced from 4.0 for faster recovery
 
 # -- [F14-A] 360 spin constants ----------------------------------------------
-_SPIN_ANGULAR_VEL = 3.0
-_SPIN_STEPS       = 150
+_SPIN_ANGULAR_VEL = 5.0  # Increased from 3.0 for faster spinning
+_SPIN_STEPS       = 50   # Reduced from 100 for faster search
 
 # -- [F15-B] Orbit radius reduced for better small-object visibility ---------
 _ORBIT_RADIUS = 1.5   # was 2.0
 
 # -- Room safety bounds ------------------------------------------------------
 _ROOM_BOUND = 3.5
+
+# -- GRASP CONFIGURATION -----------------------------------------------------
+# Table height is 0.625m, cylinder sits on top (height 0.12m, center at 0.685m)
+TABLE_SURFACE_Z = 0.625
+CYLINDER_CENTER_Z = 0.685  # TABLE_HEIGHT + TARGET_HEIGHT/2
+GRASP_HEIGHT_OFFSET = 0.02  # Gripper needs to be slightly below cylinder center for grasp
+LIFT_HEIGHT = 0.15  # How high to lift the cylinder after grasping
+APPROACH_HEIGHT = 0.15  # How high above grasp point to approach from
 
 
 def _lidar_has_data(lidar):
@@ -166,6 +174,8 @@ class CognitiveArchitecture:
         self.step_counter = 0
         self.dt           = 1.0 / 240.0
 
+        self._last_grasp_attempt = False
+        
         self._initialize_world_knowledge()
         self._initialize_motors()
 
@@ -199,10 +209,21 @@ class CognitiveArchitecture:
               f"lift={self.lift_joint_idx}, cam_link={self.camera_link_idx}")
 
     def _initialize_world_knowledge(self):
-        if not os.path.exists("initial_map.json"):
+        # Try both locations: current directory and executables directory
+        possible_paths = ["initial_map.json", os.path.join("..", "initial_map.json")]
+        
+        world_map = None
+        for map_path in possible_paths:
+            if os.path.exists(map_path):
+                with open(map_path, 'r') as f:
+                    world_map = json.load(f)
+                print(f"[CogArch] Loaded world map from {map_path}")
+                break
+        
+        if world_map is None:
+            print("[CogArch] WARNING: Could not find initial_map.json")
             return
-        with open("initial_map.json", 'r') as f:
-            world_map = json.load(f)
+            
         if 'table' in world_map:
             td  = world_map['table']
             pos = td['position']
@@ -212,6 +233,7 @@ class CognitiveArchitecture:
             self.table_orientation = td.get('orientation')
             self.table_size        = td.get('size')
             self.obstacles.append(pos[:2])
+            print(f"[CogArch] Table loaded at position: {pos[:2]}")
         if 'obstacles' in world_map:
             for i, obs in enumerate(world_map['obstacles']):
                 pos   = obs['position']
@@ -241,11 +263,18 @@ class CognitiveArchitecture:
     # -----------------------------------------------------------------------
 
     def _check_gripper_contact(self):
+        """
+        Check if the gripper has successfully grasped the object.
+        We check for:
+        1. Physical contact between gripper and target
+        """
+        # Check for direct contact between gripper and target
         contacts = p.getContactPoints(bodyA=self.robot_id, bodyB=self.target_id)
         if contacts and len(contacts) > 0:
             if self.step_counter % 60 == 0:
-                print("[Sense] Gripper contact detected")
+                print(f"[Sense] Gripper contact detected ({len(contacts)} contact points)")
             return True
+        
         return False
 
     def _compute_approach_standoff(self, target_pos, robot_pose):
@@ -318,7 +347,9 @@ class CognitiveArchitecture:
 
         dx, dy = target_pos[0]-robot_pose[0], target_pos[1]-robot_pose[1]
         d = np.hypot(dx, dy)
-        if d > 0.01:
+        if self.table_position is not None:
+            return list(self.table_position[:2])
+        elif d > 0.01:
             return [target_pos[0] - sd*dx/d, target_pos[1] - sd*dy/d]
         return list(target_pos[:2])
 
@@ -337,16 +368,9 @@ class CognitiveArchitecture:
     def _lidar_avoidance(self, lidar, fwd, relaxed=False, pose=None):
         if not _lidar_has_data(lidar):
             return fwd, 0.0
-        if pose is not None and self.table_position is not None:
-            td = self._distance_to_table(pose[0], pose[1])
-            ko = 0.2 if relaxed else 0.6
-            if td < ko:
-                away  = math.atan2(pose[1]-self.table_position[1],
-                                   pose[0]-self.table_position[0])
-                hdiff = math.atan2(math.sin(away-pose[2]), math.cos(away-pose[2]))
-                if abs(hdiff) < math.pi/2:
-                    return min(fwd, 3.0), 5.0*hdiff
-                return -2.0, 5.0 if hdiff > 0 else -5.0
+        # REMOVED: Table avoidance logic - the table is the GOAL, not an obstacle!
+        # The robot should navigate TO the table, not avoid it.
+        # Regular obstacle avoidance below handles collision prevention.
         n   = len(lidar)
         oth = 0.3 if relaxed else 0.8
         eth = 0.15 if relaxed else 0.3
@@ -558,7 +582,8 @@ class CognitiveArchitecture:
             'target_position': self.target_position,
             'target_camera_bearing': self.target_camera_bearing,
             'target_camera_depth': self.target_camera_depth,
-            'gripper_contact': gripper_contact
+            'gripper_contact': gripper_contact,
+            'table_near': self.table_position is not None and np.hypot(estimated_pose[0] - self.table_position[0], estimated_pose[1] - self.table_position[1]) < 2.0
         }
 
     # ========================== THINK =====================================
@@ -628,19 +653,21 @@ class CognitiveArchitecture:
             except Exception:
                 pass
 
+        # Update FSM with current sensor data
+        # Calculate distance_for_fsm based on current state
         if target_pos:
             dx, dy      = target_pos[0]-pose[0], target_pos[1]-pose[1]
             distance_2d = np.hypot(dx, dy)
-            if self.approach_standoff is None:
-                self.approach_standoff = self._compute_approach_standoff(
-                    target_pos, pose)
-                print(f"[CogArch] Computed approach standoff: "
-                      f"({self.approach_standoff[0]:.2f}, "
-                      f"{self.approach_standoff[1]:.2f})")
             if self.fsm.state == RobotState.APPROACH:
-                distance_for_fsm = distance_2d
-            elif (self.approach_standoff is not None
-                  and self.fsm.state == RobotState.NAVIGATE):
+                # For APPROACH state, use camera depth if available
+                cam_depth = sensor_data.get('target_camera_depth', float('inf'))
+                if cam_depth < MAX_TARGET_DEPTH:
+                    distance_for_fsm = cam_depth
+                    if self.step_counter % 120 == 0:
+                        print(f"[Think] Using camera depth={cam_depth:.2f}m for FSM")
+                else:
+                    distance_for_fsm = distance_2d
+            elif self.approach_standoff is not None and self.fsm.state == RobotState.NAVIGATE:
                 sdx = self.approach_standoff[0]-pose[0]
                 sdy = self.approach_standoff[1]-pose[1]
                 distance_for_fsm = np.hypot(sdx, sdy)
@@ -648,7 +675,13 @@ class CognitiveArchitecture:
                 cam_d = sensor_data.get('target_camera_depth', float('inf'))
                 distance_for_fsm = cam_d if cam_d < MAX_TARGET_DEPTH else distance_2d
         else:
-            distance_2d = distance_for_fsm = float('inf')
+            # No target detected - use table position for navigation
+            if self.table_position is not None:
+                dx, dy = self.table_position[0] - pose[0], self.table_position[1] - pose[1]
+                distance_2d = np.hypot(dx, dy)
+                distance_for_fsm = distance_2d
+            else:
+                distance_2d = distance_for_fsm = float('inf')
 
         self.fsm.update({
             'target_visible':     sensor_data['target_detected'],
@@ -664,37 +697,74 @@ class CognitiveArchitecture:
 
         # -- SEARCH ----------------------------------------------------------
         if self.fsm.state == RobotState.SEARCH:
-            if not self._spin_complete:
-                self._spin_steps_done += 1
-                if self._spin_steps_done >= _SPIN_STEPS:
-                    self._spin_complete = True
-                    print("[F14-A] 360 spin complete - proceeding to search approach")
-                ctrl = {'mode': 'search_spin_full',
-                        'angular_vel': _SPIN_ANGULAR_VEL}
-            else:
-                if self.table_position:
-                    td = np.hypot(self.table_position[0]-pose[0],
-                                  self.table_position[1]-pose[1])
-                    if td < _ORBIT_RADIUS + 0.5:
-                        ctrl = {'mode': 'search_orbit',
-                                'table_pos': self.table_position[:2],
-                                'pose': pose,
-                                'orbit_radius': _ORBIT_RADIUS,
-                                'lidar': sensor_data['lidar']}
-                    else:
-                        ctrl = {'mode': 'search_approach',
-                                'target': self.table_position[:2],
-                                'pose': pose, 'angular_vel': 2.0,
-                                'lidar': sensor_data['lidar']}
+            if self.step_counter % 120 == 0:
+                print(f"[Think] SEARCH: target_detected={sensor_data['target_detected']}, "
+                      f"target_pos={target_pos is not None}")
+            
+            # Immediately go towards the table when available - no spinning
+            if self.table_position:
+                td = np.hypot(self.table_position[0]-pose[0],
+                              self.table_position[1]-pose[1])
+                
+                # If table is far, go directly to it
+                if td > 1.5:
+                    ctrl = {'mode': 'search_approach',
+                            'target': self.table_position[:2],
+                            'pose': pose, 'angular_vel': 5.0,
+                            'lidar': sensor_data['lidar']}
+                    if self.step_counter % 240 == 0:
+                        print(f"[Think] SEARCH: Going directly to TABLE (dist={td:.2f}m)")
                 else:
-                    ctrl = {'mode': 'search_rotate', 'angular_vel': 3.0}
+                    # Table is close - transition to NAVIGATE to approach and grasp
+                    if self.step_counter % 240 == 0:
+                        print(f"[Think] SEARCH: Table near (dist={td:.2f}m), transitioning to NAVIGATE")
+                    self.fsm.transition_to(RobotState.NAVIGATE)
+            else:
+                # No table info - just rotate to find it
+                ctrl = {'mode': 'search_rotate', 'angular_vel': 5.0}
 
         # -- NAVIGATE --------------------------------------------------------
         elif self.fsm.state == RobotState.NAVIGATE:
+            if self.step_counter % 120 == 0:
+                print(f"[Think] NAVIGATE: target_pos={target_pos is not None}, "
+                      f"approach_standoff={self.approach_standoff}")
+            
+            
             cam_d       = sensor_data.get('target_camera_depth', float('inf'))
             use_relaxed = cam_d < 2.5 and sensor_data['target_detected']
-            nav_goal    = (self.approach_standoff or
-                           (target_pos[:2] if target_pos else None))
+            
+            # CRITICAL FIX: Immediately go to table when available, then find cylinder
+            # The robot should go to the table first, then detect and grasp the cylinder
+            if self.table_position:
+                table_dist = np.hypot(self.table_position[0]-pose[0], self.table_position[1]-pose[1])
+                
+                # Phase 1: Go directly to table (don't wait for target detection)
+                # Go to a position near the table where we can see the cylinder
+                if table_dist > 1.2:
+                    # Navigate directly to table with offset for visibility
+                    # Position slightly in front of table center
+                    nav_goal = [
+                        self.table_position[0] + 0.5,  # Slight offset from table center
+                        self.table_position[1],
+                    ]
+                    if self.step_counter % 240 == 0:
+                        print(f"[Think] NAVIGATE: Going directly to TABLE (dist={table_dist:.2f}m)")
+                
+                # Phase 2: At/near table - transition to APPROACH to find and grasp cylinder
+                else:
+                    # We're close to table, now find and grasp the cylinder
+                    if self.step_counter % 240 == 0:
+                        print(f"[Think] NAVIGATE: Arrived at table (dist={table_dist:.2f}m), transitioning to APPROACH")
+                    # Force transition to APPROACH to execute grasp
+                    self.fsm.transition_to(RobotState.APPROACH)
+                    nav_goal = None  # Will be set in APPROACH state
+            elif target_pos:
+                # No table info - go directly to target
+                nav_goal = target_pos[:2]
+            else:
+                # Nothing - can't navigate
+                nav_goal = None
+             
             if nav_goal and self.current_waypoint is None:
                 self.action_planner.create_plan(pose[:2], nav_goal, self.obstacles)
                 self.current_waypoint = self.action_planner.get_next_waypoint()
@@ -703,7 +773,7 @@ class CognitiveArchitecture:
                         'pose': pose, 'lidar': sensor_data['lidar'],
                         'relaxed_avoidance': use_relaxed}
                 if np.hypot(self.current_waypoint[0]-pose[0],
-                            self.current_waypoint[1]-pose[1]) < 0.3:
+                            self.current_waypoint[1]-pose[1]) < 0.2:  # Reduced from 0.3
                     self.action_planner.advance_waypoint()
                     self.current_waypoint = self.action_planner.get_next_waypoint()
 
@@ -712,34 +782,124 @@ class CognitiveArchitecture:
             if not self._in_approach:
                 self._approach_depth_smooth = float('inf')
                 self._in_approach           = True
+                print("[Think] APPROACH: Starting visual approach to target")
+            
+            # If we don't have target position yet, we need to find it first
+            if not target_pos:
+                # Use camera bearing to find the target
+                cam_bearing = sensor_data.get('target_camera_bearing', 0.0)
+                cam_depth = sensor_data.get('target_camera_depth', float('inf'))
+                
+                # If we can see something (bearing != 0 or depth < inf), target is visible
+                if cam_depth < MAX_TARGET_DEPTH:
+                    # Target is visible, use it for approach
+                    if self.table_position:
+                        # Use table position with some offset based on bearing
+                        approach_target = [
+                            self.table_position[0] + 0.3 * math.cos(cam_bearing),
+                            self.table_position[1] + 0.3 * math.sin(cam_bearing),
+                        ]
+                    else:
+                        approach_target = [pose[0] + 0.3 * math.cos(cam_bearing + pose[2]),
+                                           pose[1] + 0.3 * math.sin(cam_bearing + pose[2])]
+                    if self.step_counter % 120 == 0:
+                        print(f"[Think] APPROACH: Target detected via camera, bearing={np.degrees(cam_bearing):.1f}°")
+                else:
+                    # Target not visible - slowly rotate to find it
+                    if self.step_counter % 120 == 0:
+                        print(f"[Think] APPROACH: Target not visible, rotating to find it")
+                    ctrl = {'mode': 'search_rotate', 'angular_vel': 2.0}
+                    return ctrl
+            else:
+                # We have target position - approach it
+                approach_target = target_pos[:2]
+            
+            # Calculate 3D distance to target if available
             if target_pos:
-                ctrl = {'mode': 'approach_visual',
-                        'target':            target_pos[:2],
-                        'pose':              pose,
-                        'lidar':             sensor_data['lidar'],
-                        'relaxed_avoidance': True,
-                        'camera_bearing':    sensor_data.get('target_camera_bearing', 0.0),
-                        'camera_depth':      sensor_data.get('target_camera_depth', float('inf')),
-                        'world_target':      target_pos[:2],
-                        'world_dist_2d':     distance_2d}
+                dist_3d = np.hypot(target_pos[0] - pose[0], target_pos[1] - pose[1])
+            else:
+                dist_3d = float('inf')
+            
+            # Use camera depth for more accurate distance when target is visible
+            cam_depth = sensor_data.get('target_camera_depth', float('inf'))
+            if cam_depth < MAX_TARGET_DEPTH:
+                # Camera depth is more reliable for grasping
+                use_dist = cam_depth
+                if self.step_counter % 120 == 0:
+                    print(f"[Think] APPROACH: using camera depth={cam_depth:.2f}m")
+            else:
+                use_dist = dist_3d
+            
+            ctrl = {'mode': 'approach_visual',
+                    'target':            approach_target,
+                    'pose':              pose,
+                    'lidar':             sensor_data['lidar'],
+                    'relaxed_avoidance': True,
+                    'camera_bearing':    sensor_data.get('target_camera_bearing', 0.0),
+                    'camera_depth':      cam_depth,
+                    'world_target':      approach_target,
+                    'world_dist_2d':     dist_3d}
+            
+            # Also update distance_for_fsm for FSM transition
+            self.fsm.distance_to_target = use_dist
 
         # -- GRASP -----------------------------------------------------------
         elif self.fsm.state == RobotState.GRASP:
-            if target_pos:
-                gp    = self.grasp_planner.plan_grasp(target_pos)
+            # Use last known target position or table position
+            grasp_target = target_pos
+            
+            # If no target detected, use table position with estimated cylinder location
+            if grasp_target is None:
+                if self.table_position:
+                    # Estimate cylinder is on table at a slight offset from center
+                    grasp_target = [
+                        self.table_position[0],
+                        self.table_position[1],
+                        CYLINDER_CENTER_Z  # Use known cylinder center height
+                    ]
+                    if self.step_counter % 60 == 0:
+                        print(f"[Think] GRASP: Using estimated table position as grasp target")
+                else:
+                    # No table - can't grasp
+                    print(f"[Think] GRASP: No target or table, transitioning to SEARCH")
+                    self.fsm.transition_to(RobotState.SEARCH)
+                    return ctrl
+            
+            if grasp_target:
+                gp    = self.grasp_planner.plan_grasp(grasp_target)
                 gt    = self.fsm.get_time_in_state()
-                phase = ('reach_above'  if gt < 2.5 else
-                         'reach_target' if gt < 5.5 else
+                
+                # More generous timing for each phase to ensure proper execution
+                # Phase 1: reach_above - move arm above object (0-3 seconds)
+                # Phase 2: reach_target - move down to grasp position (3-7 seconds)  
+                # Phase 3: close_gripper - close gripper and verify grasp (7+ seconds)
+                phase = ('reach_above'  if gt < 3.0 else
+                         'reach_target' if gt < 7.0 else
                          'close_gripper')
+                
                 ctrl = {'mode': 'grasp',
                         'approach_pos': gp['approach_pos'],
                         'grasp_pos':    gp['grasp_pos'],
                         'orientation':  gp['orientation'],
                         'phase':        phase}
+                if self.step_counter % 60 == 0:
+                    print(f"[Think] GRASP: phase={phase}, time={gt:.1f}s, target={grasp_target[:2]}")
+            else:
+                # No target at all - go back to search
+                print(f"[Think] GRASP: No target, transitioning to SEARCH")
+                self.fsm.transition_to(RobotState.SEARCH)
 
         # -- LIFT ------------------------------------------------------------
         elif self.fsm.state == RobotState.LIFT:
             ctrl = {'mode': 'lift', 'lift_height': 0.2, 'gripper': 'close'}
+
+        # -- PLACE ------------------------------------------------------------
+        elif self.fsm.state == RobotState.PLACE:
+            if target_pos:
+                gp = self.grasp_planner.plan_grasp(target_pos)
+                ctrl = {'mode': 'place',
+                        'place_pos': gp['place_pos'],
+                        'orientation': gp['orientation']}
 
         # -- SUCCESS ---------------------------------------------------------
         elif self.fsm.state == RobotState.SUCCESS:
@@ -769,6 +929,112 @@ class CognitiveArchitecture:
             p.setJointMotorControl2(self.robot_id, j, p.POSITION_CONTROL,
                                     targetPosition=0.0, force=500, maxVelocity=2.0)
 
+    def _execute_arm_ik(self, target_pos, target_orn):
+        """
+        Execute inverse kinematics to move arm to target position.
+        Returns True if IK solution found, False otherwise.
+        """
+        if not self.arm_joints:
+            print("[IK] No arm joints configured")
+            return False
+        
+        # Find gripper base link index for IK
+        gripper_link_idx = -1
+        for i in range(p.getNumJoints(self.robot_id)):
+            link_name = p.getJointInfo(self.robot_id, i)[12].decode('utf-8')
+            if 'gripper_base' in link_name:
+                gripper_link_idx = i
+                break
+        
+        if gripper_link_idx == -1:
+            # Fallback to last arm joint
+            gripper_link_idx = self.arm_joints[-1]
+        
+        try:
+            # Calculate IK solution
+            ik_solution = p.calculateInverseKinematics(
+                self.robot_id,
+                gripper_link_idx,
+                target_pos,
+                targetOrientation=target_orn,
+                maxNumIterations=100,
+                residualThreshold=0.001
+            )
+            
+            if ik_solution is None or len(ik_solution) == 0:
+                print("[IK] No IK solution found")
+                return False
+            
+            # Apply IK solution to arm joints
+            # Get all non-fixed joint indices
+            num_joints = p.getNumJoints(self.robot_id)
+            non_fixed_joints = []
+            for j in range(num_joints):
+                if p.getJointInfo(self.robot_id, j)[2] != p.JOINT_FIXED:
+                    non_fixed_joints.append(j)
+            
+            # Apply IK to arm joints
+            for joint_idx in self.arm_joints:
+                if joint_idx in non_fixed_joints:
+                    ik_idx = non_fixed_joints.index(joint_idx)
+                    if ik_idx < len(ik_solution):
+                        p.setJointMotorControl2(
+                            self.robot_id,
+                            joint_idx,
+                            controlMode=p.POSITION_CONTROL,
+                            targetPosition=ik_solution[ik_idx],
+                            force=500,
+                            maxVelocity=1.0
+                        )
+            
+            return True
+        except Exception as e:
+            print(f"[IK] Error: {e}")
+            return False
+
+    def _close_gripper(self):
+        """
+        Close gripper fingers to grasp the object.
+        """
+        if not self.gripper_joints:
+            print("[Gripper] No gripper joints found")
+            return
+        
+        for fi in self.gripper_joints:
+            joint_info = p.getJointInfo(self.robot_id, fi)
+            joint_name = joint_info[1].decode('utf-8')
+            # Left finger: limits [-0.04, 0], close at -0.04 (moves toward center)
+            # Right finger: limits [0, 0.04], close at 0.04 (moves toward center)
+            if 'left' in joint_name:
+                target = -0.04  # Close toward center
+            else:
+                target = 0.04  # Close toward center
+            
+            p.setJointMotorControl2(
+                self.robot_id,
+                fi,
+                controlMode=p.POSITION_CONTROL,
+                targetPosition=target,
+                force=50
+            )
+
+    def _open_gripper(self):
+        """
+        Open gripper fingers to release the object.
+        """
+        if not self.gripper_joints:
+            print("[Gripper] No gripper joints found")
+            return
+        
+        for fi in self.gripper_joints:
+            p.setJointMotorControl2(
+                self.robot_id,
+                fi,
+                controlMode=p.POSITION_CONTROL,
+                targetPosition=0.0,  # Open position
+                force=50
+            )
+
     def _set_wheels(self, left, right):
         for i in [0, 2]:
             p.setJointMotorControl2(self.robot_id, i, p.VELOCITY_CONTROL,
@@ -792,6 +1058,8 @@ class CognitiveArchitecture:
         elif mode == 'search_rotate':
             av = ctrl.get('angular_vel', 3.0)
             self._set_wheels(-av, av)
+            if self.step_counter % 60 == 0:
+                print(f"[Act] SEARCH_ROTATE: rotating to find target")
 
         elif mode == 'search_approach':
             tgt, pose, lidar = ctrl['target'], ctrl['pose'], ctrl.get('lidar')
@@ -799,8 +1067,8 @@ class CognitiveArchitecture:
             dist   = np.hypot(dx, dy)
             he     = math.atan2(dy, dx) - pose[2]
             he     = math.atan2(math.sin(he), math.cos(he))
-            fv     = min(3.0, 2.0*dist)
-            av     = 4.0*he
+            fv     = min(5.0, 3.0*dist)  # Increased from 3.0/2.0
+            av     = 5.0*he  # Increased from 4.0
             fv, at = self._lidar_avoidance(lidar, fv, pose=pose)
             av    += at
             if self.step_counter % 240 == 0:
@@ -837,8 +1105,8 @@ class CognitiveArchitecture:
             desired = tangent + 0.5 * rerr
             he      = math.atan2(math.sin(desired - pose[2]),
                                  math.cos(desired - pose[2]))
-            fv      = 2.0
-            av      = 4.0 * he
+            fv      = 3.0  # Increased from 2.0
+            av      = 5.0 * he  # Increased from 4.0
             fv, at  = self._lidar_avoidance(lidar, fv, pose=pose)
             av     += at
             if self.step_counter % 240 == 0:
@@ -854,9 +1122,9 @@ class CognitiveArchitecture:
             dist      = np.hypot(dx, dy)
             he        = math.atan2(dy, dx) - pose[2]
             he        = math.atan2(math.sin(he), math.cos(he))
-            kpd       = 4.0 if mode == 'navigate' else 3.0
-            fv        = np.clip(kpd*dist, 0, 5.0)
-            av        = 5.0*he
+            kpd       = 6.0 if mode == 'navigate' else 4.0
+            fv        = np.clip(kpd*dist, 0, 8.0)
+            av        = 6.0*he
             relaxed   = ctrl.get('relaxed_avoidance', False)
             fv, at    = self._lidar_avoidance(lidar, fv, relaxed=relaxed, pose=pose)
             av       += at
@@ -883,16 +1151,18 @@ class CognitiveArchitecture:
             else:
                 he = ctrl.get('camera_bearing', 0.0)
 
+            # More aggressive approach - get closer to the target
             if sd > APPROACH_SLOW_M:
-                fv = np.clip(3.0 * (sd - APPROACH_STOP_M), MIN_FWD_APPROACH, 3.0)
+                fv = np.clip(5.0 * (sd - APPROACH_STOP_M), MIN_FWD_APPROACH, 5.0)
             elif sd > APPROACH_STOP_M:
                 fv = max(MIN_FWD_APPROACH,
-                         np.clip(3.0*(sd-APPROACH_STOP_M), 0.0, MIN_FWD_APPROACH*2))
+                         np.clip(5.0*(sd-APPROACH_STOP_M), 0.0, MIN_FWD_APPROACH*2))
             else:
                 fv = 0.0
 
-            if sd < GRASP_RANGE_M and fv == 0.0:
-                fv = MIN_FWD_APPROACH * 0.5
+            # If very close, stop and let FSM transition to GRASP
+            if sd < 0.5:
+                fv = 0.0
 
             av = 5.0 * he
 
@@ -919,33 +1189,99 @@ class CognitiveArchitecture:
             ap    = ctrl['approach_pos']
             gpos  = ctrl['grasp_pos']
             orn   = p.getQuaternionFromEuler(ctrl['orientation'])
-            if self.lift_joint_idx is not None:
-                p.setJointMotorControl2(self.robot_id, self.lift_joint_idx,
-                                        p.POSITION_CONTROL,
-                                        targetPosition=0.3, force=100,
-                                        maxVelocity=0.5)
-            close = (phase == 'close_gripper')
-            tgt_p = ap if phase == 'reach_above' else gpos
-            if self.step_counter % 120 == 0:
-                print(f"[Act] GRASP phase={phase}")
-            grasp_object(self.robot_id, tgt_p, orn,
-                         arm_joints=self.arm_joints or None,
-                         close_gripper=close)
+            
+            # Execute proper grasp sequence with timing
+            # Phase 1: Move to approach position (above object)
+            # Phase 2: Move down to grasp position
+            # Phase 3: Close gripper to grasp
+            # Phase 4: Lift slightly to verify grasp
+            
+            if phase == 'reach_above':
+                # Move arm to approach position (above the object)
+                target_pos = ap
+                # Use IK to move to approach position
+                ik_success = self._execute_arm_ik(target_pos, orn)
+                if self.step_counter % 120 == 0:
+                    print(f"[Act] GRASP: Moving to approach position {target_pos}")
+                    
+            elif phase == 'reach_target':
+                # Move arm down to grasp position (at object level)
+                target_pos = gpos
+                ik_success = self._execute_arm_ik(target_pos, orn)
+                if self.step_counter % 120 == 0:
+                    print(f"[Act] GRASP: Moving to grasp position {target_pos}")
+                    
+            elif phase == 'close_gripper':
+                # Close gripper to grasp the object
+                self._set_wheels(0, 0)
+                
+                # First move to grasp position
+                ik_success = self._execute_arm_ik(gpos, orn)
+                
+                # Close gripper fingers - move toward center to grasp
+                self._close_gripper()
+                
+                # Brief pause to ensure gripper closes
+                if self.step_counter % 60 == 0:
+                    print(f"[Act] GRASP: Closing gripper to grasp object")
+            
+            # Store grasp success for FSM
+            self._last_grasp_attempt = True
 
         elif mode == 'lift':
             self._set_wheels(0, 0)
-            for fi in self.gripper_joints:
-                jn = p.getJointInfo(self.robot_id, fi)[1].decode('utf-8')
-                tp = -0.04 if 'left' in jn else 0.04
-                p.setJointMotorControl2(self.robot_id, fi, p.POSITION_CONTROL,
-                                        targetPosition=tp, force=50)
+            
+            # Keep gripper closed while lifting
+            self._close_gripper()
+            
+            # Move arm joints to lift position (raise the arm while keeping gripper closed)
+            # First, hold the gripper closed at the current position, then move the arm up
             if self.lift_joint_idx is not None:
+                # Use lift joint to raise the arm
                 p.setJointMotorControl2(self.robot_id, self.lift_joint_idx,
                                         p.POSITION_CONTROL,
                                         targetPosition=0.3, force=100,
                                         maxVelocity=0.5)
+            
+            # Also move arm joints slightly to help lift - keep them at current position
+            for j in self.arm_joints:
+                # Get current position and hold it (helps maintain grasp)
+                current_pos = p.getJointState(self.robot_id, j)[0]
+                p.setJointMotorControl2(self.robot_id, j, p.POSITION_CONTROL,
+                                        targetPosition=current_pos, force=200,
+                                        maxVelocity=0.3)
+            
             if self.step_counter % 120 == 0:
-                print("[Act] LIFT: raising object")
+                print("[Act] LIFT: raising object with gripper closed")
+
+        elif mode == 'place':
+            self._set_wheels(0, 0)
+            
+            # Keep gripper closed while moving to place position
+            self._close_gripper()
+            
+            # Move arm to place position (above the original position)
+            place_pos = ctrl.get('place_pos')
+            orientation = ctrl.get('orientation', [0, 1.57, 0])
+            orn = p.getQuaternionFromEuler(orientation)
+            
+            if place_pos:
+                # Move to place position (slightly above original)
+                self._execute_arm_ik(place_pos, orn)
+                
+                if self.step_counter % 120 == 0:
+                    print(f"[Act] PLACE: Moving to place position {place_pos}")
+                
+                # After a brief pause, open gripper to release
+                time_in_state = self.fsm.get_time_in_state()
+                if time_in_state > 0.5:
+                    # Open gripper to release the object back on the table
+                    self._open_gripper()
+                    if self.step_counter % 60 == 0:
+                        print("[Act] PLACE: Opening gripper to release object back on table")
+            else:
+                # No place position - just open gripper
+                self._open_gripper()
 
         elif mode in ('idle', 'success', 'failure'):
             if mode == 'failure':
@@ -1019,7 +1355,7 @@ def main():
         if cog.fsm.state == RobotState.SUCCESS:
             if cog.fsm.get_time_in_state() > 3.0:
                 print("\n" + "="*60)
-                print("  MISSION COMPLETE - target grasped and lifted!")
+                print("  MISSION COMPLETE - target grasped and placed back on table!")
                 print("="*60)
                 break
 

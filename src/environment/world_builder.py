@@ -24,7 +24,7 @@ TARGET_HEIGHT = 0.12
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 URDF_PATH = _THIS_DIR
 # Use robot-1.urdf (has prismatic lift joint for arm elevation)
-ROBOT_URDF = os.path.join(_THIS_DIR, "robot-1.urdf")
+ROBOT_URDF = os.path.join(_THIS_DIR, "..", "robot", "robot.urdf")
 
 
 def get_random_pos(bounds, min_dist_from_origin=1.0):

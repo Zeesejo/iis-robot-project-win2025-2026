@@ -179,7 +179,10 @@ class RobotFSM:
         elif self.state == RobotState.NAVIGATE:
             self.distance_to_target = sensor_data.get('distance_to_target',
                                                        float('inf'))
-            if self.distance_to_target < 1.5:
+            # FIX #3: Lowered threshold from 1.5m to 0.8m so the robot is
+            # actually within arm reach before transitioning to APPROACH/GRASP.
+            # The arm chain is ~0.7m total, so 0.8m puts the gripper on target.
+            if self.distance_to_target < 0.8:
                 print(f"[FSM] Reached navigation waypoint "
                       f"(dist={self.distance_to_target:.2f}m)")
                 self.transition_to(RobotState.APPROACH)
@@ -195,7 +198,7 @@ class RobotFSM:
             self.distance_to_target = sensor_data.get('distance_to_target',
                                                        float('inf'))
             # Transition to GRASP when close enough to table/target
-            if self.distance_to_target < 0.9:
+            if self.distance_to_target < 0.55:
                 print(f"[FSM] Close to table/target, attempting grasp "
                       f"(dist={self.distance_to_target:.2f}m)")
                 self.transition_to(RobotState.GRASP)

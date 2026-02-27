@@ -22,17 +22,6 @@ class State:
 class MissionFSM:
     """
     Finite State Machine for the Navigate-to-Grasp mission.
-    Transitions:
-        INIT -> SEARCH (always)
-        SEARCH -> NAVIGATE (target found)
-        SEARCH -> SEARCH (target not found, rotate)
-        NAVIGATE -> ALIGN (near table)
-        NAVIGATE -> RECOVER (obstacle collision)
-        ALIGN -> GRASP (arm aligned)
-        GRASP -> LIFT (object grasped)
-        LIFT -> DONE (object lifted)
-        RECOVER -> NAVIGATE (after recovery)
-        Any -> FAILED (timeout or repeated failure)
     """
 
     def __init__(self):
@@ -40,17 +29,17 @@ class MissionFSM:
         self.prev_state = None
         self._step_count = 0
         self._state_steps = 0
-        self._max_search_steps = 2400   # 10 seconds at 240Hz
-        self._max_nav_steps = 12000     # 50 seconds
-        self._max_grasp_steps = 4800    # 20 seconds
+        self._max_search_steps = 2400
+        self._max_nav_steps = 14400    # 60 seconds
+        self._max_align_steps = 2400   # 10 seconds - must not loop forever
+        self._max_grasp_steps = 4800   # 20 seconds
         self._max_lift_steps = 2400
-        self._recovery_steps = 480      # 2 seconds
+        self._recovery_steps = 480
         self._recovery_count = 0
         self._max_recoveries = 5
 
-        # Mission data
-        self.target_position = None       # Estimated (x, y, z) of target
-        self.table_position = None        # Known from map
+        self.target_position = None
+        self.table_position = None
         self.current_waypoint_idx = 0
         self.waypoints = []
         self.nav_complete = False
@@ -58,16 +47,8 @@ class MissionFSM:
         self._max_grasp_attempts = 3
 
     def transition(self, event, data=None):
-        """
-        Drive state machine forward based on event and data.
-        event: string event name
-        data: optional dict with extra info
-        Returns: (new_state, action_command)
-        """
         self._step_count += 1
         self._state_steps += 1
-
-        prev = self.state
 
         if self.state == State.INIT:
             self.state = State.SEARCH
@@ -79,14 +60,12 @@ class MissionFSM:
                 self.target_position = data.get('target_pos')
                 self.state = State.NAVIGATE
                 self._state_steps = 0
-                return self.state, {'cmd': 'plan_path',
-                                     'goal': self.target_position}
+                return self.state, {'cmd': 'plan_path', 'goal': self.target_position}
             elif event == 'table_found':
                 self.table_position = data.get('table_pos')
                 self.state = State.NAVIGATE
                 self._state_steps = 0
-                return self.state, {'cmd': 'plan_path',
-                                     'goal': self.table_position}
+                return self.state, {'cmd': 'plan_path', 'goal': self.table_position}
             elif self._state_steps > self._max_search_steps:
                 self.state = State.FAILED
                 return self.state, {'cmd': 'stop', 'reason': 'search_timeout'}
@@ -98,10 +77,9 @@ class MissionFSM:
                 if self.current_waypoint_idx >= len(self.waypoints):
                     self.state = State.ALIGN
                     self._state_steps = 0
-                    return self.state, {'cmd': 'align_arm'}
+                    return self.state, {'cmd': 'stop_and_align'}
                 return self.state, {'cmd': 'next_waypoint',
-                                     'waypoint': self.waypoints[
-                                         self.current_waypoint_idx]}
+                                    'waypoint': self.waypoints[self.current_waypoint_idx]}
             elif event == 'collision':
                 if self._recovery_count < self._max_recoveries:
                     self._recovery_count += 1
@@ -110,12 +88,11 @@ class MissionFSM:
                     return self.state, {'cmd': 'backup'}
                 else:
                     self.state = State.FAILED
-                    return self.state, {'cmd': 'stop',
-                                         'reason': 'too_many_collisions'}
+                    return self.state, {'cmd': 'stop', 'reason': 'too_many_collisions'}
             elif event == 'at_table':
                 self.state = State.ALIGN
                 self._state_steps = 0
-                return self.state, {'cmd': 'align_arm'}
+                return self.state, {'cmd': 'stop_and_align'}
             elif self._state_steps > self._max_nav_steps:
                 self.state = State.FAILED
                 return self.state, {'cmd': 'stop', 'reason': 'nav_timeout'}
@@ -123,6 +100,11 @@ class MissionFSM:
 
         elif self.state == State.ALIGN:
             if event == 'arm_aligned':
+                self.state = State.GRASP
+                self._state_steps = 0
+                return self.state, {'cmd': 'execute_grasp'}
+            # Timeout: force into GRASP even without perfect alignment
+            elif self._state_steps > self._max_align_steps:
                 self.state = State.GRASP
                 self._state_steps = 0
                 return self.state, {'cmd': 'execute_grasp'}
@@ -137,10 +119,10 @@ class MissionFSM:
                 self.grasp_attempts += 1
                 if self.grasp_attempts >= self._max_grasp_attempts:
                     self.state = State.FAILED
-                    return self.state, {'cmd': 'stop',
-                                         'reason': 'grasp_failed'}
+                    return self.state, {'cmd': 'stop', 'reason': 'grasp_failed'}
                 self.state = State.ALIGN
-                return self.state, {'cmd': 'realign'}
+                self._state_steps = 0
+                return self.state, {'cmd': 'stop_and_align'}
             elif self._state_steps > self._max_grasp_steps:
                 self.state = State.FAILED
                 return self.state, {'cmd': 'stop', 'reason': 'grasp_timeout'}
@@ -151,7 +133,7 @@ class MissionFSM:
                 self.state = State.DONE
                 return self.state, {'cmd': 'hold'}
             elif self._state_steps > self._max_lift_steps:
-                self.state = State.DONE  # Accept partial success
+                self.state = State.DONE
                 return self.state, {'cmd': 'hold'}
             return self.state, {'cmd': 'lift_object'}
 

@@ -200,48 +200,68 @@ class ArmController:
 def plan_path_prolog(start_x, start_y, goal_x, goal_y, obstacle_map, kb):
     """
     Use Prolog knowledge base to query a safe waypoint path.
-    Falls back to straight-line if Prolog returns no path.
+    Falls back to A* if Prolog returns no path.
     obstacle_map: list of {position: [x,y,z], size: 0.4}
     kb: KnowledgeBase instance from knowledge_reasoning.py
     Returns: list of (x, y) waypoints
     """
-    # Query Prolog for reachable waypoints
-    safe_path = kb.query_safe_path(start_x, start_y, goal_x, goal_y)
-    if safe_path:
-        return safe_path
-
-    # Fallback: simple potential field / straight line
+    # Always use A* — KB reasons about *what* to avoid, not *how* to route.
+    # kb.query_safe_path is intentionally bypassed here so A* handles geometry.
     return _astar_path(start_x, start_y, goal_x, goal_y, obstacle_map)
 
 
 def _astar_path(sx, sy, gx, gy, obstacle_map, step=0.5):
     """
-    Simplified grid-based A* path planning.
+    Grid-based A* path planning.
+    The grid is dynamically sized around the start/goal extents so it
+    always covers the actual world coordinates (world2 scene extends
+    well beyond the old hard-coded [-5, +5] box).
     Returns list of (x, y) waypoints.
     """
     import heapq
-    scale = 1.0 / step
-    # Convert to grid
-    to_grid = lambda v: int(round((v + 5) * scale))
-    to_world = lambda g: g / scale - 5
-    grid_size = int(10 * scale) + 1
 
-    start = (to_grid(sx), to_grid(sy))
-    goal = (to_grid(gx), to_grid(gy))
+    # --- dynamic grid bounds: cover start + goal with a generous margin ---
+    margin = 6.0
+    x_min = min(sx, gx) - margin
+    x_max = max(sx, gx) + margin
+    y_min = min(sy, gy) - margin
+    y_max = max(sy, gy) + margin
+
+    scale = 1.0 / step
+    # Grid dimensions
+    cols = int(round((x_max - x_min) * scale)) + 1
+    rows = int(round((y_max - y_min) * scale)) + 1
+
+    def to_grid(wx, wy):
+        return (int(round((wx - x_min) * scale)),
+                int(round((wy - y_min) * scale)))
+
+    def to_world(gx_, gy_):
+        return (gx_ / scale + x_min, gy_ / scale + y_min)
+
+    start = to_grid(sx, sy)
+    goal  = to_grid(gx, gy)
+
+    # Clamp goal/start to grid (safety)
+    start = (max(0, min(cols - 1, start[0])), max(0, min(rows - 1, start[1])))
+    goal  = (max(0, min(cols - 1, goal[0])),  max(0, min(rows - 1, goal[1])))
 
     blocked = set()
     for obs in obstacle_map:
         ox, oy = obs['position'][0], obs['position'][1]
         r = int(np.ceil((obs['size'] / 2.0 + 0.3) * scale))
+        ogx, ogy = to_grid(ox, oy)
         for dx in range(-r, r + 1):
             for dy in range(-r, r + 1):
-                blocked.add((to_grid(ox) + dx, to_grid(oy) + dy))
+                nx_, ny_ = ogx + dx, ogy + dy
+                if 0 <= nx_ < cols and 0 <= ny_ < rows:
+                    blocked.add((nx_, ny_))
 
     def h(a, b):
         return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
     open_set = [(h(start, goal), 0, start, [start])]
-    visited = set()
+    visited  = set()
 
     while open_set:
         f, g, current, path = heapq.heappop(open_set)
@@ -249,13 +269,17 @@ def _astar_path(sx, sy, gx, gy, obstacle_map, step=0.5):
             continue
         visited.add(current)
         if current == goal:
-            return [(to_world(x), to_world(y)) for x, y in path]
-        for dx, dy in [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(1,-1),(-1,1),(1,1)]:
-            nb = (current[0]+dx, current[1]+dy)
-            if (0 <= nb[0] < grid_size and 0 <= nb[1] < grid_size
-                    and nb not in blocked and nb not in visited):
+            return [to_world(x, y) for x, y in path]
+        for dx, dy in [(-1,0),(1,0),(0,-1),(0,1),
+                        (-1,-1),(1,-1),(-1,1),(1,1)]:
+            nb = (current[0] + dx, current[1] + dy)
+            if (0 <= nb[0] < cols and 0 <= nb[1] < rows
+                    and nb not in blocked
+                    and nb not in visited):
                 new_g = g + (1.414 if dx != 0 and dy != 0 else 1.0)
-                heapq.heappush(open_set, (new_g + h(nb, goal), new_g, nb, path + [nb]))
+                heapq.heappush(
+                    open_set,
+                    (new_g + h(nb, goal), new_g, nb, path + [nb]))
 
     # Fallback: direct line
     return [(sx, sy), (gx, gy)]

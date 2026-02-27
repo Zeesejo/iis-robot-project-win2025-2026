@@ -221,15 +221,20 @@ def main():
     state_est           = (init_pos[0], init_pos[1], init_theta)
     obstacle_map_for_pf = [(o['position'][0], o['position'][1])
                            for o in scene_map['obstacles']]
-    collision_count   = 0
-    search_rotation   = init_theta
-    current_waypoints = []
-    waypoint_idx      = 0
-    nav_goal          = None      # the current navigation goal (x, y)
-    grasp_target_pos  = None
-    lift_z            = 0.9
-    step_count        = 0
-    path_planned      = False
+    collision_count     = 0
+    search_rotation     = init_theta
+    current_waypoints   = []
+    waypoint_idx        = 0
+    nav_goal            = None      # the current navigation goal (x, y)
+    grasp_target_pos    = None
+    lift_z              = 0.9
+    step_count          = 0
+    path_planned        = False
+
+    # Collision cooldown: after a backup we suppress new collision events
+    # for COLLISION_COOLDOWN steps so the robot has time to move away.
+    COLLISION_COOLDOWN   = 60   # ~0.25 s at 240 Hz
+    collision_cooldown   = 0
 
     PF_UPDATE_EVERY      = 3
     CAM_EVERY_N_STEPS    = 10
@@ -255,6 +260,10 @@ def main():
         cam_tick = (step_count % CAM_EVERY_N_STEPS == 0)
         pf_tick  = (step_count % PF_UPDATE_EVERY   == 0)
 
+        # Decrement collision cooldown each step
+        if collision_cooldown > 0:
+            collision_cooldown -= 1
+
         # ======= SENSE =======
         sensors = preprocess_all(robot_id, lidar_link, camera_link,
                                  include_camera=cam_tick)
@@ -277,8 +286,8 @@ def main():
         mission_event = 'tick'
         mission_data  = {}
 
-        # Collision via LIDAR
-        if min(lidar) < 0.25:
+        # Collision via LIDAR — only when cooldown has expired
+        if min(lidar) < 0.25 and collision_cooldown == 0:
             collision_count += 1
             mission_event = 'collision'
 
@@ -449,13 +458,16 @@ def main():
                 nav_ctrl.drive_to(wx, wy, est_x, est_y, est_theta)
 
         elif action == 'backup':
-            # Back up for 2 s, then re-plan from current position
+            # Back up for 2 s, then re-plan from current position.
+            # Reset the collision cooldown so we don't re-enter RECOVER
+            # immediately after returning to NAVIGATE.
             p.setJointMotorControl2(robot_id, left_joint,
                                      p.VELOCITY_CONTROL,
                                      targetVelocity=-2.0, force=10.0)
             p.setJointMotorControl2(robot_id, right_joint,
                                      p.VELOCITY_CONTROL,
                                      targetVelocity=-2.0, force=10.0)
+            collision_cooldown = COLLISION_COOLDOWN   # suppress lidar for ~0.25 s
             # Re-plan immediately after backup so NAVIGATE has fresh waypoints
             if nav_goal is not None:
                 path = _build_path(

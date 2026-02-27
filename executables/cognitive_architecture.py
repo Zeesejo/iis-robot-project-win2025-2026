@@ -87,7 +87,7 @@ def cam_to_world(cp, cam_pos, fwd):
     return (np.array(cam_pos) + cp[2]*fwd + cp[0]*right + cp[1]*up).tolist()
 
 
-def approach_goal(rx, ry, tx, ty, stand_off=0.6):
+def approach_goal(rx, ry, tx, ty, stand_off=1.5):
     """Return a point stand_off metres from (tx,ty) toward (rx,ry)."""
     dx, dy = tx - rx, ty - ry
     d = np.hypot(dx, dy)
@@ -97,9 +97,6 @@ def approach_goal(rx, ry, tx, ty, stand_off=0.6):
 
 
 def wall_obstacles(room_half=5.0, thickness=0.5, n=8):
-    """Virtual wall blockers so A* stays inside the room.
-    room_half=5.0 is safely larger than any spawn/table position.
-    """
     walls, seg = [], 2 * room_half / n
     for i in range(n):
         t = -room_half + (i + 0.5) * seg
@@ -119,11 +116,10 @@ def stop_wheels(robot_id, left_joint, right_joint):
                             targetVelocity=0, force=50.0)
 
 
-def plan_to_table(est_x, est_y, table_xy, obs_list, kb, stand_off=0.6):
+def plan_to_table(est_x, est_y, table_xy, obs_list, kb, stand_off=1.5):
     """Plan an A* path from current pos to stand_off metres from the table."""
     gx, gy = approach_goal(est_x, est_y, table_xy[0], table_xy[1], stand_off)
     path   = plan_path_prolog(est_x, est_y, gx, gy, obs_list, kb)
-    # Drop the start node (robot is already there)
     if len(path) > 1:
         path = path[1:]
     return path
@@ -187,11 +183,8 @@ def main():
         p.computeProjectionMatrixFOV(60, 1.0, 0.1, 10.0), dtype=np.float64
     ).reshape(4, 4).T
 
-    # Obstacle lists for A*
     obs_pf    = [(o['position'][0], o['position'][1]) for o in scene_map['obstacles']]
-    # Table as a 0.9 m blocker so approach point at 0.6 m standoff is reachable
     table_obs = [{'position': [kb_table_xy[0], kb_table_xy[1], 0], 'size': 0.9}]
-    # Walls at room_half=5.0 so robot spawn near walls is never inside a blocker
     _walls    = wall_obstacles(room_half=5.0, thickness=0.5, n=8)
 
     def obs_for_path():
@@ -203,10 +196,10 @@ def main():
     # ---- Constants ----
     COLLISION_DIST      = 0.15
     COLLISION_COOLDOWN  = 240
-    WP_ARRIVE           = 0.50
-    WP_TIMEOUT          = 240 * 15   # 15 s per waypoint
-    STAND_OFF           = 0.6
-    ALIGN_CLOSE_ENOUGH  = 1.0
+    WP_ARRIVE           = 0.40
+    WP_TIMEOUT          = 240 * 15
+    STAND_OFF           = 1.5   # must be > table blocker inflation (~0.7 m)
+    ALIGN_CLOSE_ENOUGH  = 1.6   # must be >= STAND_OFF
     PF_EVERY            = 3
     CAM_EVERY           = 10
     LOG_EVERY           = 240 * 5
@@ -224,7 +217,6 @@ def main():
     current_waypoints   = []
     waypoint_idx        = 0
     waypoint_steps      = 0
-    nav_goal            = kb_table_xy[:]
     grasp_target_pos    = None
     grasp_target_locked = False
     step_count          = 0
@@ -234,13 +226,12 @@ def main():
     in_recover_prev     = False
     search_steps        = 0
     align_too_far_steps = 0
-    # BUG-B-FIX: flag so post-recover replan fires only once, not every tick
     recover_replan_done = False
+    just_replanned      = False   # prevents same-tick at_table after ALIGN re-nav
 
     _nav_rgb = _nav_depth = _nav_cam_pos = _nav_fwd = _nav_view = None
     _w_rgb   = _w_depth   = None
 
-    # Prime FSM: INIT -> SEARCH
     fsm_state, cmd = fsm.transition('tick')
     print("[CogArch] Loop started.")
 
@@ -269,10 +260,9 @@ def main():
         est_x, est_y   = gt_pos[0], gt_pos[1]
         est_theta       = p.getEulerFromQuaternion(gt_orn)[2]
 
-        # ---- Track RECOVER entry/exit ----
+        # ---- Track RECOVER entry ----
         in_recover_now = (fsm.state == State.RECOVER)
         if in_recover_now and not in_recover_prev:
-            # Just entered RECOVER
             recover_steps       = 0
             recover_replan_done = False
         if in_recover_now:
@@ -291,7 +281,6 @@ def main():
             collision_cooldown = COLLISION_COOLDOWN
             mission_event      = 'collision'
 
-        # Nav camera update
         if cam_tick:
             try:
                 _nav_rgb, _nav_depth, _nav_cam_pos, _nav_fwd, _nav_view = \
@@ -382,10 +371,13 @@ def main():
             search_steps = 0
 
         # ---- Waypoint arrival ----
+        # just_replanned guard: skip this check the tick we switched to NAVIGATE
+        # from ALIGN re-nav, so we don't immediately fire at_table again.
         if (fsm.state == State.NAVIGATE
                 and current_waypoints
                 and waypoint_idx < len(current_waypoints)
-                and mission_event == 'tick'):
+                and mission_event == 'tick'
+                and not just_replanned):
             wx, wy    = current_waypoints[waypoint_idx]
             dist_wp   = np.hypot(est_x - wx, est_y - wy)
             waypoint_steps += 1
@@ -400,6 +392,7 @@ def main():
                     print("[CogArch] All WPs reached -> ALIGN")
                 else:
                     mission_event = 'waypoint_reached'
+        just_replanned = False  # always clear after one tick
 
         # ---- ALIGN: check proximity, re-nav if too far ----
         if fsm.state == State.ALIGN and mission_event == 'tick':
@@ -420,6 +413,7 @@ def main():
                     waypoint_idx      = 0
                     waypoint_steps    = 0
                     path_planned      = True
+                    just_replanned    = True  # skip arrival check next tick
                     fsm.state         = State.NAVIGATE
                     fsm._state_steps  = 0
                     cmd               = {'cmd': 'continue_nav'}
@@ -445,8 +439,7 @@ def main():
             if p.getLinkState(robot_id, ee_index)[0][2] > LIFT_Z - LIFT_SUCCESS_MARGIN:
                 mission_event = 'lift_success'
 
-        # ---- RECOVER timeout -> re-plan once then back to NAVIGATE ----
-        # BUG-B-FIX: guard with recover_replan_done so this fires exactly once
+        # ---- RECOVER timeout -> re-plan once ----
         if (fsm.state == State.RECOVER
                 and recover_steps >= RECOVER_TOTAL
                 and not recover_replan_done):
@@ -462,6 +455,7 @@ def main():
             waypoint_idx      = 0
             waypoint_steps    = 0
             path_planned      = True
+            just_replanned    = True
             print(f"[CogArch] Post-recover re-plan: {len(path)} wps")
             mission_event = 'tick'
             cmd = {'cmd': 'continue_nav'}
@@ -487,7 +481,6 @@ def main():
                   f"locked={grasp_target_locked}")
 
         # ===== FSM DISPATCH =====
-        # Only tick FSM on real events; avoid burning step counters on idle ticks
         if mission_event != 'tick':
             fsm_state, cmd = fsm.transition(mission_event, mission_data)
         elif fsm.state in (State.NAVIGATE, State.RECOVER):
@@ -513,6 +506,7 @@ def main():
             waypoint_idx      = 0
             waypoint_steps    = 0
             path_planned      = True
+            just_replanned    = True
             if path:
                 nav_ctrl.drive_to(
                     path[0][0], path[0][1], est_x, est_y, est_theta

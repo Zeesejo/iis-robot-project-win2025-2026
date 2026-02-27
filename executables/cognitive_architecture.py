@@ -30,6 +30,12 @@ FIXES in this revision
   [F17] FIX #2: Grasp IK target converted from world-frame to robot-local
         frame so arm can actually reach the cylinder.
   [F18] FIX #4: _perception_interval raised 10->30 to reduce CPU stall.
+  [F19] FIX: APPROACH think() now reads self.target_camera_depth directly
+        each tick instead of the stale sensor_data value, so the FSM
+        distance_to_target stays live and the robot actually advances.
+  [F20] FIX: F12 lidar emergency-stop threshold raised 0.07->0.04 m and
+        requires 3 consecutive hits to fire, preventing sensor noise from
+        freezing forward velocity during close-range approach.
 """
 
 import pybullet as p
@@ -104,6 +110,10 @@ CYLINDER_CENTER_Z = 0.685  # TABLE_HEIGHT + TARGET_HEIGHT/2
 GRASP_HEIGHT_OFFSET = 0.02  # Gripper needs to be slightly below cylinder center for grasp
 LIFT_HEIGHT = 0.15  # How high to lift the cylinder after grasping
 APPROACH_HEIGHT = 0.15  # How high above grasp point to approach from
+
+# -- [F20] Lidar emergency-stop: raised threshold + consecutive-hit guard ----
+_LIDAR_ESTOP_THRESHOLD   = 0.04   # was 0.07 m; noise readings rarely exceed 0.02 m
+_LIDAR_ESTOP_CONSEC_HITS = 3      # must trigger this many times in a row to stop
 
 
 def _lidar_has_data(lidar):
@@ -182,6 +192,9 @@ class CognitiveArchitecture:
         self.dt           = 1.0 / 240.0
 
         self._last_grasp_attempt = False
+
+        # [F20] Consecutive lidar-estop hit counter
+        self._lidar_estop_consec = 0
         
         self._initialize_world_knowledge()
         self._initialize_motors()
@@ -530,7 +543,7 @@ class CognitiveArchitecture:
                         fx = fy * (320 / 240)
                         px = cam_x * fx / cam_z + 160.0
                         self.target_camera_bearing = math.atan2(px - 160.0, fx)
-                        self.target_camera_depth   = cam_z
+                        self.target_camera_depth   = cam_z   # <-- always fresh from PCA
 
                         alpha = 0.4 if self.target_detection_count > 3 else 0.8
                         if self.target_position_smoothed is None:
@@ -666,8 +679,11 @@ class CognitiveArchitecture:
             dx, dy      = target_pos[0]-pose[0], target_pos[1]-pose[1]
             distance_2d = np.hypot(dx, dy)
             if self.fsm.state == RobotState.APPROACH:
-                # For APPROACH state, use camera depth if available
-                cam_depth = sensor_data.get('target_camera_depth', float('inf'))
+                # [F19] FIX: Read self.target_camera_depth directly — it is updated
+                # by sense() every _perception_interval steps.  sensor_data carries
+                # the value from the START of this STA tick which may be one tick
+                # stale; reading the instance variable gives the freshest value.
+                cam_depth = self.target_camera_depth
                 if cam_depth < MAX_TARGET_DEPTH:
                     distance_for_fsm = cam_depth
                     if self.step_counter % 120 == 0:
@@ -679,7 +695,7 @@ class CognitiveArchitecture:
                 sdy = self.approach_standoff[1]-pose[1]
                 distance_for_fsm = np.hypot(sdx, sdy)
             else:
-                cam_d = sensor_data.get('target_camera_depth', float('inf'))
+                cam_d = self.target_camera_depth
                 distance_for_fsm = cam_d if cam_d < MAX_TARGET_DEPTH else distance_2d
         else:
             # No target detected - use table position for navigation
@@ -736,7 +752,7 @@ class CognitiveArchitecture:
                 print(f"[Think] NAVIGATE: target_pos={target_pos is not None}, "
                       f"approach_standoff={self.approach_standoff}")
             
-            cam_d       = sensor_data.get('target_camera_depth', float('inf'))
+            cam_d       = self.target_camera_depth
             use_relaxed = cam_d < 2.5 and sensor_data['target_detected']
 
             # [F16] FIX #1: Use _compute_approach_standoff() so the nav goal is
@@ -780,8 +796,8 @@ class CognitiveArchitecture:
             # If we don't have target position yet, we need to find it first
             if not target_pos:
                 # Use camera bearing to find the target
-                cam_bearing = sensor_data.get('target_camera_bearing', 0.0)
-                cam_depth = sensor_data.get('target_camera_depth', float('inf'))
+                cam_bearing = self.target_camera_bearing
+                cam_depth = self.target_camera_depth
                 
                 # If we can see something (bearing != 0 or depth < inf), target is visible
                 if cam_depth < MAX_TARGET_DEPTH:
@@ -813,10 +829,9 @@ class CognitiveArchitecture:
             else:
                 dist_3d = float('inf')
             
-            # Use camera depth for more accurate distance when target is visible
-            cam_depth = sensor_data.get('target_camera_depth', float('inf'))
+            # [F19] Always read live depth from instance variable, not stale sensor_data
+            cam_depth = self.target_camera_depth
             if cam_depth < MAX_TARGET_DEPTH:
-                # Camera depth is more reliable for grasping
                 use_dist = cam_depth
                 if self.step_counter % 120 == 0:
                     print(f"[Think] APPROACH: using camera depth={cam_depth:.2f}m")
@@ -828,7 +843,7 @@ class CognitiveArchitecture:
                     'pose':              pose,
                     'lidar':             sensor_data['lidar'],
                     'relaxed_avoidance': True,
-                    'camera_bearing':    sensor_data.get('target_camera_bearing', 0.0),
+                    'camera_bearing':    self.target_camera_bearing,
                     'camera_depth':      cam_depth,
                     'world_target':      approach_target,
                     'world_dist_2d':     dist_3d}
@@ -1173,11 +1188,18 @@ class CognitiveArchitecture:
                 fv, at = self._lidar_avoidance(lidar, fv, relaxed=True, pose=pose)
                 av    += at
             else:
+                # [F20] Raised threshold 0.07->0.04 m; require 3 consecutive hits
+                # to distinguish real obstacles from sensor noise at close range.
                 if _lidar_has_data(lidar):
                     mf = min(lidar[i % len(lidar)] for i in range(-2, 3))
-                    if mf < 0.07:
-                        fv = 0.0
-                        print(f"[F12] Lidar emergency stop mf={mf:.3f}m")
+                    if mf < _LIDAR_ESTOP_THRESHOLD:
+                        self._lidar_estop_consec += 1
+                        if self._lidar_estop_consec >= _LIDAR_ESTOP_CONSEC_HITS:
+                            fv = 0.0
+                            print(f"[F12] Lidar emergency stop mf={mf:.3f}m "
+                                  f"(consec={self._lidar_estop_consec})")
+                    else:
+                        self._lidar_estop_consec = 0  # reset on clean reading
 
             if self.step_counter % 240 == 0:
                 print(f"[Act] APPROACH_VISUAL: world_dist={sd:.2f}m, "

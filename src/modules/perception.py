@@ -182,21 +182,30 @@ def refine_box_points(points, obb_center, obb_vectors, obb_dims,
         mask    &= (proj >= -half_dim) & (proj <= half_dim)
     return points[mask]
 
-def depth_to_point_cloud(depth_buffer, width=CAM_WIDTH, height=CAM_HEIGHT,
-                          fov=CAM_FOV_DEG, near=CAM_NEAR, far=CAM_FAR):
-    depth_linear = (2.0 * near * far) / (far + near - (2.0 * depth_buffer - 1.0) * (far - near))
-    depth_2d     = np.reshape(depth_linear, (height, width))
-    aspect = width / height
-    fy     = (height / 2.0) / np.tan(np.radians(fov / 2.0))
-    fx     = fy
-    cx, cy = width / 2.0, height / 2.0
-    v_idx, u_idx = np.indices((height, width))
-    z = depth_2d
-    x = (u_idx - cx) * z / fx
-    y = (v_idx - cy) * z / fy
+def depth_to_point_cloud(depth_buffer, width=CAM_WIDTH, height=CAM_HEIGHT, fov=CAM_FOV_DEG, near=CAM_NEAR, far=CAM_FAR):
+    depth_buffer = np.asarray(depth_buffer, dtype=np.float32)
 
-    points = np.stack([x, y, z], axis=-1).reshape(-1, 3)
-    valid  = (z.flatten() > near) & (z.flatten() < far * 0.99)
+    # OpenGL depth [0..1] -> linear depth (positive distance)
+    z = (2.0 * near * far) / (far + near - (2.0 * depth_buffer - 1.0) * (far - near))
+    z2d = z.reshape((height, width))
+
+    # Your projection uses aspect = 1.0, so fx = fy
+    fy = (height / 2.0) / np.tan(np.radians(fov / 2.0))
+    fx = fy
+    cx, cy = width / 2.0, height / 2.0
+
+    v, u = np.indices((height, width))
+
+    # OpenGL camera coordinates:
+    #  x right, y up, camera looks along -Z
+    x = (u - cx) * z2d / fx
+    y = -(v - cy) * z2d / fy
+    z_cam = -z2d
+
+    points = np.stack([x, y, z_cam], axis=-1).reshape(-1, 3)
+
+    # Validity should use the positive distance z2d
+    valid = (z2d.flatten() > near) & (z2d.flatten() < far * 0.99)
     return points[valid], valid
 
 def _view_to_Tcw(view_matrix):
@@ -272,12 +281,16 @@ class PerceptionModule:
         plane_mask, plane_model = ransac.run()
 
         if plane_model is not None:
-            A, B, C, D = plane_model
-            if abs(D) > 0.35:
-                results['table_plane'] = {
-                    'model':       plane_model,
-                    'num_inliers': int(np.sum(plane_mask)),
-                }
+            inliers = all_points_3d[plane_mask]
+            if len(inliers) > 50:
+                z_med = float(np.median(inliers[:, 2]))
+                # table top is z=0.625 (allow tolerance)
+                if abs(z_med - 0.625) < 0.10:
+                    results['table_plane'] = {
+                        'model': plane_model,
+                        'num_inliers': int(np.sum(plane_mask)),
+                        'z_med': z_med
+                    }
         else:
             plane_mask = np.zeros(len(all_points_3d), dtype=bool)
         red_target_pose = None
@@ -311,8 +324,9 @@ class PerceptionModule:
                 'dimensions': dims.tolist(),
             }
             print(f"[M4-PCA] Target (red cylinder) "
-                    f"center=({center[0]:.3f},{center[1]:.3f},{center[2]:.3f}) "
-                    f"dims=({dims[0]:.3f},{dims[1]:.3f},{dims[2]:.3f})")
+                f"centerW=({center_out[0]:.3f},{center_out[1]:.3f},{center_out[2]:.3f}) "
+                f"centerC=({center[0]:.3f},{center[1]:.3f},{center[2]:.3f}) "
+                f"dims=({dims[0]:.3f},{dims[1]:.3f},{dims[2]:.3f})")
             # except ValueError as e:
             #     print(f"[M4-PCA] Target PCA failed: {e}")
         results['target_pose'] = red_target_pose

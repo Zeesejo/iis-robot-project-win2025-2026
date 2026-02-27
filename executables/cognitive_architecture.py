@@ -145,6 +145,30 @@ def _build_path(est_x, est_y, goal, obstacle_map_for_pf, kb):
     return path
 
 
+# ===================== BOUNDARY WALLS AS VIRTUAL OBSTACLES =====================
+
+def _wall_obstacles(room_half=4.8, wall_thickness=0.6, n_segments=8):
+    """
+    Return a list of obstacle dicts representing the 4 room boundary walls
+    so A* treats them as impassable.
+    room_half: half-size of the navigable area (room is 10x10, walls at ±5,
+               keep robot 0.2 m inside -> ±4.8)
+    """
+    walls = []
+    segment_size = (2 * room_half) / n_segments
+    for i in range(n_segments):
+        t = -room_half + (i + 0.5) * segment_size
+        # North wall  (y = +room_half)
+        walls.append({'position': [t,  room_half, 0], 'size': wall_thickness})
+        # South wall  (y = -room_half)
+        walls.append({'position': [t, -room_half, 0], 'size': wall_thickness})
+        # East wall   (x = +room_half)
+        walls.append({'position': [ room_half, t, 0], 'size': wall_thickness})
+        # West wall   (x = -room_half)
+        walls.append({'position': [-room_half, t, 0], 'size': wall_thickness})
+    return walls
+
+
 # ===================== MAIN COGNITIVE LOOP =====================
 
 def main():
@@ -217,10 +241,17 @@ def main():
         dtype=np.float64
     ).reshape(4, 4).T
 
-    # ---- State variables ----
-    state_est           = (init_pos[0], init_pos[1], init_theta)
+    # ---- Obstacle map for A* (scene obstacles + boundary walls) ----
     obstacle_map_for_pf = [(o['position'][0], o['position'][1])
                            for o in scene_map['obstacles']]
+    # Virtual wall obstacles so A* never routes through room boundaries
+    _wall_obs = _wall_obstacles(room_half=4.8, wall_thickness=0.6, n_segments=8)
+    _wall_xy  = [(w['position'][0], w['position'][1]) for w in _wall_obs]
+    # PF only uses real obstacles; A* uses real + walls
+    obstacle_map_for_astar = obstacle_map_for_pf + _wall_xy
+
+    # ---- State variables ----
+    state_est           = (init_pos[0], init_pos[1], init_theta)
     collision_count     = 0
     search_rotation     = init_theta
     current_waypoints   = []
@@ -231,10 +262,21 @@ def main():
     step_count          = 0
     path_planned        = False
 
-    # Collision cooldown: after a backup we suppress new collision events
-    # for COLLISION_COOLDOWN steps so the robot has time to move away.
-    COLLISION_COOLDOWN   = 60   # ~0.25 s at 240 Hz
+    # -------------------------------------------------------------------
+    # Collision cooldown:
+    # After entering RECOVER we suppress new collision events for
+    # COLLISION_COOLDOWN steps so the robot has time to back up.
+    # This prevents the RECOVER->NAVIGATE->collision->RECOVER loop that
+    # was burning the entire simulation budget.
+    # -------------------------------------------------------------------
+    COLLISION_COOLDOWN   = 120   # ~0.5 s at 240 Hz (increased from 60)
     collision_cooldown   = 0
+
+    # RECOVER step counter — tracks steps spent in RECOVER state
+    # so we know when to leave it (replaces FSM internal _state_steps
+    # which was being reset every transition).
+    recover_steps        = 0
+    RECOVER_EXIT_STEPS   = 240   # back up for 1 s then re-plan once
 
     PF_UPDATE_EVERY      = 3
     CAM_EVERY_N_STEPS    = 10
@@ -286,10 +328,19 @@ def main():
         mission_event = 'tick'
         mission_data  = {}
 
-        # Collision via LIDAR — only when cooldown has expired
-        if min(lidar) < 0.25 and collision_cooldown == 0:
+        # Collision via LIDAR — only when cooldown has expired AND not
+        # already in RECOVER (let RECOVER run its full backup duration)
+        if (min(lidar) < 0.25
+                and collision_cooldown == 0
+                and fsm.state != State.RECOVER):
             collision_count += 1
             mission_event = 'collision'
+
+        # Track steps spent inside RECOVER
+        if fsm.state == State.RECOVER:
+            recover_steps += 1
+        else:
+            recover_steps = 0
 
         # Nav camera (throttled)
         if cam_tick:
@@ -420,6 +471,13 @@ def main():
             if p.getLinkState(robot_id, ee_index)[0][2] > lift_z - 0.05:
                 mission_event = 'lift_success'
 
+        # RECOVER timeout: after RECOVER_EXIT_STEPS steps in RECOVER,
+        # force-transition back to NAVIGATE and re-plan.
+        # This replaces the broken FSM internal timer which was being
+        # reset on every collision->RECOVER transition.
+        if fsm.state == State.RECOVER and recover_steps >= RECOVER_EXIT_STEPS:
+            mission_event = 'recover_done'   # custom event handled below
+
         # Progress log every 5 s
         if step_count % LOG_EVERY_STEPS == 0:
             print(f"[CogArch] t={step_count//240}s | state={fsm.state} "
@@ -428,8 +486,40 @@ def main():
                   f"| lidar_min={min(lidar):.2f}")
 
         # ---- Drive FSM ----
-        fsm_state, cmd = fsm.transition(mission_event, mission_data)
-        action = cmd.get('cmd', 'idle')
+        # Handle the custom recover_done event outside the FSM so we can
+        # re-plan with wall-aware obstacle map before resuming NAVIGATE.
+        if mission_event == 'recover_done':
+            # Manually force FSM to NAVIGATE
+            fsm.state = State.NAVIGATE
+            fsm._state_steps = 0
+            recover_steps = 0
+            collision_cooldown = COLLISION_COOLDOWN
+            # Re-plan from current position with full obstacle + wall map
+            if nav_goal is not None:
+                # Nudge start point away from wall to help A* find a clear node
+                nudge_x = np.clip(est_x, -4.5, 4.5)
+                nudge_y = np.clip(est_y, -4.5, 4.5)
+                obs_for_path = [
+                    {'position': [ox, oy, 0], 'size': 0.4}
+                    for ox, oy in obstacle_map_for_astar
+                ]
+                path = plan_path_prolog(
+                    nudge_x, nudge_y, nav_goal[0], nav_goal[1],
+                    obs_for_path, kb)
+                if len(path) > 1:
+                    path = path[1:]
+                fsm.set_waypoints(path)
+                current_waypoints = path
+                waypoint_idx = 0
+                path_planned = True
+                print(f"[CogArch] Re-planned after recovery: "
+                      f"{len(path)} waypoints")
+            fsm_state = fsm.state
+            cmd = {'cmd': 'continue_nav'}
+            action = 'continue_nav'
+        else:
+            fsm_state, cmd = fsm.transition(mission_event, mission_data)
+            action = cmd.get('cmd', 'idle')
 
         # ======= ACT =======
         if action == 'rotate_search':
@@ -440,9 +530,15 @@ def main():
             # nav_goal is set when the FSM fires table_found / target_found
             goal = nav_goal or fsm.table_position
             if goal is not None:
-                path = _build_path(
-                    est_x, est_y, goal,
-                    obstacle_map_for_pf, kb)
+                obs_for_path = [
+                    {'position': [ox, oy, 0], 'size': 0.4}
+                    for ox, oy in obstacle_map_for_astar
+                ]
+                path = plan_path_prolog(
+                    est_x, est_y, goal[0], goal[1], obs_for_path, kb)
+                if len(path) > 1:
+                    path = path[1:]
+                print(f"[CogArch] Path planned: {len(path)} waypoints to {goal}")
                 fsm.set_waypoints(path)
                 current_waypoints = path
                 waypoint_idx = 0
@@ -458,27 +554,16 @@ def main():
                 nav_ctrl.drive_to(wx, wy, est_x, est_y, est_theta)
 
         elif action == 'backup':
-            # Back up for 2 s, then re-plan from current position.
-            # Reset the collision cooldown so we don't re-enter RECOVER
-            # immediately after returning to NAVIGATE.
+            # Back up and let RECOVER run for RECOVER_EXIT_STEPS.
+            # The re-plan is now handled by the recover_done handler above
+            # (NOT here) so we only re-plan once per recovery, not every step.
             p.setJointMotorControl2(robot_id, left_joint,
                                      p.VELOCITY_CONTROL,
                                      targetVelocity=-2.0, force=10.0)
             p.setJointMotorControl2(robot_id, right_joint,
                                      p.VELOCITY_CONTROL,
                                      targetVelocity=-2.0, force=10.0)
-            collision_cooldown = COLLISION_COOLDOWN   # suppress lidar for ~0.25 s
-            # Re-plan immediately after backup so NAVIGATE has fresh waypoints
-            if nav_goal is not None:
-                path = _build_path(
-                    est_x, est_y, nav_goal,
-                    obstacle_map_for_pf, kb)
-                fsm.set_waypoints(path)
-                current_waypoints = path
-                waypoint_idx = 0
-                path_planned = True
-                print(f"[CogArch] Re-planned after collision: "
-                      f"{len(path)} waypoints")
+            collision_cooldown = COLLISION_COOLDOWN
 
         elif action == 'align_arm':
             if grasp_target_pos:

@@ -10,7 +10,6 @@ services:
     environment:
       - DISPLAY=${DISPLAY}
       - QT_X11_NO_MITSHM=1
-      - SDL_VIDEODRIVER=dummy
       # This ensures Python can find your 'src' and 'modules'
       - PYTHONPATH=/home/jovyan/work
     volumes:
@@ -23,4 +22,4 @@ services:
     working_dir: /home/jovyan/work/executables
     
     # Default command (can be overridden by docker-compose run)
-    command: xvfb-run python3 cognitive_architecture.py
+    command: python3 cognitive_architecture.py

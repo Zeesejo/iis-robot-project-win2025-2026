@@ -88,17 +88,10 @@ import json
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from src.environment.world_builder import build_world, TABLE_HEIGHT, TARGET_HEIGHT
-from src.modules.sensor_preprocessing import get_sensor_data, get_sensor_id
+from src.modules.sensor_preprocessing import get_sensor_data, get_sensor_id, get_link_id_by_name
 from src.modules.perception import (
     PerceptionModule,
-    detect_objects_by_color,
-    RANSAC_Segmentation,
-    depth_to_point_cloud,
-    edge_contour_segmentation,
-    compute_pca,
-    refine_object_points,
-    SCENE_OBJECTS,
-    COLOR_RANGES_HSV,
+    edge_contour_segmentation
 )
 from src.modules.state_estimation import state_estimate, initialize_state_estimator
 from src.modules.motion_control import PIDController, move_to_goal, grasp_object
@@ -128,6 +121,9 @@ MAX_TARGET_DEPTH = 3.5
 MIN_TARGET_DEPTH = 0.2
 MAX_JUMP_M       = 1.0
 _CAM_TILT        = 0.2
+CAM_OFFSET_POS = [0.12, 0.0, 0.27]
+CAM_OFFSET_ORN = p.getQuaternionFromEuler([0.0, 0.2, 0.0])  # rpy
+
 
 # -- [F45] Z height filter: cylinder centroid = 0.695 m; table surface = 0.625 m.
 #    Anything detected below 0.63 m is floor/obstacle-face level, not on table.
@@ -551,6 +547,28 @@ class CognitiveArchitecture:
         self.target_position = list(self.target_position_smoothed)
         self.kb.add_position('target', *self.target_position)
         return True
+    
+    def compute_view_from_gripper(self):
+        gripper_link_index = get_link_id_by_name(self.robot_id, 'gripper_base')
+        ls = p.getLinkState(self.robot_id, gripper_link_index, computeForwardKinematics=True)
+        g_pos = ls[4]
+        g_orn = ls[5]
+
+        cam_pos, cam_orn = p.multiplyTransforms(g_pos, g_orn, CAM_OFFSET_POS, CAM_OFFSET_ORN)
+
+        R = np.array(p.getMatrixFromQuaternion(cam_orn)).reshape(3, 3)
+
+        forward = R[:, 0]     # +X
+        up      = R[:, 2]     # +Z
+
+        target = (np.array(cam_pos) + 0.20 * forward).tolist()
+
+        view = p.computeViewMatrix(
+            cameraEyePosition=cam_pos,
+            cameraTargetPosition=target,
+            cameraUpVector=up.tolist()
+        )
+        return view, cam_pos, cam_orn
 
     # ========================== SENSE =====================================
 
@@ -578,7 +596,8 @@ class CognitiveArchitecture:
                                  float(estimated_pose[1]), 0.0)
 
         if rgb is not None and depth is not None and self.step_counter % 10 == 0:
-            perc = self.perception.process_frame(rgb, depth, width=320, height=240)
+            view, _, _ = self.compute_view_from_gripper()
+            perc = self.perception.process_frame(rgb, depth, width=320, height=240, view_matrix=view)
             self.last_perception_result = perc
 
             if perc['table_plane'] is not None:
@@ -603,64 +622,6 @@ class CognitiveArchitecture:
                 print(f"[M4-Edge] seg_pixels={int(np.sum(seg_mask > 0))}, "
                       f"edge_pixels={int(np.sum(edge_map > 0))}")
 
-            depth_arr = np.array(depth).reshape(240, 320)
-            red_dets  = sorted(
-                [d for d in detections if d['color'] == TARGET_COLOR],
-                key=lambda d: d['area'], reverse=True
-            )
-
-            for det in red_dets[:1]:
-                x, y, w, h = det['bbox']
-                cx_px = int(x + w / 2)
-                cy_px = int(y + h / 2)
-                if not (0 <= cy_px < 240 and 0 <= cx_px < 320):
-                    continue
-                raw_d = depth_arr[cy_px, cx_px]
-                if raw_d <= 0 or raw_d >= 1.0:
-                    continue
-                true_d = DEPTH_FAR * DEPTH_NEAR / (
-                    DEPTH_FAR - (DEPTH_FAR - DEPTH_NEAR) * raw_d)
-                if not (MIN_TARGET_DEPTH < true_d < MAX_TARGET_DEPTH):
-                    continue
-                if np.isnan(true_d) or np.isinf(true_d):
-                    continue
-                if self.target_position_smoothed is None and true_d > 3.0:
-                    continue
-
-                bearing = math.atan2(-(cx_px - CAM_CX), CAM_FX)
-                wp      = self._pixel_depth_to_world(cx_px, cy_px,
-                                                     true_d, estimated_pose)
-                # [F45] Z clamp now uses raised _TARGET_Z_MIN
-                wp[2]   = float(np.clip(wp[2], _TARGET_Z_MIN, _TARGET_Z_MAX))
-
-                if self.table_position is not None:
-                    dist_to_table = np.hypot(wp[0] - self.table_position[0],
-                                             wp[1] - self.table_position[1])
-                    if dist_to_table > MAX_TARGET_DEPTH:
-                        continue
-
-                if self.pca_target_pose is not None:
-                    pca_c      = self.pca_target_pose['center']
-                    pca_body_x = pca_c[2]
-                    pca_body_y = -pca_c[0]
-                    rx, ry, rt = estimated_pose
-                    pca_wx = rx + pca_body_x*math.cos(rt) - pca_body_y*math.sin(rt)
-                    pca_wy = ry + pca_body_x*math.sin(rt) + pca_body_y*math.cos(rt)
-                    pca_wz = float(np.clip(
-                        CAMERA_HEIGHT - pca_c[1], _TARGET_Z_MIN, _TARGET_Z_MAX))
-                    pca_world = [pca_wx, pca_wy, pca_wz]
-                    if np.hypot(pca_world[0]-wp[0], pca_world[1]-wp[1]) < 0.5:
-                        wp = pca_world
-
-                # [F45/F46] _update_target_from_detection checks Z and
-                # non-table obstacle proximity
-                accepted = self._update_target_from_detection(wp, true_d, bearing)
-                if accepted and self.step_counter % 10 == 0:
-                    print(f"[CogArch] TARGET at "
-                          f"({wp[0]:.2f},{wp[1]:.2f},{wp[2]:.2f}) "
-                          f"depth={true_d:.2f}m")
-                break
-
         # [F43] Debounced touch detection via joint torque
         gripper_contact = self._check_gripper_contact(joint_states)
 
@@ -671,8 +632,8 @@ class CognitiveArchitecture:
             'lidar':                 lidar,
             'imu':                   imu,
             'joint_states':          joint_states,
-            'target_detected':       self.target_position is not None,
-            'target_position':       self.target_position,
+            'target_detected':       self.pca_target_pose is not None,
+            'target_position':       self.pca_target_pose,
             'target_camera_bearing': self.target_camera_bearing,
             'target_camera_depth':   self.target_camera_depth,
             'gripper_contact':       gripper_contact,
@@ -741,33 +702,9 @@ class CognitiveArchitecture:
 
         target_pos = self.kb.query_position('target')
         if sensor_data['target_detected']:
-            target_pos = sensor_data['target_position']
+            target_pos = sensor_data['target_position']['center']
+        print(f"[Debug] Target pos: {target_pos}")
 
-        # [F44] SEARCH FAST-SKIP + [F45] init smoother fix:
-        # When the table is already known from initial_map.json, skip the spin
-        # and navigate directly. Also set target_position_smoothed so the
-        # MAX_JUMP guard fires correctly on the first real camera detection.
-        if (self.fsm.state == RobotState.SEARCH
-                and self.table_position is not None
-                and not sensor_data['target_detected']):
-            synth_z   = _GRASP_WORLD_Z
-            synth_pos = [self.table_position[0],
-                         self.table_position[1],
-                         synth_z]
-            if self.target_position is None:
-                self.target_position          = synth_pos
-                # [F45] Also seed the smoother so MAX_JUMP_M=1.0 fires
-                # correctly when vision detects something far from table.
-                self.target_position_smoothed = list(synth_pos)
-                self.target_camera_depth = np.hypot(
-                    synth_pos[0] - pose[0], synth_pos[1] - pose[1])
-                sensor_data = dict(sensor_data)
-                sensor_data['target_detected'] = True
-                sensor_data['target_position'] = synth_pos
-                target_pos = synth_pos
-                print(f"[F44] SEARCH skip: table known at "
-                      f"({self.table_position[0]:.2f},{self.table_position[1]:.2f}), "
-                      f"navigating directly.")
 
         if target_pos:
             dx, dy      = target_pos[0]-pose[0], target_pos[1]-pose[1]
@@ -1165,6 +1102,9 @@ def main():
     print(f"[Init] Grasp world Z={_GRASP_WORLD_Z:.3f}m  "
           f"above Z={_GRASP_ABOVE_WORLD_Z:.3f}m  lift={_GRASP_LIFT_POS}")
     print("[Init] Mission: navigate to table, grasp red cylinder\n")
+
+
+    ######        Main Loop        ######
 
     while p.isConnected():          # DO NOT TOUCH
         try:

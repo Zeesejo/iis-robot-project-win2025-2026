@@ -194,22 +194,21 @@ def main():
         return r
 
     # ---- Constants ----
-    COLLISION_DIST      = 0.15
-    COLLISION_COOLDOWN  = 240
-    WP_ARRIVE           = 0.40
-    WP_TIMEOUT          = 240 * 15
-    STAND_OFF           = 1.5   # must be > table blocker inflation (~0.7 m)
-    ALIGN_CLOSE_ENOUGH  = 1.6   # must be >= STAND_OFF
-    PF_EVERY            = 3
-    CAM_EVERY           = 10
-    LOG_EVERY           = 240 * 5
-    SEARCH_TIMEOUT      = 480
-    RECOVER_DRIVE_BACK  = 120
-    RECOVER_HOLD        = 60
-    RECOVER_TOTAL       = RECOVER_DRIVE_BACK + RECOVER_HOLD
-    GRASP_SUCCESS_DIST  = 0.15
-    LIFT_Z              = 0.72
-    LIFT_SUCCESS_MARGIN = 0.12
+    COLLISION_DIST     = 0.15
+    COLLISION_COOLDOWN = 240
+    WP_ARRIVE          = 0.40
+    WP_TIMEOUT         = 240 * 15
+    STAND_OFF          = 1.5
+    PF_EVERY           = 3
+    CAM_EVERY          = 10
+    LOG_EVERY          = 240 * 5
+    SEARCH_TIMEOUT     = 480
+    RECOVER_DRIVE_BACK = 120
+    RECOVER_HOLD       = 60
+    RECOVER_TOTAL      = RECOVER_DRIVE_BACK + RECOVER_HOLD
+    GRASP_SUCCESS_DIST = 0.15
+    LIFT_Z             = 0.72
+    LIFT_SUCCESS_MARGIN= 0.12
 
     # ---- Runtime state ----
     collision_count     = 0
@@ -225,9 +224,7 @@ def main():
     recover_steps       = 0
     in_recover_prev     = False
     search_steps        = 0
-    align_too_far_steps = 0
     recover_replan_done = False
-    just_replanned      = False   # prevents same-tick at_table after ALIGN re-nav
 
     _nav_rgb = _nav_depth = _nav_cam_pos = _nav_fwd = _nav_view = None
     _w_rgb   = _w_depth   = None
@@ -371,13 +368,10 @@ def main():
             search_steps = 0
 
         # ---- Waypoint arrival ----
-        # just_replanned guard: skip this check the tick we switched to NAVIGATE
-        # from ALIGN re-nav, so we don't immediately fire at_table again.
         if (fsm.state == State.NAVIGATE
                 and current_waypoints
                 and waypoint_idx < len(current_waypoints)
-                and mission_event == 'tick'
-                and not just_replanned):
+                and mission_event == 'tick'):
             wx, wy    = current_waypoints[waypoint_idx]
             dist_wp   = np.hypot(est_x - wx, est_y - wy)
             waypoint_steps += 1
@@ -392,39 +386,15 @@ def main():
                     print("[CogArch] All WPs reached -> ALIGN")
                 else:
                     mission_event = 'waypoint_reached'
-        just_replanned = False  # always clear after one tick
 
-        # ---- ALIGN: check proximity, re-nav if too far ----
+        # ---- ALIGN: always proceed, use KB table pos if no grasp target ----
+        # No distance check / re-nav here — that was causing an infinite loop.
+        # The arm will attempt to reach regardless of distance.
         if fsm.state == State.ALIGN and mission_event == 'tick':
-            dist_to_table = np.hypot(
-                est_x - kb_table_xy[0], est_y - kb_table_xy[1]
-            )
-            if dist_to_table > ALIGN_CLOSE_ENOUGH:
-                align_too_far_steps += 1
-                if align_too_far_steps >= 10:
-                    align_too_far_steps = 0
-                    print(f"[CogArch] ALIGN too far ({dist_to_table:.2f}m) -> re-nav")
-                    path = plan_to_table(
-                        est_x, est_y, kb_table_xy, obs_for_path(), kb, STAND_OFF
-                    )
-                    print(f"[CogArch] Re-nav path: {len(path)} wps")
-                    fsm.set_waypoints(path)
-                    current_waypoints = path
-                    waypoint_idx      = 0
-                    waypoint_steps    = 0
-                    path_planned      = True
-                    just_replanned    = True  # skip arrival check next tick
-                    fsm.state         = State.NAVIGATE
-                    fsm._state_steps  = 0
-                    cmd               = {'cmd': 'continue_nav'}
-            else:
-                align_too_far_steps = 0
-                if grasp_target_pos is None:
-                    grasp_target_pos = [kb_table_xy[0], kb_table_xy[1], 0.685]
-                    print("[CogArch] Using KB table centre as grasp pos")
-                mission_event = 'arm_aligned'
-        else:
-            align_too_far_steps = 0
+            if grasp_target_pos is None:
+                grasp_target_pos = [kb_table_xy[0], kb_table_xy[1], 0.685]
+                print("[CogArch] Using KB table centre as grasp pos")
+            mission_event = 'arm_aligned'
 
         # ---- GRASP success check ----
         if (fsm.state == State.GRASP
@@ -443,10 +413,10 @@ def main():
         if (fsm.state == State.RECOVER
                 and recover_steps >= RECOVER_TOTAL
                 and not recover_replan_done):
-            recover_replan_done  = True
-            fsm.state            = State.NAVIGATE
-            fsm._state_steps     = 0
-            collision_cooldown   = COLLISION_COOLDOWN
+            recover_replan_done = True
+            fsm.state           = State.NAVIGATE
+            fsm._state_steps    = 0
+            collision_cooldown  = COLLISION_COOLDOWN
             path = plan_to_table(
                 est_x, est_y, kb_table_xy, obs_for_path(), kb, STAND_OFF
             )
@@ -455,7 +425,6 @@ def main():
             waypoint_idx      = 0
             waypoint_steps    = 0
             path_planned      = True
-            just_replanned    = True
             print(f"[CogArch] Post-recover re-plan: {len(path)} wps")
             mission_event = 'tick'
             cmd = {'cmd': 'continue_nav'}
@@ -506,7 +475,6 @@ def main():
             waypoint_idx      = 0
             waypoint_steps    = 0
             path_planned      = True
-            just_replanned    = True
             if path:
                 nav_ctrl.drive_to(
                     path[0][0], path[0][1], est_x, est_y, est_theta

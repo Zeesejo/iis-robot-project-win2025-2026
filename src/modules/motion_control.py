@@ -137,15 +137,44 @@ class DifferentialDriveController:
 class ArmController:
     """
     Controls the robot arm using PyBullet's built-in IK.
-    Uses position control on joints.
+
+    IMPORTANT: PyBullet's calculateInverseKinematics requires the
+    jointDamping list to have exactly one value per joint in the ENTIRE
+    robot body (not just the arm joints). Passing fewer values causes
+    PyBullet to silently ignore the damping and produce unstable IK.
+
+    robot.urdf joint count = 11:
+      0  left_wheel_joint   (continuous)
+      1  right_wheel_joint  (continuous)
+      2  caster_joint       (fixed)
+      3  arm_base_joint     (revolute)  <- arm
+      4  shoulder_joint     (revolute)  <- arm
+      5  elbow_joint        (revolute)  <- arm
+      6  wrist_joint        (revolute)  <- arm
+      7  end_effector_joint (fixed)
+      8  camera_joint       (fixed)
+      9  imu_joint          (fixed)
+     10  lidar_joint        (fixed)
     """
 
+    # Indices of the 4 controllable arm joints inside the full joint list
+    _ARM_JOINT_IDS_IN_ROBOT = [3, 4, 5, 6]
+
     def __init__(self, robot_id, end_effector_index,
-                 arm_joint_indices, joint_damping=None):
-        self.robot_id = robot_id
-        self.ee_index = end_effector_index
-        self.arm_joints = arm_joint_indices
-        self.damping = joint_damping or [0.01] * len(arm_joint_indices)
+                 arm_joint_indices, total_joints=11):
+        self.robot_id      = robot_id
+        self.ee_index      = end_effector_index
+        self.arm_joints    = arm_joint_indices
+        self.total_joints  = total_joints
+
+        # Build a damping vector the same length as the total joint count.
+        # Low damping on non-arm joints (wheel / fixed) so IK doesn't try
+        # to move them; higher damping on arm joints for stable solutions.
+        self.damping = [0.005] * total_joints
+        for idx in self._ARM_JOINT_IDS_IN_ROBOT:
+            if idx < total_joints:
+                self.damping[idx] = 0.1
+
         self.arm_pid = [PIDController(kp=50.0, ki=0.1, kd=5.0,
                                        output_limits=(-20, 20))
                         for _ in arm_joint_indices]
@@ -159,28 +188,34 @@ class ArmController:
             bodyUniqueId=self.robot_id,
             endEffectorLinkIndex=self.ee_index,
             targetPosition=target_pos,
-            jointDamping=self.damping
+            jointDamping=self.damping,
+            solver=p.IK_DLS,
+            maxNumIterations=200,
+            residualThreshold=1e-4
         )
         if target_orn is not None:
             ik_kwargs['targetOrientation'] = target_orn
 
         joint_poses = p.calculateInverseKinematics(**ik_kwargs)
 
-        for i, joint_idx in enumerate(self.arm_joints):
-            if i < len(joint_poses):
+        # joint_poses has one value per joint; index into it using the
+        # arm joint positions within the full robot joint list.
+        for local_i, robot_joint_idx in enumerate(self.arm_joints):
+            ik_i = self._ARM_JOINT_IDS_IN_ROBOT[local_i]
+            if ik_i < len(joint_poses):
                 p.setJointMotorControl2(
-                    self.robot_id, joint_idx,
+                    self.robot_id, robot_joint_idx,
                     p.POSITION_CONTROL,
-                    targetPosition=joint_poses[i],
+                    targetPosition=joint_poses[ik_i],
                     force=20.0,
                     maxVelocity=1.5
                 )
 
         # Check convergence
-        ee_state = p.getLinkState(self.robot_id, self.ee_index)
+        ee_state  = p.getLinkState(self.robot_id, self.ee_index)
         current_pos = np.array(ee_state[0])
         error = np.linalg.norm(current_pos - np.array(target_pos))
-        return error < 0.05
+        return error < 0.06
 
     def home(self):
         """Return arm to home (folded) position."""
@@ -205,8 +240,6 @@ def plan_path_prolog(start_x, start_y, goal_x, goal_y, obstacle_map, kb):
     kb: KnowledgeBase instance from knowledge_reasoning.py
     Returns: list of (x, y) waypoints
     """
-    # Always use A* — KB reasons about *what* to avoid, not *how* to route.
-    # kb.query_safe_path is intentionally bypassed here so A* handles geometry.
     return _astar_path(start_x, start_y, goal_x, goal_y, obstacle_map)
 
 
@@ -214,13 +247,11 @@ def _astar_path(sx, sy, gx, gy, obstacle_map, step=0.5):
     """
     Grid-based A* path planning.
     The grid is dynamically sized around the start/goal extents so it
-    always covers the actual world coordinates (world2 scene extends
-    well beyond the old hard-coded [-5, +5] box).
+    always covers the actual world coordinates.
     Returns list of (x, y) waypoints.
     """
     import heapq
 
-    # --- dynamic grid bounds: cover start + goal with a generous margin ---
     margin = 6.0
     x_min = min(sx, gx) - margin
     x_max = max(sx, gx) + margin
@@ -228,7 +259,6 @@ def _astar_path(sx, sy, gx, gy, obstacle_map, step=0.5):
     y_max = max(sy, gy) + margin
 
     scale = 1.0 / step
-    # Grid dimensions
     cols = int(round((x_max - x_min) * scale)) + 1
     rows = int(round((y_max - y_min) * scale)) + 1
 
@@ -242,7 +272,6 @@ def _astar_path(sx, sy, gx, gy, obstacle_map, step=0.5):
     start = to_grid(sx, sy)
     goal  = to_grid(gx, gy)
 
-    # Clamp goal/start to grid (safety)
     start = (max(0, min(cols - 1, start[0])), max(0, min(rows - 1, start[1])))
     goal  = (max(0, min(cols - 1, goal[0])),  max(0, min(rows - 1, goal[1])))
 
@@ -281,5 +310,4 @@ def _astar_path(sx, sy, gx, gy, obstacle_map, step=0.5):
                     open_set,
                     (new_g + h(nb, goal), new_g, nb, path + [nb]))
 
-    # Fallback: direct line
     return [(sx, sy), (gx, gy)]

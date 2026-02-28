@@ -120,7 +120,7 @@ def _lidar_has_data(lidar):
 
 class CognitiveArchitecture:
 
-    def __init__(self, robot_id, table_id, room_id, target_id, parameters):
+    def __init__(self, robot_id, table_id, room_id, target_id):
         self.robot_id  = robot_id
         self.table_id  = table_id
         self.room_id   = room_id
@@ -1386,8 +1386,7 @@ def main():
     print("[Init] Parameters chosen for this run:", best_params)
 
     # 3) Create cognitive architecture with chosen parameters
-    cog = CognitiveArchitecture(robot_id, table_id, room_id, target_id,
-                                parameters=best_params)
+    cog = CognitiveArchitecture(robot_id, table_id, room_id, target_id)
     
     for i in range(1):
         print(f"\n[Run {i} Running episode and storing experience...")

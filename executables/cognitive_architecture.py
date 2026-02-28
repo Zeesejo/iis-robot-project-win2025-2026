@@ -37,6 +37,14 @@ import sys
 import os
 import json
 
+import sys
+
+# Always flush prints immediately
+sys.stdout.reconfigure(line_buffering=True)
+# or, if reconfigure is not available in your Python:
+# sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', buffering=1)
+
+
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from src.environment.world_builder import build_world
@@ -47,7 +55,7 @@ from src.modules.motion_control import PIDController, move_to_goal, grasp_object
 from src.modules.fsm import RobotFSM, RobotState
 from src.modules.action_planning import get_action_planner, get_grasp_planner
 from src.modules.knowledge_reasoning import get_knowledge_base
-LEARNING_DEFAULTS = {'nav_kp': 1.0, 'nav_ki': 0.0, 'nav_kd': 0.1, 'angle_kp': 1.0}
+from src.modules.learning import Learner, DEFAULT_PARAMETERS
 
 # -- Robot physical constants ------------------------------------------------
 WHEEL_RADIUS    = 0.1
@@ -129,11 +137,7 @@ class CognitiveArchitecture:
         self.grasp_planner  = get_grasp_planner()
         self.kb             = get_knowledge_base()
 
-        self.nav_pid = PIDController(
-            Kp=LEARNING_DEFAULTS['nav_kp'],
-            Ki=LEARNING_DEFAULTS['nav_ki'],
-            Kd=LEARNING_DEFAULTS['nav_kd']
-        )
+        # self.apply_parameters(parameters)
 
         self.wheel_joints = [0, 1, 2, 3]
         self.wheel_names  = ['fl_wheel_joint', 'fr_wheel_joint',
@@ -1390,6 +1394,62 @@ class CognitiveArchitecture:
                     p.setJointMotorControl2(self.robot_id, i, p.VELOCITY_CONTROL,
                                             targetVelocity=0, force=1500)
 
+    def apply_parameters(self, parameters):
+        """
+        Apply learning parameters to controllers and limits.
+        `parameters` is a dict with keys like in DEFAULT_PARAMETERS.
+        """
+        def get_param(name, default):
+            return parameters.get(name, default)
+
+        # Navigation distance PID (linear motion)
+        # Clip gains to safe ranges, using DEFAULT_PARAMETERS as fallbacks
+        nav_kp = np.clip(get_param("nav_kp", DEFAULT_PARAMETERS["nav_kp"]), 0.1, 3.0)
+        nav_ki = get_param("nav_ki", DEFAULT_PARAMETERS["nav_ki"])
+        nav_kd = np.clip(get_param("nav_kd", DEFAULT_PARAMETERS["nav_kd"]), 0.0, 1.0)
+
+        self.nav_pid = PIDController(
+            Kp=nav_kp,
+            Ki=nav_ki,
+            Kd=nav_kd,
+            setpoint=0.0,
+        )
+
+        print(
+            "[Learning] Parameters applied:",
+            f"nav_kp={self.nav_pid.Kp:.2f}, "
+            f"nav_ki={self.nav_pid.Ki:.2f}, "
+            f"nav_kd={self.nav_pid.Kd:.2f}, "
+        )
+
+    def run_episode(self, parameters):
+            """
+            Run one navigate-to-grasp episode with given parameters.
+            Returns {'success': bool, 'steps': int}.
+            """
+            # 1) Apply parameters (PID gains, speed limits, etc.)
+            self.apply_parameters(parameters)
+
+            # 2) Reset FSM and internal state for a fresh episode
+            self.fsm.reset()
+            self.approach_standoff = None
+            self.current_waypoint = None
+            self.step_counter = 0
+            max_steps = 6000  # safety cap
+
+            # 3) Sense–Think–Act loop, same structure as main
+            while self.step_counter < max_steps and not self.fsm.is_task_complete():
+                self.fsm.tick()
+                sensor_data = self.sense()
+                control_commands = self.think(sensor_data)
+                self.act(control_commands)
+
+                self.step_counter += 1
+                p.stepSimulation()
+
+            # 4) Episode result
+            success = (self.fsm.state == RobotState.SUCCESS)
+            return {"success": success, "steps": self.step_counter}
 
 # ========================== MAIN ==========================================
 
@@ -1398,24 +1458,17 @@ def main():
     print("  IIS Cognitive Architecture - Navigate-to-Grasp Mission")
     print("="*60)
     print("  M4:  Perception - PerceptionModule (full pipeline)")
-    print("       * detect_objects_by_color  (HSV)")
-    print("       * edge_contour_segmentation")
-    print("       * depth_to_point_cloud")
-    print("       * RANSAC_Segmentation      (table plane)")
-    print("       * compute_pca / refine_object_points (target pose)")
-    print("       * SiftFeatureExtractor     (SIFT KB)")
-    print("  M9:  Learning DISABLED - hardcoded defaults")
+    print("  M9:  Learning integrated via experience CSV")
     print("="*60)
 
+    # 1) Build world and get IDs
     robot_id, table_id, room_id, target_id = build_world(gui=True)
     cog = CognitiveArchitecture(robot_id, table_id, room_id, target_id)
 
     print(f"\n[Init] Robot at (0.00, 0.00)")
     if cog.table_position:
-        print(f"[Init] MAP: Table at ({cog.table_position[0]:.2f}, "
-              f"{cog.table_position[1]:.2f}) — known from initial_map.json")
-    print(f"[Init] MAP: {len(cog.obstacles)} obstacles loaded from map")
-    print(f"[Init] MAP: Target position UNKNOWN — must be found by perception")
+        print(f"[Init] Table at ({cog.table_position[0]:.2f}, "
+              f"{cog.table_position[1]:.2f})")
     try:
         print(f"[Init] M8 sensors:      {cog.kb.sensors()}")
         print(f"[Init] M8 capabilities: {cog.kb.robot_capabilities()}")
@@ -1424,7 +1477,7 @@ def main():
     print(f"[Init] M9 DISABLED - "
           f"nav_kp={LEARNING_DEFAULTS['nav_kp']:.2f}  "
           f"angle_kp={LEARNING_DEFAULTS['angle_kp']:.2f}")
-    print("[Init] Mission: navigate to table → find red cylinder → grasp → lift\n")
+    print("[Init] Mission: navigate to table, grasp red cylinder\n")
 
     while p.isConnected():
         try:

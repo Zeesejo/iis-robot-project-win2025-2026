@@ -1,1 +1,5 @@
-nav_kp,nav_ki,nav_kd,arm_kp,arm_ki,arm_kd,vision_threshold,max_linear_speed,max_angular_speed,score
+nav_kp,nav_ki,nav_kd,angle_kp,score,success
+1.0,0.0,0.1,1.0,-300.0,0
+1.0,0.0,0.1,1.0,-300.0,0
+1.0,0.0,0.1,1.0,-300.0,0
+1.0,0.0,0.1,1.0,-600.0,0

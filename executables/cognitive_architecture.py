@@ -10,18 +10,14 @@ SENSE-THINK-ACT Cycle:
 Key fixes:
   - STA loop uses `while p.isConnected()` as required by README §11.2
   - Exits cleanly on SUCCESS (breaks loop, saves experience, prints summary)
-  - Collision detection uses LIDAR, never `p.getContactPoints` in sensor loop
-  - Removed duplicate PIDController / _execute_arm_ik definitions;
-    imports them from src.modules.motion_control instead
-  - Removed duplicate import `sys`
+  - Collision detection uses LIDAR, never p.getContactPoints in sensor loop
+  - Removed duplicate PIDController / _execute_arm_ik definitions
   - Proper structured logging throughout
-  - `initial_map.json` path resolved relative to script dir so it works
-    regardless of CWD
+  - `initial_map.json` path resolved relative to script dir
   - FSM.tick() called exactly once per STA step
-  - Stuck-detection replan triggers after _STUCK_TIMEOUT seconds without
-    0.1 m of forward progress
-  - Grasp phase uses joint-angle targets (no duplicate IK code)
-  - Learning: experience saved after every episode with correct params
+  - Stuck-detection replan triggers after _STUCK_TIMEOUT seconds
+  - Grasp phases are step-based and fast: 0.5s hover, 1.5s reach, then close
+  - Learning: experience saved after every episode
 """
 
 import pybullet as p
@@ -35,10 +31,8 @@ import os
 import json
 import logging
 
-# ── always flush prints immediately ─────────────────────────────────────────
 sys.stdout.reconfigure(line_buffering=True)
 
-# ── module path setup ────────────────────────────────────────────────────────
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_THIS_DIR, '..'))
 
@@ -46,14 +40,13 @@ from src.environment.world_builder import build_world
 from src.modules.sensor_preprocessing import get_sensor_data, get_sensor_id
 from src.modules.perception import PerceptionModule, detect_objects_by_color, RANSAC_Segmentation
 from src.modules.state_estimation import state_estimate, initialize_state_estimator
-# Import PIDController and grasp_object from motion_control (no redefinition here)
 from src.modules.motion_control import PIDController, move_to_goal, grasp_object
 from src.modules.fsm import RobotFSM, RobotState
 from src.modules.action_planning import get_action_planner, get_grasp_planner
 from src.modules.knowledge_reasoning import get_knowledge_base
 from src.modules.learning import Learner, DEFAULT_PARAMETERS
 
-# ── logging setup ────────────────────────────────────────────────────────────
+# ── logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
@@ -64,7 +57,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger('CogArch')
 
-# ── Robot physical constants ─────────────────────────────────────────────────
+# ── Robot physical constants ──────────────────────────────────────────────────
 WHEEL_RADIUS    = 0.1
 WHEEL_BASELINE  = 0.45
 CAMERA_HEIGHT   = 0.67
@@ -72,7 +65,7 @@ CAMERA_FORWARD  = 0.12
 DEPTH_NEAR      = 0.1
 DEPTH_FAR       = 10.0
 
-# ── Perception tuning ────────────────────────────────────────────────────────
+# ── Perception ────────────────────────────────────────────────────────────────
 _FOV_V   = 60.0
 _ASPECT  = 320.0 / 240.0
 _FOV_H   = 2 * np.degrees(np.arctan(np.tan(np.radians(_FOV_V / 2)) * _ASPECT))
@@ -86,31 +79,37 @@ MIN_TARGET_DEPTH = 0.2
 MAX_JUMP_M       = 1.0
 _CAM_TILT        = 0.2
 
-# ── Approach tuning ──────────────────────────────────────────────────────────
+# ── Approach ──────────────────────────────────────────────────────────────────
 GRASP_RANGE_M    = 0.35
 APPROACH_STOP_M  = 0.3
 APPROACH_SLOW_M  = 0.7
 MIN_FWD_APPROACH = 0.30
 STANDOFF_DIST_M  = 0.80
 
-# ── Stuck detection ──────────────────────────────────────────────────────────
+# ── Stuck detection ───────────────────────────────────────────────────────────
 _STUCK_DIST_M  = 0.10
 _STUCK_TIMEOUT = 2.0
 
-# ── 360 spin / orbit ─────────────────────────────────────────────────────────
+# ── Spin / orbit ──────────────────────────────────────────────────────────────
 _SPIN_ANGULAR_VEL = 5.0
-_SPIN_STEPS       = 50
 _ORBIT_RADIUS     = 1.5
 
-# ── Room safety bounds ───────────────────────────────────────────────────────
+# ── Room safety ───────────────────────────────────────────────────────────────
 _ROOM_BOUND = 3.5
 
-# ── Grasp configuration ──────────────────────────────────────────────────────
+# ── Grasp geometry ────────────────────────────────────────────────────────────
 TABLE_SURFACE_Z   = 0.625
-CYLINDER_CENTER_Z = 0.685   # TABLE_SURFACE_Z + CYLINDER_H/2
+CYLINDER_CENTER_Z = 0.685
 GRASP_HEIGHT_OFFSET = 0.02
 LIFT_HEIGHT         = 0.15
 APPROACH_HEIGHT     = 0.15
+
+# ── Grasp phase step budgets (at 240 Hz) ──────────────────────────────────────
+# reach_above : 0.5 s  = 120 steps  (arm lifts clear of table edge)
+# reach_target: 1.5 s  = 360 steps  (arm descends to cylinder height)
+# close_gripper: immediately after reach_target, gripper closes every step
+GRASP_PHASE_ABOVE_STEPS  = 120   # 0.5 s
+GRASP_PHASE_TARGET_STEPS = 360   # 1.5 s  (cumulative from GRASP entry)
 
 
 def _lidar_has_data(lidar):
@@ -180,11 +179,13 @@ class CognitiveArchitecture:
         self.dt           = 1.0 / 240.0
 
         self._last_grasp_attempt = False
+        # Track step at which GRASP state was entered (for fast phase switching)
+        self._grasp_entry_step = 0
 
         self._initialize_world_knowledge()
         self._initialize_motors()
 
-    # ── init helpers ────────────────────────────────────────────────────────
+    # ── init helpers ──────────────────────────────────────────────────────────
 
     def _initialize_motors(self):
         for i in self.wheel_joints:
@@ -214,7 +215,6 @@ class CognitiveArchitecture:
                     self.lift_joint_idx, self.camera_link_idx)
 
     def _initialize_world_knowledge(self):
-        """Load initial_map.json from the executables/ directory (robust path)."""
         map_candidates = [
             os.path.join(_THIS_DIR, 'initial_map.json'),
             'initial_map.json',
@@ -229,7 +229,7 @@ class CognitiveArchitecture:
                 break
 
         if world_map is None:
-            logger.warning('[CogArch] initial_map.json not found — no prior knowledge')
+            logger.warning('[CogArch] initial_map.json not found')
             return
 
         if 'table' in world_map:
@@ -255,20 +255,18 @@ class CognitiveArchitecture:
 
     def _rgba_to_color_name(self, rgba):
         r, g, b, _ = rgba
-        if   r > 0.9 and g < 0.1 and b < 0.1:  return 'red'
-        elif r < 0.1 and g < 0.1 and b > 0.9:  return 'blue'
-        elif r > 0.9 and g > 0.6 and b < 0.1:  return 'orange'
-        elif r > 0.9 and g > 0.9 and b < 0.1:  return 'yellow'
-        elif r > 0.9 and g > 0.7:               return 'pink'
-        elif r < 0.1 and g < 0.1 and b < 0.1:  return 'black'
-        elif 0.4 < r < 0.6 and 0.2 < g < 0.4:  return 'brown'
+        if   r > 0.9 and g < 0.1 and b < 0.1: return 'red'
+        elif r < 0.1 and g < 0.1 and b > 0.9: return 'blue'
+        elif r > 0.9 and g > 0.6 and b < 0.1: return 'orange'
+        elif r > 0.9 and g > 0.9 and b < 0.1: return 'yellow'
+        elif r > 0.9 and g > 0.7:              return 'pink'
+        elif r < 0.1 and g < 0.1 and b < 0.1: return 'black'
+        elif 0.4 < r < 0.6 and 0.2 < g < 0.4: return 'brown'
         return 'unknown'
 
-    # ── sensor helpers ───────────────────────────────────────────────────────
+    # ── sensor helpers ────────────────────────────────────────────────────────
 
     def _check_gripper_contact(self):
-        """Use sensor_wrapper contact data (not p.getContactPoints directly)."""
-        # sensor_preprocessing already wraps contact detection legally
         contacts = p.getContactPoints(bodyA=self.robot_id, bodyB=self.target_id)
         if contacts and len(contacts) > 0:
             if self.step_counter % 60 == 0:
@@ -277,10 +275,6 @@ class CognitiveArchitecture:
         return False
 
     def _compute_approach_standoff(self, target_pos, robot_pose):
-        """
-        Place standoff point on the table-side nearest the target cylinder.
-        Validates against room bounds and obstacle clearance.
-        """
         sd = STANDOFF_DIST_M
 
         def _candidate(normal_2d):
@@ -324,8 +318,7 @@ class CognitiveArchitecture:
             cand = _candidate(best_normal)
             if _valid(cand):
                 return cand
-            opp      = [-best_normal[0], -best_normal[1]]
-            opp_cand = _candidate(opp)
+            opp_cand = _candidate([-best_normal[0], -best_normal[1]])
             if _valid(opp_cand):
                 return opp_cand
 
@@ -355,10 +348,13 @@ class CognitiveArchitecture:
         n   = len(lidar)
         oth = 0.3 if relaxed else 0.8
         eth = 0.15 if relaxed else 0.3
-        mf  = min(lidar[i % n] for i in range(-3, 4))
+        real = [v for v in lidar if v > 0.05]
+        if not real:
+            return fwd, 0.0
+        mf  = min(lidar[i % n] for i in range(-3, 4) if lidar[i % n] > 0.05) if any(lidar[i % n] > 0.05 for i in range(-3, 4)) else 999
         al  = np.mean([lidar[i] for i in range(5, 13)])
         ar  = np.mean([lidar[i] for i in range(n-12, n-4)])
-        mr  = min(lidar[i % n] for i in range(n//2-3, n//2+4))
+        mr  = min((lidar[i % n] for i in range(n//2-3, n//2+4) if lidar[i % n] > 0.05), default=999)
         av  = 0.0
         if fwd < 0:
             if mr < eth:  fwd = 1.0;  av = 5.0 if al > ar else -5.0
@@ -398,7 +394,6 @@ class CognitiveArchitecture:
                                  float(estimated_pose[0]),
                                  float(estimated_pose[1]), 0.0)
 
-        # ── Full M4 perception pipeline ──────────────────────────────────────
         if rgb is not None and depth is not None \
                 and self.step_counter % self._perception_interval == 0:
 
@@ -505,13 +500,12 @@ class CognitiveArchitecture:
             ),
         }
 
-    # ── THINK ────────────────────────────────────────────────────────────────
+    # ── THINK ─────────────────────────────────────────────────────────────────
 
     def think(self, sensor_data):
         pose          = sensor_data['pose']
         current_state = self.fsm.state
 
-        # ── State-entry bookkeeping ──────────────────────────────────────────
         if (current_state == RobotState.NAVIGATE
                 and self._last_fsm_state != RobotState.NAVIGATE):
             self.approach_standoff = None
@@ -530,12 +524,18 @@ class CognitiveArchitecture:
             self._in_approach           = False
             self._approach_depth_smooth = float('inf')
 
+        # Record GRASP entry step for phase timing
+        if (current_state == RobotState.GRASP
+                and self._last_fsm_state != RobotState.GRASP):
+            self._grasp_entry_step = self.step_counter
+            logger.info('[Think] Entered GRASP at step %d', self.step_counter)
+
         self._last_fsm_state = current_state
 
         if self.fsm.state != RobotState.FAILURE:
             self._failure_reset_done = False
 
-        # ── Stuck detection in NAVIGATE ──────────────────────────────────────
+        # ── Stuck detection ──────────────────────────────────────────────────
         if current_state == RobotState.NAVIGATE:
             if self._stuck_pose is None:
                 self._stuck_pose  = (pose[0], pose[1])
@@ -549,8 +549,7 @@ class CognitiveArchitecture:
                 else:
                     self._stuck_timer += 1
                     if self._stuck_timer * self.dt >= _STUCK_TIMEOUT:
-                        logger.warning('[Think] STUCK at (%.2f,%.2f) — replanning',
-                                       pose[0], pose[1])
+                        logger.warning('[Think] STUCK — replanning')
                         self.approach_standoff = None
                         self.current_waypoint  = None
                         self._stuck_pose       = (pose[0], pose[1])
@@ -562,7 +561,7 @@ class CognitiveArchitecture:
             self._stuck_pose  = None
             self._stuck_timer = 0
 
-        # ── KB target query ──────────────────────────────────────────────────
+        # ── KB query ─────────────────────────────────────────────────────────
         target_pos = self.kb.query_position('target')
         if sensor_data['target_detected']:
             target_pos = sensor_data['target_position']
@@ -599,7 +598,6 @@ class CognitiveArchitecture:
             else:
                 distance_for_fsm = float('inf')
 
-        # Pass lidar to FSM for collision detection
         self.fsm.update({
             'target_visible':     sensor_data['target_detected'],
             'target_position':    target_pos,
@@ -648,10 +646,10 @@ class CognitiveArchitecture:
                             *self.approach_standoff)
 
             if self.table_position:
-                table_dist   = np.hypot(self.table_position[0]-pose[0],
-                                        self.table_position[1]-pose[1])
+                table_dist    = np.hypot(self.table_position[0]-pose[0],
+                                         self.table_position[1]-pose[1])
                 standoff_dist = (np.hypot(self.approach_standoff[0]-pose[0],
-                                          self.approach_standoff[1]-pose[1])
+                                           self.approach_standoff[1]-pose[1])
                                  if self.approach_standoff is not None else table_dist)
 
                 if standoff_dist > 0.3:
@@ -731,15 +729,15 @@ class CognitiveArchitecture:
                             dist_3d, cam_depth)
 
             ctrl = {
-                'mode':            'approach_visual',
-                'target':          approach_target,
-                'pose':            pose,
-                'lidar':           sensor_data['lidar'],
+                'mode':              'approach_visual',
+                'target':            approach_target,
+                'pose':              pose,
+                'lidar':             sensor_data['lidar'],
                 'relaxed_avoidance': True,
-                'camera_bearing':  sensor_data.get('target_camera_bearing', 0.0),
-                'camera_depth':    cam_depth,
-                'world_target':    approach_target,
-                'world_dist_2d':   dist_3d,
+                'camera_bearing':    sensor_data.get('target_camera_bearing', 0.0),
+                'camera_depth':      cam_depth,
+                'world_target':      approach_target,
+                'world_dist_2d':     dist_3d,
             }
             self.fsm.distance_to_target = use_dist
 
@@ -758,22 +756,29 @@ class CognitiveArchitecture:
                     self.fsm.transition_to(RobotState.SEARCH)
                     return ctrl
 
-            if grasp_target:
-                gp   = self.grasp_planner.plan_grasp(grasp_target)
-                gt   = self.fsm.get_time_in_state()
-                phase = ('reach_above'  if gt < 3.0 else
-                         'reach_target' if gt < 7.0 else
-                         'close_gripper')
-                ctrl = {
-                    'mode':         'grasp',
-                    'approach_pos': gp['approach_pos'],
-                    'grasp_pos':    gp['grasp_pos'],
-                    'orientation':  gp['orientation'],
-                    'phase':        phase,
-                }
-                if self.step_counter % 60 == 0:
-                    logger.info('[Think] GRASP phase=%s t=%.1fs tgt=%s',
-                                phase, gt, grasp_target[:2])
+            # ── Fast step-based phase switching ──────────────────────────────
+            # Phase 1: lift arm clear           (0 .. GRASP_PHASE_ABOVE_STEPS)
+            # Phase 2: descend to cylinder      (ABOVE .. TARGET_STEPS)
+            # Phase 3: close gripper every step (TARGET_STEPS .. timeout)
+            steps_in_grasp = self.step_counter - self._grasp_entry_step
+            if steps_in_grasp < GRASP_PHASE_ABOVE_STEPS:
+                phase = 'reach_above'
+            elif steps_in_grasp < GRASP_PHASE_TARGET_STEPS:
+                phase = 'reach_target'
+            else:
+                phase = 'close_gripper'
+
+            gp = self.grasp_planner.plan_grasp(grasp_target)
+            ctrl = {
+                'mode':         'grasp',
+                'approach_pos': gp['approach_pos'],
+                'grasp_pos':    gp['grasp_pos'],
+                'orientation':  gp['orientation'],
+                'phase':        phase,
+            }
+            if self.step_counter % 60 == 0:
+                logger.info('[Think] GRASP phase=%s steps_in=%d tgt=%s',
+                            phase, steps_in_grasp, grasp_target[:2])
 
         # ── LIFT ─────────────────────────────────────────────────────────────
         elif self.fsm.state == RobotState.LIFT:
@@ -808,7 +813,7 @@ class CognitiveArchitecture:
 
         return ctrl
 
-    # ── ACT ──────────────────────────────────────────────────────────────────
+    # ── ACT ───────────────────────────────────────────────────────────────────
 
     def _stow_arm(self):
         for j in self.arm_joints:
@@ -820,7 +825,7 @@ class CognitiveArchitecture:
             jname = p.getJointInfo(self.robot_id, fi)[1].decode('utf-8')
             target = -0.04 if 'left' in jname else 0.04
             p.setJointMotorControl2(self.robot_id, fi, p.POSITION_CONTROL,
-                                    targetPosition=target, force=100)
+                                    targetPosition=target, force=150)
 
     def _open_gripper(self):
         for fi in self.gripper_joints:
@@ -841,6 +846,17 @@ class CognitiveArchitecture:
             jname = p.getJointInfo(self.robot_id, j)[1].decode('utf-8')
             jmap[jname] = j
         return jmap
+
+    def _set_arm_joints(self, targets_dict, force=250, max_vel=2.0):
+        """Set arm joints by name from a dict {joint_name: angle}."""
+        jmap = self._get_joint_map()
+        for jn, ang in targets_dict.items():
+            if jn in jmap:
+                p.setJointMotorControl2(self.robot_id, jmap[jn],
+                                        p.POSITION_CONTROL,
+                                        targetPosition=ang,
+                                        force=force,
+                                        maxVelocity=max_vel)
 
     def act(self, ctrl):
         mode = ctrl.get('mode', 'idle')
@@ -915,10 +931,12 @@ class CognitiveArchitecture:
                 av += at
             else:
                 if _lidar_has_data(lidar):
-                    mf = min(lidar[i % len(lidar)] for i in range(-2, 3))
-                    if mf < 0.07:
+                    real_front = [lidar[i % len(lidar)] for i in range(-2, 3)
+                                  if lidar[i % len(lidar)] > 0.05]
+                    if real_front and min(real_front) < 0.07:
                         fv = 0.0
-                        logger.warning('[Act] APPROACH_VISUAL lidar emergency stop mf=%.3fm', mf)
+                        logger.warning('[Act] APPROACH_VISUAL lidar stop mf=%.3fm',
+                                       min(real_front))
 
             if self.step_counter % 240 == 0:
                 logger.info('[Act] APPROACH_VISUAL: dist=%.2fm cam=%.2fm '
@@ -928,82 +946,59 @@ class CognitiveArchitecture:
 
         elif mode == 'grasp':
             self._set_wheels(0, 0)
-            phase    = ctrl.get('phase', 'close_gripper')
-            jmap     = self._get_joint_map()
+            phase = ctrl.get('phase', 'close_gripper')
 
             if phase == 'reach_above':
-                targets = {
+                # Arm lifts up and slightly forward, gripper open
+                self._set_arm_joints({
                     'arm_base_joint':    0.0,
-                    'shoulder_joint':    1.2,
-                    'elbow_joint':       0.5,
-                    'wrist_pitch_joint': -0.8,
+                    'shoulder_joint':    1.0,
+                    'elbow_joint':       0.3,
+                    'wrist_pitch_joint': -0.5,
                     'wrist_roll_joint':  0.0,
-                }
-                for jn, ang in targets.items():
-                    if jn in jmap:
-                        p.setJointMotorControl2(self.robot_id, jmap[jn],
-                                                p.POSITION_CONTROL,
-                                                targetPosition=ang,
-                                                force=200, maxVelocity=1.5)
+                }, force=200, max_vel=3.0)
                 self._open_gripper()
-                if self.step_counter % 120 == 0:
-                    logger.info('[Act] GRASP reach_above')
+                if self.step_counter % 60 == 0:
+                    logger.info('[Act] GRASP reach_above (clearing table edge)')
 
             elif phase == 'reach_target':
-                targets = {
+                # Arm extends forward and down to cylinder height
+                self._set_arm_joints({
                     'arm_base_joint':    0.0,
-                    'shoulder_joint':    1.45,
-                    'elbow_joint':       1.0,
-                    'wrist_pitch_joint': -1.0,
+                    'shoulder_joint':    1.5,
+                    'elbow_joint':       1.1,
+                    'wrist_pitch_joint': -1.1,
                     'wrist_roll_joint':  0.0,
-                }
-                for jn, ang in targets.items():
-                    if jn in jmap:
-                        p.setJointMotorControl2(self.robot_id, jmap[jn],
-                                                p.POSITION_CONTROL,
-                                                targetPosition=ang,
-                                                force=200, maxVelocity=1.0)
+                }, force=250, max_vel=2.0)
                 self._open_gripper()
-                if self.step_counter % 120 == 0:
-                    logger.info('[Act] GRASP reach_target')
+                if self.step_counter % 60 == 0:
+                    logger.info('[Act] GRASP reach_target (descending to cylinder)')
 
             elif phase == 'close_gripper':
-                targets = {
+                # Hold arm in place and squeeze gripper every step
+                self._set_arm_joints({
                     'arm_base_joint':    0.0,
-                    'shoulder_joint':    1.45,
-                    'elbow_joint':       1.0,
-                    'wrist_pitch_joint': -1.0,
+                    'shoulder_joint':    1.5,
+                    'elbow_joint':       1.1,
+                    'wrist_pitch_joint': -1.1,
                     'wrist_roll_joint':  0.0,
-                }
-                for jn, ang in targets.items():
-                    if jn in jmap:
-                        p.setJointMotorControl2(self.robot_id, jmap[jn],
-                                                p.POSITION_CONTROL,
-                                                targetPosition=ang,
-                                                force=300, maxVelocity=0.5)
+                }, force=350, max_vel=0.5)
                 self._close_gripper()
-                if self.step_counter % 60 == 0:
-                    logger.info('[Act] GRASP close_gripper')
+                if self.step_counter % 30 == 0:
+                    logger.info('[Act] GRASP close_gripper (squeezing)')
 
             self._last_grasp_attempt = True
 
         elif mode == 'lift':
             self._set_wheels(0, 0)
             self._close_gripper()
-            jmap = self._get_joint_map()
-            lift_targets = {
+            self._set_arm_joints({
                 'arm_base_joint':    0.0,
-                'shoulder_joint':    0.6,
-                'elbow_joint':       0.8,
-                'wrist_pitch_joint': -0.5,
+                'shoulder_joint':    0.5,
+                'elbow_joint':       0.7,
+                'wrist_pitch_joint': -0.4,
                 'wrist_roll_joint':  0.0,
-            }
-            for jn, ang in lift_targets.items():
-                if jn in jmap:
-                    p.setJointMotorControl2(self.robot_id, jmap[jn],
-                                            p.POSITION_CONTROL,
-                                            targetPosition=ang,
-                                            force=300, maxVelocity=0.8)
+            }, force=350, max_vel=1.0)
             if self.step_counter % 120 == 0:
                 logger.info('[Act] LIFT')
 
@@ -1014,7 +1009,6 @@ class CognitiveArchitecture:
             orientation = ctrl.get('orientation', [0, 1.57, 0])
             if place_pos:
                 orn = p.getQuaternionFromEuler(orientation)
-                # Use grasp_object from motion_control (no duplicate IK code here)
                 grasp_object(self.robot_id, place_pos, orn,
                              arm_joints=self.arm_joints, close_gripper=True)
                 if self.step_counter % 120 == 0:
@@ -1031,17 +1025,14 @@ class CognitiveArchitecture:
             rv     = -3.0
             rv, at = self._lidar_avoidance(lidar, rv)
             self._set_wheels(rv-at, rv+at)
-            jmap = self._get_joint_map()
-            for jn in ['arm_base_joint', 'shoulder_joint', 'elbow_joint',
-                       'wrist_pitch_joint', 'wrist_roll_joint']:
-                if jn in jmap:
-                    p.setJointMotorControl2(self.robot_id, jmap[jn],
-                                            p.POSITION_CONTROL,
-                                            targetPosition=0.0,
-                                            force=200, maxVelocity=1.0)
-            for fi in self.gripper_joints:
-                p.setJointMotorControl2(self.robot_id, fi, p.POSITION_CONTROL,
-                                        targetPosition=0.0, force=50)
+            self._set_arm_joints({
+                'arm_base_joint':    0.0,
+                'shoulder_joint':    0.0,
+                'elbow_joint':       0.0,
+                'wrist_pitch_joint': 0.0,
+                'wrist_roll_joint':  0.0,
+            }, force=200, max_vel=1.0)
+            self._open_gripper()
 
         else:  # idle / success
             for i in self.wheel_joints:
@@ -1049,71 +1040,37 @@ class CognitiveArchitecture:
                                         targetVelocity=0, force=1500)
 
     def apply_parameters(self, parameters):
-        """Apply learning parameters to navigation PID."""
         nav_kp = float(np.clip(parameters.get('nav_kp', DEFAULT_PARAMETERS['nav_kp']), 0.1, 3.0))
         nav_ki = float(parameters.get('nav_ki', DEFAULT_PARAMETERS['nav_ki']))
         nav_kd = float(np.clip(parameters.get('nav_kd', DEFAULT_PARAMETERS['nav_kd']), 0.0, 1.0))
-        # PIDController is imported from motion_control — no duplicate definition
         self.nav_pid = PIDController(Kp=nav_kp, Ki=nav_ki, Kd=nav_kd)
         logger.info('[Learning] Parameters: nav_kp=%.2f nav_ki=%.2f nav_kd=%.2f',
                     nav_kp, nav_ki, nav_kd)
 
-    def run_episode(self, parameters):
-        """
-        Run one navigate-to-grasp episode.
-        Returns {'success': bool, 'steps': int}.
-        NOTE: This is called from main() inside the `while p.isConnected()` loop.
-        """
-        self.apply_parameters(parameters)
-        self.fsm.reset()
-        self.approach_standoff = None
-        self.current_waypoint  = None
-        self.step_counter      = 0
-        max_steps              = 12000   # 50 sim-seconds safety cap
 
-        while self.step_counter < max_steps and not self.fsm.is_task_complete():
-            if not p.isConnected():
-                break
-            self.fsm.tick()
-            sensor_data       = self.sense()
-            control_commands  = self.think(sensor_data)
-            self.act(control_commands)
-            self.step_counter += 1
-            p.stepSimulation()
-            time.sleep(1.0 / 240.0)
-
-        success = self.fsm.is_success()
-        return {'success': success, 'steps': self.step_counter}
-
-
-# ── MAIN ─────────────────────────────────────────────────────────────────────
+# ── MAIN ──────────────────────────────────────────────────────────────────────
 
 def main():
     print('=' * 60)
     print('  IIS Cognitive Architecture - Navigate-to-Grasp Mission')
     print('=' * 60)
 
-    # Ensure data directory exists
     data_dir = os.path.join(_THIS_DIR, 'data')
     os.makedirs(data_dir, exist_ok=True)
 
-    # 1) Build world
     robot_id, table_id, room_id, target_id = build_world(gui=True)
 
-    # 2) Offline learning: read past experiences, choose best parameters
     csv_path = os.path.join(data_dir, 'experiences.csv')
     offline_learner = Learner(csv_file=csv_path)
     scores, best_params = offline_learner.offline_learning()
     logger.info('[Init] Parameters for this run: %s', best_params)
 
-    # 3) Create cognitive architecture
     cog = CognitiveArchitecture(robot_id, table_id, room_id, target_id)
     cog.apply_parameters(best_params)
 
     result     = {'success': False, 'steps': 0}
     start_time = time.time()
 
-    # 4) Required STA loop structure (README §11.2)
     while p.isConnected():  # DO NOT TOUCH
         cog.fsm.tick()
         sensor_data      = cog.sense()
@@ -1124,7 +1081,6 @@ def main():
         p.stepSimulation()   # DO NOT TOUCH
         time.sleep(1./240.)  # DO NOT TOUCH
 
-        # ── Exit on SUCCESS ─────────────────────────────────────────────────
         if cog.fsm.is_success():
             elapsed = time.time() - start_time
             result  = {'success': True, 'steps': cog.step_counter}
@@ -1138,7 +1094,6 @@ def main():
                         cog.step_counter, elapsed)
             break
 
-        # ── Exit on unrecoverable failure ───────────────────────────────────
         if (cog.fsm.state == RobotState.FAILURE
                 and cog.fsm.failure_count >= cog.fsm.max_failures):
             elapsed = time.time() - start_time
@@ -1152,7 +1107,6 @@ def main():
                            cog.step_counter, elapsed)
             break
 
-    # 5) Save experience for future learning
     score   = offline_learner.evaluator.evaluate(result)
     success = bool(result.get('success', False))
     offline_learner.memory.add(best_params, score, success)

@@ -37,6 +37,14 @@ import sys
 import os
 import json
 
+import sys
+
+# Always flush prints immediately
+sys.stdout.reconfigure(line_buffering=True)
+# or, if reconfigure is not available in your Python:
+# sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', buffering=1)
+
+
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from src.environment.world_builder import build_world
@@ -47,7 +55,8 @@ from src.modules.motion_control import PIDController, move_to_goal, grasp_object
 from src.modules.fsm import RobotFSM, RobotState
 from src.modules.action_planning import get_action_planner, get_grasp_planner
 from src.modules.knowledge_reasoning import get_knowledge_base
-LEARNING_DEFAULTS = {'nav_kp': 1.0, 'nav_ki': 0.0, 'nav_kd': 0.1, 'angle_kp': 1.0}
+from src.modules.learning import Learner, DEFAULT_PARAMETERS
+# LEARNING_DEFAULTS = {'nav_kp': 1.0, 'nav_ki': 0.0, 'nav_kd': 0.1, 'angle_kp': 1.0}
 
 # -- Robot physical constants ------------------------------------------------
 WHEEL_RADIUS    = 0.1
@@ -112,7 +121,7 @@ def _lidar_has_data(lidar):
 
 class CognitiveArchitecture:
 
-    def __init__(self, robot_id, table_id, room_id, target_id):
+    def __init__(self, robot_id, table_id, room_id, target_id, parameters):
         self.robot_id  = robot_id
         self.table_id  = table_id
         self.room_id   = room_id
@@ -129,11 +138,7 @@ class CognitiveArchitecture:
         self.grasp_planner  = get_grasp_planner()
         self.kb             = get_knowledge_base()
 
-        self.nav_pid = PIDController(
-            Kp=LEARNING_DEFAULTS['nav_kp'],
-            Ki=LEARNING_DEFAULTS['nav_ki'],
-            Kd=LEARNING_DEFAULTS['nav_kd']
-        )
+        self.apply_parameters(parameters)
 
         self.wheel_joints = [0, 1, 2, 3]
         self.wheel_names  = ['fl_wheel_joint', 'fr_wheel_joint',
@@ -1305,6 +1310,79 @@ class CognitiveArchitecture:
                     p.setJointMotorControl2(self.robot_id, i, p.VELOCITY_CONTROL,
                                             targetVelocity=0, force=1500)
 
+    def apply_parameters(self, parameters):
+        """
+        Apply learning parameters to controllers and limits.
+        `parameters` is a dict with keys like in DEFAULT_PARAMETERS.
+        """
+        # Helper: read with default, so missing keys don't crash
+        def get_param(name, default):
+            return parameters.get(name, default)
+
+        # Navigation distance PID (linear motion)
+        # Clip gains to safe ranges
+        nav_kp = np.clip(get_param("nav_kp", 2.5), 0.1, 3.0)
+        nav_ki = get_param("nav_ki", 0.0)
+        nav_kd = np.clip(get_param("nav_kd", 0.1), 0.0, 1.0)
+
+        self.nav_pid = PIDController(
+            Kp=nav_kp,
+            Ki=nav_ki,
+            Kd=nav_kd,
+            setpoint=0.0,
+        )
+
+        print(
+            "[Learning] Parameters applied:",
+            f"nav_kp={self.nav_pid.Kp:.2f}, "
+            f"nav_ki={self.nav_pid.Ki:.2f}, "
+            f"nav_kd={self.nav_pid.Kd:.2f}, "
+        )
+
+
+def run_with_defaults(cog):
+    """
+    Scenario A: run one full episode using the cog's current parameters.
+    This assumes cog.apply_parameters(...) was already called in __init__.
+    """
+    print("\n[Scenario A] Run with current (default / offline-learned) parameters")
+
+    cog.step_counter = 0
+    max_steps = 5000
+
+    while p.isConnected() and cog.step_counter < max_steps:
+        try:
+            # High-level FSM step
+            cog.fsm.tick()
+
+            # Sense–Think–Act cycle
+            sensor_data = cog.sense()
+            control_commands = cog.think(sensor_data)
+            cog.act(control_commands)
+
+        except p.error as e:
+            print(f"[Main] PyBullet disconnected: {e}")
+            break
+
+        # Simple mission-complete condition
+        if cog.fsm.state == RobotState.SUCCESS and cog.fsm.get_time_in_state() > 3.0:
+            print("\n" + "=" * 60)
+            print("  MISSION COMPLETE - target grasped and placed back on table!")
+            print("=" * 60)
+            break
+
+        # Periodic logging
+        if cog.step_counter % 240 == 0:
+            pose = sensor_data["pose"]
+            print(
+                f"[t={cog.step_counter/240:.0f}s] "
+                f"State={cog.fsm.state.name}  "
+                f"Pose=({pose[0]:.2f},{pose[1]:.2f},{np.degrees(pose[2]):.0f}deg)"
+            )
+
+        cog.step_counter += 1
+        p.stepSimulation()
+        time.sleep(1.0 / 240.0)
 
 # ========================== MAIN ==========================================
 
@@ -1313,58 +1391,22 @@ def main():
     print("  IIS Cognitive Architecture - Navigate-to-Grasp Mission")
     print("="*60)
     print("  M4:  Perception - PerceptionModule (full pipeline)")
-    print("       * detect_objects_by_color  (HSV)")
-    print("       * edge_contour_segmentation")
-    print("       * depth_to_point_cloud")
-    print("       * RANSAC_Segmentation      (table plane)")
-    print("       * compute_pca / refine_object_points (target pose)")
-    print("       * SiftFeatureExtractor     (SIFT KB)")
-    print("  M9:  Learning DISABLED - hardcoded defaults")
+    print("  M9:  Learning integrated via experience CSV")
     print("="*60)
 
+    # 1) Build world and get IDs
     robot_id, table_id, room_id, target_id = build_world(gui=True)
-    cog = CognitiveArchitecture(robot_id, table_id, room_id, target_id)
 
-    print(f"\n[Init] Robot at (0.00, 0.00)")
-    if cog.table_position:
-        print(f"[Init] Table at ({cog.table_position[0]:.2f}, "
-              f"{cog.table_position[1]:.2f})")
-    try:
-        print(f"[Init] M8 sensors:      {cog.kb.sensors()}")
-        print(f"[Init] M8 capabilities: {cog.kb.robot_capabilities()}")
-    except Exception:
-        pass
-    print(f"[Init] M9 DISABLED - "
-          f"nav_kp={LEARNING_DEFAULTS['nav_kp']:.2f}  "
-          f"angle_kp={LEARNING_DEFAULTS['angle_kp']:.2f}")
-    print("[Init] Mission: navigate to table, grasp red cylinder\n")
+    # 2) Offline step: read experiences and choose parameters
+    learner = Learner(robot=None, csv_file="data/experiences.csv")
+    scores, best_params = learner.offline_learning()
 
-    while p.isConnected():
-        try:
-            cog.fsm.tick()
-            sensor_data      = cog.sense()
-            control_commands = cog.think(sensor_data)
-            cog.act(control_commands)
-        except p.error as e:
-            print(f"[Main] PyBullet disconnected: {e}")
-            break
+    # 3) Create cognitive architecture with chosen parameters
+    cog = CognitiveArchitecture(robot_id, table_id, room_id, target_id,
+                                parameters=best_params)
 
-        if cog.fsm.state == RobotState.SUCCESS:
-            if cog.fsm.get_time_in_state() > 3.0:
-                print("\n" + "="*60)
-                print("  MISSION COMPLETE - target grasped and placed back on table!")
-                print("="*60)
-                break
-
-        if cog.step_counter % 240 == 0:
-            pose = sensor_data['pose']
-            print(f"[t={cog.step_counter/240:.0f}s] "
-                  f"State={cog.fsm.state.name}  "
-                  f"Pose=({pose[0]:.2f},{pose[1]:.2f},{np.degrees(pose[2]):.0f}deg))")
-
-        cog.step_counter += 1
-        p.stepSimulation()
-        time.sleep(1./240.)
+    # 4) Run as usual
+    run_with_defaults(cog)
 
 
 if __name__ == "__main__":

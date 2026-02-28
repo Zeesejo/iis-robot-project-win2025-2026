@@ -56,7 +56,6 @@ from src.modules.fsm import RobotFSM, RobotState
 from src.modules.action_planning import get_action_planner, get_grasp_planner
 from src.modules.knowledge_reasoning import get_knowledge_base
 from src.modules.learning import Learner, DEFAULT_PARAMETERS
-# LEARNING_DEFAULTS = {'nav_kp': 1.0, 'nav_ki': 0.0, 'nav_kd': 0.1, 'angle_kp': 1.0}
 
 # -- Robot physical constants ------------------------------------------------
 WHEEL_RADIUS    = 0.1
@@ -138,7 +137,7 @@ class CognitiveArchitecture:
         self.grasp_planner  = get_grasp_planner()
         self.kb             = get_knowledge_base()
 
-        self.apply_parameters(parameters)
+        # self.apply_parameters(parameters)
 
         self.wheel_joints = [0, 1, 2, 3]
         self.wheel_names  = ['fl_wheel_joint', 'fr_wheel_joint',
@@ -1315,15 +1314,14 @@ class CognitiveArchitecture:
         Apply learning parameters to controllers and limits.
         `parameters` is a dict with keys like in DEFAULT_PARAMETERS.
         """
-        # Helper: read with default, so missing keys don't crash
         def get_param(name, default):
             return parameters.get(name, default)
 
         # Navigation distance PID (linear motion)
-        # Clip gains to safe ranges
-        nav_kp = np.clip(get_param("nav_kp", 2.5), 0.1, 3.0)
-        nav_ki = get_param("nav_ki", 0.0)
-        nav_kd = np.clip(get_param("nav_kd", 0.1), 0.0, 1.0)
+        # Clip gains to safe ranges, using DEFAULT_PARAMETERS as fallbacks
+        nav_kp = np.clip(get_param("nav_kp", DEFAULT_PARAMETERS["nav_kp"]), 0.1, 3.0)
+        nav_ki = get_param("nav_ki", DEFAULT_PARAMETERS["nav_ki"])
+        nav_kd = np.clip(get_param("nav_kd", DEFAULT_PARAMETERS["nav_kd"]), 0.0, 1.0)
 
         self.nav_pid = PIDController(
             Kp=nav_kp,
@@ -1339,50 +1337,34 @@ class CognitiveArchitecture:
             f"nav_kd={self.nav_pid.Kd:.2f}, "
         )
 
+    def run_episode(self, parameters):
+            """
+            Run one navigate-to-grasp episode with given parameters.
+            Returns {'success': bool, 'steps': int}.
+            """
+            # 1) Apply parameters (PID gains, speed limits, etc.)
+            self.apply_parameters(parameters)
 
-def run_with_defaults(cog):
-    """
-    Scenario A: run one full episode using the cog's current parameters.
-    This assumes cog.apply_parameters(...) was already called in __init__.
-    """
-    print("\n[Scenario A] Run with current (default / offline-learned) parameters")
+            # 2) Reset FSM and internal state for a fresh episode
+            self.fsm.reset()
+            self.approach_standoff = None
+            self.current_waypoint = None
+            self.step_counter = 0
+            max_steps = 3000  # safety cap
 
-    cog.step_counter = 0
-    max_steps = 5000
+            # 3) Sense–Think–Act loop, same structure as main
+            while self.step_counter < max_steps and not self.fsm.is_task_complete():
+                self.fsm.tick()
+                sensor_data = self.sense()
+                control_commands = self.think(sensor_data)
+                self.act(control_commands)
 
-    while p.isConnected() and cog.step_counter < max_steps:
-        try:
-            # High-level FSM step
-            cog.fsm.tick()
+                self.step_counter += 1
+                p.stepSimulation()
 
-            # Sense–Think–Act cycle
-            sensor_data = cog.sense()
-            control_commands = cog.think(sensor_data)
-            cog.act(control_commands)
-
-        except p.error as e:
-            print(f"[Main] PyBullet disconnected: {e}")
-            break
-
-        # Simple mission-complete condition
-        if cog.fsm.state == RobotState.SUCCESS and cog.fsm.get_time_in_state() > 3.0:
-            print("\n" + "=" * 60)
-            print("  MISSION COMPLETE - target grasped and placed back on table!")
-            print("=" * 60)
-            break
-
-        # Periodic logging
-        if cog.step_counter % 240 == 0:
-            pose = sensor_data["pose"]
-            print(
-                f"[t={cog.step_counter/240:.0f}s] "
-                f"State={cog.fsm.state.name}  "
-                f"Pose=({pose[0]:.2f},{pose[1]:.2f},{np.degrees(pose[2]):.0f}deg)"
-            )
-
-        cog.step_counter += 1
-        p.stepSimulation()
-        time.sleep(1.0 / 240.0)
+            # 4) Episode result
+            success = (self.fsm.state == RobotState.SUCCESS)
+            return {"success": success, "steps": self.step_counter}
 
 # ========================== MAIN ==========================================
 
@@ -1397,17 +1379,24 @@ def main():
     # 1) Build world and get IDs
     robot_id, table_id, room_id, target_id = build_world(gui=True)
 
-    # 2) Offline step: read experiences and choose parameters
-    learner = Learner(robot=None, csv_file="data/experiences.csv")
-    scores, best_params = learner.offline_learning()
+    # 2) Offline step: read experiences and choose parameters (no robot needed)
+    offline_learner = Learner(csv_file="data/experiences.csv")
+    scores, best_params = offline_learner.offline_learning()
+
+    print("[Init] Parameters chosen for this run:", best_params)
 
     # 3) Create cognitive architecture with chosen parameters
     cog = CognitiveArchitecture(robot_id, table_id, room_id, target_id,
                                 parameters=best_params)
-
-    # 4) Run as usual
-    run_with_defaults(cog)
-
+    
+    for i in range(1):
+        print(f"\n[Run {i} Running episode and storing experience...")
+        result = cog.run_episode(best_params)         # {'success', 'steps'}
+        score = offline_learner.evaluator.evaluate(result)      # float
+        success = bool(result.get("success", False))
+        offline_learner.memory.add(best_params, score, success)
+        offline_learner.save_experience()
+        print(f"[Run {i} score={score:.1f}, success={success}")
 
 if __name__ == "__main__":
     main()

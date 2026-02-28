@@ -1,21 +1,13 @@
 """
 Module 9: Learning
 Parameter optimization via replay buffer, evaluation, and mutation.
-Supports online learning (trial-based), offline learning (replay),
-and baseline comparison.
+Supports offline learning (replay).
 """
 
 import random
 from collections import deque
 import csv
 import os
-import numpy as np
-
-try:
-    import matplotlib.pyplot as plt
-    MATPLOTLIB_AVAILABLE = True
-except ImportError:
-    MATPLOTLIB_AVAILABLE = False
 
 # =========================
 # Default Parameters (tuned for this robot)
@@ -67,8 +59,7 @@ class Evaluator:
 # Learner
 # =========================
 class Learner:
-    def __init__(self, robot=None, csv_file="data/experiences.csv"):
-        self.robot = robot
+    def __init__(self, csv_file="data/experiences.csv"):
         self.memory = ReplayBuffer()
         self.evaluator = Evaluator()
         self.csv_file = csv_file
@@ -92,19 +83,6 @@ class Learner:
                 success = bool(int(row.get("success", "0")))
                 self.memory.add(params, score, success)
 
-    
-    def run_trial(self, parameters):
-        return self.robot.run_episode(parameters)
-
-    def run_and_store(self, parameters):
-        result = self.run_trial(parameters)          # {'success', 'steps'}
-        score = self.evaluator.evaluate(result)      # scalar
-        success = bool(result.get("success", False))
-        self.memory.add(parameters, score, success)
-        self.save_experience()
-        return score
-    
-
     def save_experience(self):
         experiences = self.memory.get_all()
         with open(self.csv_file, "w", newline="") as f:
@@ -118,13 +96,15 @@ class Learner:
     # -------- Offline Learning (Replay) --------
     def offline_learning(self):
         """
-        Pick best parameters only among successful runs.
-        If no success in memory, return defaults.
+        Use stored experiences to pick best parameters.
+        - If no experience at all: use defaults.
+        - If only failures: use defaults.
+        - Else: best among successful runs.
         """
         experiences = self.memory.get_all()
         if not experiences:
-            print("[Learning] No stored experience at all.")
-            return [], None
+            print("[Learning] No stored experience at all; using defaults.")
+            return [], DEFAULT_PARAMETERS.copy()
 
         successes = [exp for exp in experiences if exp[2]]  # (params, score, success)
         if not successes:
@@ -132,7 +112,7 @@ class Learner:
             scores = [exp[1] for exp in experiences]
             return scores, DEFAULT_PARAMETERS.copy()
 
-        best = max(successes, key=lambda x: x[1])  # highest score among successes
+        best = max(successes, key=lambda x: x[1])
         scores = [exp[1] for exp in experiences]
         return scores, best[0]
 

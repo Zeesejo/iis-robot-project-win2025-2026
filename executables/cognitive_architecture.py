@@ -1463,49 +1463,24 @@ def main():
 
     # 1) Build world and get IDs
     robot_id, table_id, room_id, target_id = build_world(gui=True)
+
+    # 2) Offline step: read experiences and choose parameters (no robot needed)
+    offline_learner = Learner(csv_file="data/experiences.csv")
+    scores, best_params = offline_learner.offline_learning()
+
+    print("[Init] Parameters chosen for this run:", best_params)
+
+    # 3) Create cognitive architecture with chosen parameters
     cog = CognitiveArchitecture(robot_id, table_id, room_id, target_id)
-
-    print(f"\n[Init] Robot at (0.00, 0.00)")
-    if cog.table_position:
-        print(f"[Init] Table at ({cog.table_position[0]:.2f}, "
-              f"{cog.table_position[1]:.2f})")
-    try:
-        print(f"[Init] M8 sensors:      {cog.kb.sensors()}")
-        print(f"[Init] M8 capabilities: {cog.kb.robot_capabilities()}")
-    except Exception:
-        pass
-    print(f"[Init] M9 DISABLED - "
-          f"nav_kp={LEARNING_DEFAULTS['nav_kp']:.2f}  "
-          f"angle_kp={LEARNING_DEFAULTS['angle_kp']:.2f}")
-    print("[Init] Mission: navigate to table, grasp red cylinder\n")
-
-    while p.isConnected():
-        try:
-            cog.fsm.tick()
-            sensor_data      = cog.sense()
-            control_commands = cog.think(sensor_data)
-            cog.act(control_commands)
-        except p.error as e:
-            print(f"[Main] PyBullet disconnected: {e}")
-            break
-
-        if cog.fsm.state == RobotState.SUCCESS:
-            if cog.fsm.get_time_in_state() > 3.0:
-                print("\n" + "="*60)
-                print("  MISSION COMPLETE - target grasped and placed back on table!")
-                print("="*60)
-                break
-
-        if cog.step_counter % 240 == 0:
-            pose = sensor_data['pose']
-            print(f"[t={cog.step_counter/240:.0f}s] "
-                  f"State={cog.fsm.state.name}  "
-                  f"Pose=({pose[0]:.2f},{pose[1]:.2f},{np.degrees(pose[2]):.0f}deg))")
-
-        cog.step_counter += 1
-        p.stepSimulation()
-        time.sleep(1./240.)
-
+    
+    for i in range(1):
+        print(f"\n[Run {i} Running episode and storing experience...")
+        result = cog.run_episode(best_params)         # {'success', 'steps'}
+        score = offline_learner.evaluator.evaluate(result)      # float
+        success = bool(result.get("success", False))
+        offline_learner.memory.add(best_params, score, success)
+        offline_learner.save_experience()
+        print(f"[Run {i} score={score:.1f}, success={success}")
 
 if __name__ == "__main__":
     main()

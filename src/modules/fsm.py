@@ -194,9 +194,9 @@ class RobotFSM:
         elif self.state == RobotState.APPROACH:
             self.distance_to_target = sensor_data.get('distance_to_target',
                                                        float('inf'))
-            # Transition to GRASP when within safe grasp distance (not too close to collide)
-            if self.distance_to_target < 0.5:
-                print(f"[FSM] Close to table/target, attempting grasp "
+            # Transition to GRASP when within safe grasp distance
+            if self.distance_to_target < 0.58:
+                print(f"[FSM] Close enough to target, attempting grasp "
                       f"(dist={self.distance_to_target:.2f}m)")
                 self.transition_to(RobotState.GRASP)
             elif sensor_data.get('collision_detected', False):
@@ -212,7 +212,7 @@ class RobotFSM:
                 self.object_grasped = True
                 print("[FSM] Object grasped successfully!")
                 self.transition_to(RobotState.LIFT)
-            elif self.get_time_in_state() > 20.0:
+            elif self.get_time_in_state() > 50.0:
                 print("[FSM] Grasp attempt failed (timeout)")
                 self.failure_reason = 'grasp_failed'
                 self.transition_to(RobotState.FAILURE)

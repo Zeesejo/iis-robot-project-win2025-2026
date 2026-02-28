@@ -23,8 +23,16 @@ TARGET_HEIGHT = 0.12
 # File Paths (relative to this file's location for portability)
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 URDF_PATH = _THIS_DIR
-# Use robot-1.urdf (has prismatic lift joint for arm elevation)
-ROBOT_URDF = os.path.join(_THIS_DIR, "..", "robot", "robot.urdf")
+# Use robot-1.urdf (has prismatic lift joint for arm elevation), fallback to robot.urdf
+_ROBOT_1 = os.path.join(_THIS_DIR, "robot-1.urdf")
+_ROBOT_FALLBACK = os.path.join(_THIS_DIR, "..", "robot", "robot.urdf")
+if os.path.exists(_ROBOT_1):
+    ROBOT_URDF = _ROBOT_1
+elif os.path.exists(_ROBOT_FALLBACK):
+    ROBOT_URDF = _ROBOT_FALLBACK
+    print(f"[WorldBuilder] robot-1.urdf not found, using fallback: {_ROBOT_FALLBACK}")
+else:
+    ROBOT_URDF = _ROBOT_1  # will fail with clear error
 
 
 def get_random_pos(bounds, min_dist_from_origin=1.0):
@@ -94,13 +102,13 @@ def build_world(gui=True):
     spawned_objects = [{'pos': [0, 0], 'radius': 0.5}]
     knowledge_base = {"room": {"w": 10, "l": 10, "h": 10}, "obstacles": [], "table": {}}
 
-    # 3. Table
+    # 3. Table — always spawn in FRONT of robot (+X direction)
+    # Robot faces +X at origin, so table X ∈ [1, 4], Y ∈ [-3, 3]
     while True:
-        t_pos_xy = get_random_pos([-4, 4, -4, 4])
+        t_pos_xy = get_random_pos([1, 4, -3, 3], min_dist_from_origin=1.5)
         if not is_overlapping(t_pos_xy, 1.0, spawned_objects):
             break
-    
-    t_pos_xy = [2.0, 0.0]
+
     table_pos = [t_pos_xy[0], t_pos_xy[1], 0]
     table_orn = p.getQuaternionFromEuler([0, 0, random.uniform(-3.14, 3.14)])
     table_id  = p.loadURDF(os.path.join(URDF_PATH, "table.urdf"), table_pos, table_orn, useFixedBase=True)

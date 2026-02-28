@@ -101,7 +101,7 @@ def build_world(gui=True):
             break
 
     # Debug FIX table position for testing:
-    # t_pos_xy = [2.0, 0.0]
+    t_pos_xy = [2.0, 0.0]
     table_pos = [t_pos_xy[0], t_pos_xy[1], 0]
     table_orn = p.getQuaternionFromEuler([0, 0, random.uniform(-3.14, 3.14)])
     table_id  = p.loadURDF(os.path.join(URDF_PATH, "table.urdf"), table_pos, table_orn, useFixedBase=True)

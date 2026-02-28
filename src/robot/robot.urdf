@@ -85,12 +85,12 @@
     <origin xyz="0 0 0.3"/>
   </joint>
 
-  <!-- Lidar at top of torso -->
+  <!-- Lidar at top of base -->
   <link name="lidar_link"/>
   <joint name="lidar_joint" type="fixed">
-    <parent link="torso_link"/>
+    <parent link="base_link"/>
     <child link="lidar_link"/>
-    <origin xyz="0 0 0.18" rpy="0 0 0"/>
+    <origin xyz="0 0 0.35" rpy="0 0 0"/>
   </joint>
 
   <!--
@@ -103,7 +103,7 @@
     <collision><geometry><box size="0.1 0.1 0.05"/></geometry></collision>
     <inertial><mass value="1.0"/><inertia ixx="0.01" iyy="0.01" izz="0.01"/></inertial>
   </link>
-  <joint name="lift_joint" type="prismatic">
+  <joint name="lift_joint" type="fixed">
     <parent link="torso_link"/>
     <child link="lift_carriage"/>
     <origin xyz="0 0 0.22" rpy="0 0 0"/>
@@ -243,7 +243,7 @@
   <joint name="camera_joint" type="fixed">
     <parent link="gripper_base"/>
     <child link="rgbd_camera_link"/>
-    <origin xyz="0.12 0 0.27" rpy="0 0.2 0"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
   </joint>
 
 </robot>

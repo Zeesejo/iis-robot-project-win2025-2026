@@ -70,7 +70,7 @@ class ActionPlanner:
         else:
             plan = self._plan_around_obstacles(start_pos, goal_pos)
 
-        self.current_plan = plan
+        self.current_plan = plan + [goal_pos]  # ensure final goal is included
         self.plan_index = 0
         return plan
 
@@ -82,6 +82,7 @@ class ActionPlanner:
         return None
 
     def advance_waypoint(self):
+        print(f"[ActionPlanner] Advancing waypoint: {self.plan_index} -> {self.plan_index + 1}")
         if self.plan_index < len(self.current_plan):
             self.plan_index += 1
             return True
@@ -164,55 +165,38 @@ class ActionPlanner:
         fallback = _clamp((np.array(start) + direction * 0.8).tolist())
         return [fallback, _clamp(goal)]
 class GraspPlanner:
-    """
-    Plans grasp attempts for the target object.
-    Uses simple heuristics for approach and grasp configuration.
-    """
+    def __init__(self, table_z=0.625, obj_height=0.12):
+        # tune these two constants to your sim
+        self.table_z = float(table_z)
+        self.obj_height = float(obj_height)
 
-    def __init__(self):
-        self.grasp_offset = [0, 0, 0.15]
-        self.grasp_height = 0.05
+        self.pregrasp_dz = 0.18     # above object
+        self.grasp_clearance = 0.02 # don't penetrate
 
     def plan_grasp(self, object_pos, object_type='cylinder'):
-        """
-        Plan a grasp for the target object.
 
-        Args:
-            object_pos:  Position [x, y, z] of object
-            object_type: Type of object ('cylinder', 'cube', etc.)
+        # object_pos may be [x,y] or [x,y,z]
+        x = float(object_pos[0])
+        y = float(object_pos[1])
 
-        Returns:
-            Dict with 'approach_pos' and 'grasp_pos'
-        """
-        import numpy as _np
+        # Prefer provided z if valid, else derive from table height
+        if len(object_pos) >= 3 and object_pos[2] is not None and np.isfinite(object_pos[2]):
+            z_obj = float(object_pos[2])
+        else:
+            z_obj = self.table_z + 0.5 * self.obj_height  # approximate center/top
+
+        grasp_z    = max(self.table_z + self.grasp_clearance, z_obj)
+        approach_z = grasp_z + self.pregrasp_dz
+
         grasp_plan = {}
-        grasp_plan['approach_pos'] = [
-            object_pos[0],
-            object_pos[1],
-            object_pos[2] + self.grasp_offset[2],
-        ]
-        grasp_plan['grasp_pos'] = [
-            object_pos[0],
-            object_pos[1],
-            object_pos[2],
-        ]
-        grasp_plan['orientation'] = [0, _np.pi / 2, 0]
+        grasp_plan['approach_pos'] = [x, y, approach_z]
+        grasp_plan['grasp_pos']    = [x, y, grasp_z]
+        grasp_plan['orientation']  = [0, np.pi / 2, 0]
         return grasp_plan
-
+    
     def check_reachability(self, robot_pos, object_pos, max_reach=1.0):
-        """
-        Check if object is within robot's reach.
-
-        Args:
-            robot_pos:  Robot base position
-            object_pos: Target object position
-            max_reach:  Maximum arm reach distance
-
-        Returns:
-            bool: True if reachable
-        """
-        dist = np.hypot(object_pos[0] - robot_pos[0],
-                        object_pos[1] - robot_pos[1])
+        dist = float(np.hypot(object_pos[0] - robot_pos[0],
+                            object_pos[1] - robot_pos[1]))
         return dist <= max_reach
 
 

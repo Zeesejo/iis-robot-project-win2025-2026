@@ -172,10 +172,7 @@ class RobotFSM:
         elif self.state == RobotState.NAVIGATE:
             self.distance_to_target = sensor_data.get('distance_to_target',
                                                        float('inf'))
-            # [F23] Lowered from 2.0 m to 1.2 m: the standoff is 0.65 m so
-            # 1.2 m means the robot is ~0.55 m from the standoff point and
-            # close enough to start fine visual approach.
-            if self.distance_to_target < 1.2:
+            if self.distance_to_target < 1.5:
                 print(f"[FSM] Reached navigation waypoint "
                       f"(dist={self.distance_to_target:.2f}m)")
                 self.transition_to(RobotState.APPROACH)
@@ -190,8 +187,9 @@ class RobotFSM:
         elif self.state == RobotState.APPROACH:
             self.distance_to_target = sensor_data.get('distance_to_target',
                                                        float('inf'))
-            if self.distance_to_target < 0.55:
-                print(f"[FSM] Target within grasp range "
+            # Transition to GRASP when within safe grasp distance (not too close to collide)
+            if self.distance_to_target < 0.4:
+                print(f"[FSM] Close to table/target, attempting grasp "
                       f"(dist={self.distance_to_target:.2f}m)")
                 self.transition_to(RobotState.GRASP)
             elif sensor_data.get('collision_detected', False):

@@ -215,7 +215,7 @@
   </joint>
 
   <link name="gripper_base">
-    <visual><geometry><box size="0.05 0.1 0.05"/></geometry><material name="black"/></visual>
+    <visual><geometry><box size="0.05 0.15 0.05"/></geometry><material name="black"/></visual>
     <collision><geometry><box size="0.05 0.1 0.05"/></geometry></collision>
     <inertial><mass value="0.2"/><inertia ixx="0.001" iyy="0.001" izz="0.001"/></inertial>
   </link>
@@ -225,25 +225,25 @@
   </joint>
 
   <link name="left_finger">
-    <visual><geometry><box size="0.08 0.01 0.02"/></geometry><material name="grey"/></visual>
+    <visual><geometry><box size="0.08 0.01 0.05"/></geometry><material name="grey"/></visual>
     <collision><geometry><box size="0.08 0.01 0.02"/></geometry></collision>
     <inertial><mass value="0.1"/><inertia ixx="0.0001" iyy="0.0001" izz="0.0001"/></inertial>
   </link>
   <joint name="left_finger_joint" type="prismatic">
     <parent link="gripper_base"/><child link="left_finger"/>
-    <origin xyz="0.05 0.044 0" rpy="0 0 0"/>
+    <origin xyz="0.05 0.07 0" rpy="0 0 0"/>
     <axis xyz="0 1 0"/>
     <limit effort="5.0" lower="-0.04" upper="0" velocity="0.5"/>
   </joint>
 
   <link name="right_finger">
-    <visual><geometry><box size="0.08 0.01 0.02"/></geometry><material name="grey"/></visual>
+    <visual><geometry><box size="0.08 0.01 0.05"/></geometry><material name="grey"/></visual>
     <collision><geometry><box size="0.08 0.01 0.02"/></geometry></collision>
     <inertial><mass value="0.1"/><inertia ixx="0.0001" iyy="0.0001" izz="0.0001"/></inertial>
   </link>
   <joint name="right_finger_joint" type="prismatic">
     <parent link="gripper_base"/><child link="right_finger"/>
-    <origin xyz="0.05 -0.044 0" rpy="0 0 0"/>
+    <origin xyz="0.05 -0.07 0" rpy="0 0 0"/>
     <axis xyz="0 1 0"/>
     <limit effort="5.0" lower="0" upper="0.04" velocity="0.5"/>
   </joint>

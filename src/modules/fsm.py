@@ -195,7 +195,7 @@ class RobotFSM:
             self.distance_to_target = sensor_data.get('distance_to_target',
                                                        float('inf'))
             # Transition to GRASP when within safe grasp distance
-            if self.distance_to_target < 0.58:
+            if self.distance_to_target < 0.50:
                 print(f"[FSM] Close enough to target, attempting grasp "
                       f"(dist={self.distance_to_target:.2f}m)")
                 self.transition_to(RobotState.GRASP)

@@ -1466,21 +1466,25 @@ def main():
 
     # 2) Offline step: read experiences and choose parameters (no robot needed)
     offline_learner = Learner(csv_file="data/experiences.csv")
-    scores, best_params = offline_learner.offline_learning()
+    scores, base_params, has_success = offline_learner.offline_learning()
 
-    print("[Init] Parameters chosen for this run:", best_params)
+    if has_success:
+        # We have at least one successful run → explore around it
+        trial_params = offline_learner.sample_mutated(base_params, sigma=0.1)
+        print("[Init] Using mutated params around successful run:", trial_params)
+    else:
+        # No success yet → just use safe defaults, no mutation
+        trial_params = base_params
+        print("[Init] No success yet, using defaults without mutation:", trial_params)
 
-    # 3) Create cognitive architecture with chosen parameters
+    # Use trial_params for the episode
     cog = CognitiveArchitecture(robot_id, table_id, room_id, target_id)
-    
-    for i in range(1):
-        print(f"\n[Run {i} Running episode and storing experience...")
-        result = cog.run_episode(best_params)         # {'success', 'steps'}
-        score = offline_learner.evaluator.evaluate(result)      # float
-        success = bool(result.get("success", False))
-        offline_learner.memory.add(best_params, score, success)
-        offline_learner.save_experience()
-        print(f"[Run {i} score={score:.1f}, success={success}")
+    result = cog.run_episode(trial_params)
+    score = offline_learner.evaluator.evaluate(result)
+    success = bool(result.get("success", False))
+    offline_learner.memory.add(trial_params, score, success)
+    offline_learner.save_experience()
+
 
 if __name__ == "__main__":
     main()

@@ -8,6 +8,7 @@ import random
 from collections import deque
 import csv
 import os
+import numpy as np
 
 # =========================
 # Default Parameters (tuned for this robot)
@@ -93,28 +94,39 @@ class Learner:
                 row += [score, int(success)]
                 writer.writerow(row)
 
+    def sample_mutated(self, base_params, sigma=0.1):
+        """
+        Sample new parameters by adding Gaussian noise to base_params.
+        sigma controls how strong the variation is.
+        """
+        new_params = base_params.copy()
+        for name, default in DEFAULT_PARAMETERS.items():
+            value = new_params.get(name, default)
+            noise = np.random.normal(0.0, sigma)
+            new_params[name] = float(np.clip(value + noise, 0.0, 3.0))
+        return new_params
+
     # -------- Offline Learning (Replay) --------
     def offline_learning(self):
         """
-        Use stored experiences to pick best parameters.
-        - If no experience at all: use defaults.
-        - If only failures: use defaults.
-        - Else: best among successful runs.
+        Offline learning from replay buffer.
+        Returns (scores, params, has_success).
         """
         experiences = self.memory.get_all()
         if not experiences:
             print("[Learning] No stored experience at all; using defaults.")
-            return [], DEFAULT_PARAMETERS.copy()
+            return [], DEFAULT_PARAMETERS.copy(), False
 
         successes = [exp for exp in experiences if exp[2]]  # (params, score, success)
+        scores = [exp[1] for exp in experiences]
+
         if not successes:
             print("[Learning] No successful runs yet; using defaults.")
-            scores = [exp[1] for exp in experiences]
-            return scores, DEFAULT_PARAMETERS.copy()
+            return scores, DEFAULT_PARAMETERS.copy(), False
 
         best = max(successes, key=lambda x: x[1])
-        scores = [exp[1] for exp in experiences]
-        return scores, best[0]
+        return scores, best[0], True
+
 
 # =========================
 # Main Test

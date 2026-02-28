@@ -14,6 +14,10 @@ States:
 
 All timeouts are step-based (immune to wall-clock startup delay).
 Collision is detected via LIDAR readings passed in sensor_data.
+
+Fix: ignore LIDAR for first LIDAR_WARMUP_STEPS steps to avoid
+self-hit false positives while the robot body is settling.
+Zero readings (< 0.01 m) are also ignored as URDF self-hits.
 """
 
 from enum import Enum, auto
@@ -53,8 +57,13 @@ class RobotFSM:
         RobotState.PLACE:    15  * 240,
     }
 
-    # LIDAR front-sector threshold for collision detection (meters)
-    COLLISION_LIDAR_THRESH = 0.12
+    # LIDAR front-sector thresholds for collision detection (meters).
+    # Only readings > LIDAR_ZERO_SKIP are considered real obstacles
+    # (values near 0 are URDF self-intersections, not real hits).
+    COLLISION_LIDAR_THRESH_NAVIGATE = 0.18
+    COLLISION_LIDAR_THRESH_APPROACH = 0.08
+    LIDAR_ZERO_SKIP   = 0.05   # ignore readings below this (self-hits)
+    LIDAR_WARMUP_STEPS = 120   # ignore all LIDAR for first 0.5 sim-seconds
 
     def __init__(self):
         self.state          = RobotState.IDLE
@@ -134,20 +143,30 @@ class RobotFSM:
 
     # ── lidar collision helper ───────────────────────────────────────
 
-    @staticmethod
-    def _lidar_collision(lidar, thresh=None):
-        """Return True if any front-sector lidar ray is closer than thresh."""
-        if thresh is None:
-            thresh = RobotFSM.COLLISION_LIDAR_THRESH
+    def _lidar_collision(self, lidar, thresh):
+        """
+        Return True only if a real front-sector obstacle is within thresh.
+
+        Rules:
+          - Skipped entirely for first LIDAR_WARMUP_STEPS global steps
+            (robot body still settling, lots of self-hit noise).
+          - Readings below LIDAR_ZERO_SKIP are self-intersections and ignored.
+          - Only the 7 front-facing rays (indices -3..+3) are checked.
+        """
+        if self._step_counter < self.LIDAR_WARMUP_STEPS:
+            return False
         if lidar is None:
             return False
         try:
             n = len(lidar)
             if n == 0:
                 return False
-            # front sector: indices ±3 around 0
             front = [lidar[i % n] for i in range(-3, 4)]
-            return min(front) < thresh
+            # filter out self-hit zeros
+            real = [v for v in front if v > self.LIDAR_ZERO_SKIP]
+            if not real:
+                return False
+            return min(real) < thresh
         except (TypeError, ValueError):
             return False
 
@@ -193,9 +212,10 @@ class RobotFSM:
         # ── NAVIGATE ────────────────────────────────────────────────
         elif self.state == RobotState.NAVIGATE:
             self.distance_to_target = sensor_data.get('distance_to_target', float('inf'))
-            collision = self._lidar_collision(lidar)
+            collision = self._lidar_collision(lidar, self.COLLISION_LIDAR_THRESH_NAVIGATE)
             if collision:
                 print("[FSM] Collision detected during NAVIGATE")
+                logger.warning("[FSM] Collision NAVIGATE step=%d", self._step_counter)
                 self.failure_reason = 'collision'
                 self.transition_to(RobotState.FAILURE)
             elif self.distance_to_target < 1.5:
@@ -207,9 +227,10 @@ class RobotFSM:
         # ── APPROACH ────────────────────────────────────────────────
         elif self.state == RobotState.APPROACH:
             self.distance_to_target = sensor_data.get('distance_to_target', float('inf'))
-            collision = self._lidar_collision(lidar, thresh=0.07)
+            collision = self._lidar_collision(lidar, self.COLLISION_LIDAR_THRESH_APPROACH)
             if collision:
                 print("[FSM] Collision detected during APPROACH")
+                logger.warning("[FSM] Collision APPROACH step=%d", self._step_counter)
                 self.failure_reason = 'collision'
                 self.transition_to(RobotState.FAILURE)
             elif self.distance_to_target < 0.50:

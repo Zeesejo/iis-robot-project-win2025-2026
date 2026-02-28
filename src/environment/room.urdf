@@ -1,0 +1,103 @@
+<?xml version="1.0"?>
+<robot name="room">
+  <material name="wall_color">
+    <color rgba="0.8 0.8 0.8 1"/>
+  </material>
+  <material name="ceiling_color">
+    <color rgba="1.0 1.0 1.0 1"/>
+  </material>
+
+  <link name="world"/>
+
+  <link name="floor">
+    <visual>
+      <geometry>
+        <box size="10.0 10.0 0.1"/>
+      </geometry>
+      <origin xyz="0 0 -0.05"/>
+      <material name="floor_color"/>
+    </visual>
+    <collision>
+      <geometry>
+        <box size="10.0 10.0 0.1"/>
+      </geometry>
+      <origin xyz="0 0 -0.05"/>
+    </collision>
+    <inertial>
+      <mass value="0.0"/>
+      <inertia ixx="0" ixy="0" ixz="0" iyy="0" iyz="0" izz="0"/>
+    </inertial>
+  </link>
+
+  <joint name="world_to_floor" type="fixed">
+    <parent link="world"/>
+    <child link="floor"/>
+  </joint>
+
+  <link name="walls">
+    <visual>
+      <geometry>
+          <box size="10.0 0.1 10.0"/>
+      </geometry>
+      <origin xyz="0 5.0 5.0"/>
+      <material name="wall_color"/>
+    </visual>
+    <collision>
+      <geometry>
+          <box size="10.0 0.1 10.0"/>
+      </geometry>
+      <origin xyz="0 5.0 5.0"/>
+    </collision>
+    <visual>
+      <geometry>
+          <box size="10.0 0.1 10.0"/>
+      </geometry>
+      <origin xyz="0 -5.0 5.0"/>
+      <material name="wall_color"/>
+    </visual>
+    <collision>
+      <geometry>
+          <box size="10.0 0.1 10.0"/>
+      </geometry>
+      <origin xyz="0 -5.0 5.0"/>
+    </collision>
+    <visual>
+      <geometry>
+          <box size="0.1 10.0 10.0"/>
+      </geometry>
+      <origin xyz="5.0 0 5.0"/>
+      <material name="wall_color"/>
+    </visual>
+    <collision>
+      <geometry>
+          <box size="0.1 10.0 10.0"/>
+      </geometry>
+      <origin xyz="5.0 0 5.0"/>
+    </collision>
+    <visual>
+      <geometry>
+          <box size="0.1 10.0 10.0"/>
+      </geometry>
+      <origin xyz="-5.0 0 5.0"/>
+      <material name="wall_color"/>
+    </visual>
+    <collision>
+      <geometry>
+          <box size="0.1 10.0 10.0"/>
+      </geometry>
+      <origin xyz="-5.0 0 5.0"/>
+    </collision>
+    <visual>
+      <geometry>
+          <box size="10.0 10.0 0.1"/>
+      </geometry>
+      <origin xyz="0 0 10.0"/>
+      <material name="ceiling_color"/>
+    </visual>
+  </link>
+
+  <joint name="fixed" type="fixed">
+    <parent link="world"/>
+    <child link="walls"/>
+  </joint>
+</robot>

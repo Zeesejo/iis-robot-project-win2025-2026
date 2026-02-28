@@ -1350,7 +1350,7 @@ class CognitiveArchitecture:
             self.approach_standoff = None
             self.current_waypoint = None
             self.step_counter = 0
-            max_steps = 3000  # safety cap
+            max_steps = 6000  # safety cap
 
             # 3) Sense–Think–Act loop, same structure as main
             while self.step_counter < max_steps and not self.fsm.is_task_complete():

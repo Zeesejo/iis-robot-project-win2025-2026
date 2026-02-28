@@ -22,38 +22,39 @@ COLOR_RANGES_HSV = {
 OBSTACLE_COLORS = {'blue', 'pink', 'orange', 'yellow', 'black'}
 CAM_WIDTH   = 320
 CAM_HEIGHT  = 240
-CAM_FOV_DEG = 60 
-CAM_NEAR    = 0.1
-CAM_FAR     = 10.0
+CAM_FOV_DEG = 60                  # Camera field of view in degrees
+CAM_NEAR    = 0.1                 # Near clipping plane
+CAM_FAR     = 10.0                # Far clipping plane
 class SiftFeatureExtractor:
     def __init__(self):
         self.sift = cv2.SIFT_create()
     def compute_sift(self, image):
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) > 2 else image
-        kp, des = self.sift.detectAndCompute(gray, None)
+        kp, des = self.sift.detectAndCompute(gray, None)             #(corners,edges,blobs),calculates a 128-dimensional vector
         return kp, des
     def match_and_classify(self, test_des, knowledge_base, ratio_threshold=0.75):
         if test_des is None:
             return "Unknown", 0
-        bf = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
+        bf = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)        #Brute-Force Matcher(matching feature descriptors between two images)
         best_count, best_cat = -1, "Unknown"
         for category, desc_list in knowledge_base.items():
             total = 0
             for train_des in desc_list:
                 if train_des is None:
                     continue
-                matches = bf.knnMatch(test_des, train_des, k=2)
+                matches = bf.knnMatch(test_des, train_des, k=2)                     # k=2: nearest + second-nearest
+                # Lowe's ratio test: keep match only if clearly closer than second-best
                 good = [m for m, n in matches if m.distance < ratio_threshold * n.distance]
                 total += len(good)
-            avg = total / len(desc_list) if desc_list else 0
+            avg = total / len(desc_list) if desc_list else 0                        # normalise across training samples
             if avg > best_count:
                 best_count = avg
                 best_cat = category
         return best_cat, best_count
 def edge_contour_segmentation(rgb_image, min_contour_area=500, ratio_threshold=5.0):
     gray    = cv2.cvtColor(rgb_image, cv2.COLOR_BGR2GRAY) if len(rgb_image.shape) > 2 else rgb_image
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges   = cv2.Canny(blurred, 50, 150)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)                #Smooth
+    edges   = cv2.Canny(blurred, 50, 150)                    # hysteresis: weak=50, strong=150
     contours, _ = cv2.findContours(edges.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     mask = np.zeros_like(gray, dtype=np.uint8)
     for cnt in contours:
@@ -62,7 +63,7 @@ def edge_contour_segmentation(rgb_image, min_contour_area=500, ratio_threshold=5
             continue
         x, y, w, h = cv2.boundingRect(cnt)
         ar = float(w) / h if h > 0 else 0
-        if ar > ratio_threshold:
+        if ar > ratio_threshold:                            # reject wide horizontal bands (table edge, floor)
             continue
         cv2.drawContours(mask, [cnt], -1, 255, thickness=cv2.FILLED)
     return mask, edges
@@ -73,14 +74,14 @@ def detect_objects_by_color(bgr_image, min_area=200):
         color_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
         for (lo, hi) in ranges:
             color_mask |= cv2.inRange(hsv, lo, hi)
-        ksz = (3, 3) if color_name == 'red' else (5, 5)
+        ksz = (3, 3) if color_name == 'red' else (5, 5)                            # Morphological filtering to remove noise
         k   = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, ksz)
-        color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, k)
-        color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN,  k)
-        effective_min = min_area * 4 if color_name == 'black' else min_area
+        color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, k)              # fill small holes inside blobs
+        color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN,  k)              # remove isolated noise pixels
+        effective_min = min_area * 4 if color_name == 'black' else min_area        # Black needs larger minimum area (to avoid noise)
         contours, _ = cv2.findContours(color_mask, cv2.RETR_EXTERNAL,
                                        cv2.CHAIN_APPROX_SIMPLE)
-        for cnt in contours:
+        for cnt in contours:                                                        # Extract valid contours as detections
             area = cv2.contourArea(cnt)
             if area < effective_min:
                 continue
@@ -102,8 +103,8 @@ class RANSAC_Segmentation:
         self.max_iterations     = max_iterations
         self.N                  = len(points)
         self.min_inliers        = int(min_inliers_ratio * self.N)
-        self._early_exit_count  = int(0.95 * self.N)
-    def _fit_plane(self, samples):
+        self._early_exit_count  = int(0.95 * self.N)                        # stop early if 95 % of points fit — table dominates the scene
+    def _fit_plane(self, samples):                                          #Calculates the coefficients (A, B, C, D) of the plane equation.
         p1, p2, p3 = samples
         v1, v2     = p2 - p1, p3 - p1
         normal     = np.cross(v1, v2)
@@ -111,27 +112,27 @@ class RANSAC_Segmentation:
         if norm == 0:
             return None
         A, B, C = normal / norm
-        D = -(A * p1[0] + B * p1[1] + C * p1[2])
+        D = -(A * p1[0] + B * p1[1] + C * p1[2])                            # plane eq: Ax+By+Cz+D=0
         return A, B, C, D
-    def _get_inliers(self, points, model):
+    def _get_inliers(self, points, model):                                  #Compute inliers based on point-to-plane distance.
         A, B, C, D = model
         dist = np.abs(A * points[:, 0] + B * points[:, 1]
-                      + C * points[:, 2] + D)
-        mask = dist < self.distance_threshold
+                      + C * points[:, 2] + D)                               # (N,) distances
+        mask = dist < self.distance_threshold                               # bool (N,); e.g. threshold=0.01 m → 1 cm
         return int(np.sum(mask)), mask
-    def run(self):
+    def run(self):                                                          # Run RANSAC to find the best plane model.
         best_count = 0
         best_mask  = np.zeros(self.N, dtype=bool)
         best_model = None
         if self.N < 3:
             return best_mask, None
         for _ in range(self.max_iterations):
-            idx   = np.random.choice(self.N, 3, replace=False)
+            idx   = np.random.choice(self.N, 3, replace=False)              # minimal sample: 3 pts define a plane
             model = self._fit_plane(self.points[idx])
             if model is None:
                 continue
             count, mask = self._get_inliers(self.points, model)
-            if count > best_count:
+            if count > best_count:                                          # consensus reached
                 best_count = count
                 best_model = model
                 best_mask  = mask
@@ -142,24 +143,30 @@ class RANSAC_Segmentation:
 def compute_pca(points):
     if len(points) < 3:
         raise ValueError("Not enough points for PCA.")
-    center   = np.mean(points, axis=0)
-    centered = points - center
-    cov      = np.cov(centered, rowvar=False)
-    eigenvalues, eigenvectors = np.linalg.eigh(cov)
-    order        = np.argsort(eigenvalues)[::-1]
-    eigenvectors = eigenvectors[:, order]
-    projected    = np.dot(centered, eigenvectors)
+    center   = np.mean(points, axis=0)                                           #(3,) centroid
+    centered = points - center                                                   #zero-mean cloud
+    # Covariance matrix and eigen decomposition
+    cov      = np.cov(centered, rowvar=False)                                    #(3,3) covariance; rowvar=False → each col is a variable
+    eigenvalues, eigenvectors = np.linalg.eigh(cov)                              # eigh: symmetric → real eigenvalues, guaranteed orthogonal vectors
+    # Sort eigenvectors by descending eigenvalues
+    order        = np.argsort(eigenvalues)[::-1]                                 #sort descending: PC1 = max variance axis
+    eigenvectors = eigenvectors[:, order]                                        # (3,3); cols are principal axes
+    # Project points to PCA axes
+    projected    = np.dot(centered, eigenvectors)                                # (N,3) coordinates in PCA frame
+    # Compute bounding box dimensions
     mins, maxs   = np.min(projected, axis=0), np.max(projected, axis=0)
-    dimensions   = maxs - mins
-    obb_offset   = (mins + maxs) / 2.0
-    obb_center   = center + np.dot(obb_offset, eigenvectors.T)
+    dimensions   = maxs - mins                                                   # (3,) extent along each principal axis → OBB side lengths
+    # Compute oriented bounding box center
+    obb_offset   = (mins + maxs) / 2.0                                           # centroid offset in PCA frame
+    obb_center   = center + np.dot(obb_offset, eigenvectors.T)                   # back to world frame
     return obb_center, eigenvectors, dimensions
+    
 def refine_cylinder_points(points, obb_center, obb_vectors, obb_dims,
                             tolerance=1.2):
     if len(points) == 0:
         return points
-    v1          = obb_vectors[:, 0]
-    est_radius  = (obb_dims[1] + obb_dims[2]) / 4.0
+    v1          = obb_vectors[:, 0]                                 # longest axis ≈ cylinder axis (PC1)
+    est_radius  = (obb_dims[1] + obb_dims[2]) / 4.0                 # avg of minor dims / 2 → radius estimate
     centered    = points - obb_center
     proj_v1     = np.dot(centered, v1)
     parallel    = proj_v1[:, np.newaxis] * v1
